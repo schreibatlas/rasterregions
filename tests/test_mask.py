@@ -105,3 +105,67 @@ def test_adaptive_mode_handles_local_background_levels() -> None:
     assert result.mask[25:55, 48:52].all()
     assert not result.mask[10, 10]
     assert not result.mask[10, 90]
+
+
+def test_mask_path_pil_and_array_inputs_share_normalization(tmp_path) -> None:
+    image = Image.new("RGB", (80, 50), "white")
+    ImageDraw.Draw(image).rectangle((20, 10, 49, 39), fill="black")
+    path = tmp_path / "page.png"
+    image.save(path)
+    array = np.asarray(image)
+    float_array = array.astype(np.float32) / 255.0
+
+    masks = [
+        foreground_mask(path).mask,
+        foreground_mask(image).mask,
+        foreground_mask(array).mask,
+        foreground_mask(float_array).mask,
+    ]
+
+    assert all(np.array_equal(mask, masks[0]) for mask in masks[1:])
+
+
+def test_auto_preserves_sparse_black_and_color_foreground() -> None:
+    image = Image.new("RGB", (400, 200), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((60, 80, 69, 99), fill="black")
+    draw.rectangle((300, 80, 309, 99), fill=(20, 70, 220))
+
+    result = foreground_mask(image, mode="auto")
+
+    assert result.mask[90, 65]
+    assert result.mask[90, 305]
+
+
+def test_auto_sparse_mixed_ink_excludes_gray_guide() -> None:
+    image = Image.new("RGB", (400, 200), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((60, 80, 69, 99), fill="black")
+    draw.rectangle((300, 80, 309, 99), fill=(20, 70, 220))
+    draw.line((5, 150, 394, 150), fill=(180, 180, 180), width=1)
+
+    result = foreground_mask(image, mode="auto")
+
+    assert result.mask[90, 65]
+    assert result.mask[90, 305]
+    assert not result.mask[150, 100]
+
+
+def test_auto_color_only_page_does_not_invent_neutral_foreground() -> None:
+    image = Image.new("RGB", (400, 200), "white")
+    ImageDraw.Draw(image).rectangle((300, 80, 309, 99), fill=(20, 70, 220))
+
+    result = foreground_mask(image, mode="auto")
+
+    assert result.mask[90, 305]
+    assert not result.mask[0, 0]
+
+
+def test_auto_sparse_black_only_page_remains_detectable() -> None:
+    image = Image.new("RGB", (400, 200), "white")
+    ImageDraw.Draw(image).rectangle((60, 80, 69, 99), fill="black")
+
+    result = foreground_mask(image, mode="auto")
+
+    assert result.mask[90, 65]
+    assert not result.mask[0, 0]

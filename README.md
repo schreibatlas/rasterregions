@@ -24,6 +24,9 @@ It was extracted from the generic image-segmentation work in InkGrammar.
 The public API returns geometry and confidence only. It never assigns semantic
 labels.
 
+
+For the detailed input, diagnostics, and output contracts, see the [user guide](docs/guide.md), [API reference](docs/api.md), and [examples](docs/examples.md).
+
 ## Install
 
 ```bash
@@ -35,6 +38,12 @@ Development install:
 ```bash
 python -m pip install -e ".[dev]"
 ```
+
+## Supported images and coordinates
+
+`detect_regions` and `foreground_mask` accept image paths, Pillow images, and NumPy arrays. Arrays may be two-dimensional grayscale or have RGB/RGBA channels. Pixel values must be finite numeric values. Floating-point arrays in `[0, 1]` are scaled to `[0, 255]`; values are clipped to that range during conversion. RGBA inputs are composited over white.
+
+Paths and Pillow images are transposed according to EXIF orientation before detection. Reported boxes, masks, overlays, and crops use the orientation-corrected pixel coordinates. NumPy arrays have no EXIF metadata and are used in their supplied orientation. Bounding boxes use half-open coordinates: `(x0, y0, x1, y1)` excludes the right and bottom edges.
 
 ## Python API
 
@@ -62,16 +71,28 @@ into the requested number of regions. To constrain the total over all detected
 rows, use page scope:
 
 ```python
-result = detect_regions(
-    "worksheet.png", expected_count=8, expected_count_scope="page"
-)
+result = detect_regions("worksheet.png", expected_count=8, expected_count_scope="page")
 ```
 
 Confidence values are deterministic heuristic scores in `[0, 1]`, based on
 separation and segment plausibility. They are not calibrated probabilities.
 
+## Status, confidence, and reading order
 
-Cleanup and grouping heuristics can be tuned through a configuration object:
+Statuses are `ok`, `ambiguous`, or `failed`. Automatic detection reports `ambiguous` when at least one region is below `min_confidence`. Expected-count detection reports `failed` and returns no regions when its best partition is below the threshold. Mask confidence is a separate diagnostic and warning; it does not gate status. Region and partition confidence values are deterministic heuristic scores, not calibrated probabilities.
+
+Rows and columns are zero-based. `reading_order` is zero-based and follows rows from top to bottom and regions within each row from left to right. The library does not infer right-to-left or semantic order.
+
+`DetectionConfig` collects validated cleanup, grouping, mask, and partition settings. Mask and partition configurations reject non-finite and out-of-domain values rather than silently clamping them. Adaptive settings can be supplied through `MaskConfig` when using `detect_regions`:
+
+```python
+from rasterregions import DetectionConfig, MaskConfig, detect_regions
+
+config = DetectionConfig(mask=MaskConfig(adaptive_window_size=21, adaptive_offset=8.0))
+result = detect_regions("page.png", mode="adaptive", config=config)
+```
+
+Cleanup and grouping settings are configurable as well:
 
 ```python
 from rasterregions import CleanupConfig, DetectionConfig, detect_regions
@@ -143,6 +164,19 @@ crops/
 mask threshold and foreground fraction, cleanup decisions, row metadata, and
 partition boundaries. Existing manifest keys remain available.
 
+
+## Writing diagnostics
+
+The Python output helper writes the manifest and selected artifacts, returning the manifest path:
+
+```python
+from rasterregions.io import write_detection
+
+manifest_path = write_detection(result, "build/regions")
+```
+
+`detection_payload(result)` returns the JSON-compatible payload without writing files. Its current `schema_version` is `1`; component indexes are explicitly labeled with the `raw_mask` namespace. `write_detection` writes the manifest last as the completion marker, removes stale rasterregions-managed crops and disabled mask/overlay files on reruns, and preserves unrelated files already in the output directory.
+
 ## Package layout
 
 There is intentionally **no `src/` layer**:
@@ -151,6 +185,11 @@ There is intentionally **no `src/` layer**:
 rasterregions/
   __init__.py
   __main__.py
+  _cleanup.py
+  _grouping.py
+  _image.py
+  _partition.py
+  _rows.py
   cli.py
   components.py
   detect.py
@@ -159,6 +198,7 @@ rasterregions/
   models.py
   regions.py
 examples/
+docs/
 tests/
 pyproject.toml
 ```
@@ -197,6 +237,23 @@ region -> OCR / glyph identity / handwriting semantics / domain labels
 This boundary keeps the library reusable for document scans, forms,
 worksheets, sprite extraction, diagrams, signatures, historical documents,
 and handwriting pipelines.
+
+## Examples and generated fixtures
+
+The [example guide](examples/README.md) describes the deterministic fixtures and scripts. Regenerate assets and run every example from the repository root with:
+
+```bash
+python examples/rasterregions_examples/run_all_examples.py
+```
+
+The runner writes generated diagnostics under `build/rasterregions_examples/`. Inputs are regenerated from `generate_assets.py`; logs and output images are disposable and are not committed as evidence. The fixture below shows the synthetic multi-row input:
+
+![Synthetic multi-row raster fixture](examples/rasterregions_examples/assets/01_multirow_sparse.png)
+
+
+## Benchmarks and optimization evidence
+
+The opt-in benchmark suite provides deterministic dense/sparse component masks and 2,000/4,000-pixel partition rows. Run it from the repository root with `python -m benchmarks.benchmark_workloads --repeat 5 --warmup 1`; see [`benchmarks/README.md`](benchmarks/README.md) for workload definitions and output details. Timings are machine-specific and are not CI assertions. Algorithm changes require representative workload evidence and controlled before/after measurements.
 
 ## Current limitations
 

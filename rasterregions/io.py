@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +21,8 @@ def detection_payload(result: DetectionResult) -> dict:
     width, height = diagnostics.image_size if diagnostics else result.image.size
     return {
         "rasterregions_version": __version__,
+        "schema_version": 1,
+        "component_index_namespace": "raw_mask",
         "source": result.source_path.name if result.source_path else None,
         "status": result.status,
         "expected_count": result.expected_count,
@@ -80,6 +85,48 @@ def detection_payload(result: DetectionResult) -> dict:
     }
 
 
+def _atomic_save_image(image: Image.Image, destination: Path) -> None:
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        image.save(temporary_path, format="PNG")
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_write_text(text: str, destination: Path) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary.write(text)
+        temporary_path = Path(temporary.name)
+    try:
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _remove_stale_crops(crops: Path, *, remove_directory: bool) -> None:
+    if crops.is_dir():
+        for path in crops.glob("region-*.png"):
+            if path.is_file():
+                path.unlink()
+        if remove_directory:
+            with contextlib.suppress(OSError):
+                crops.rmdir()
+
+
 def write_detection(
     result: DetectionResult,
     output_dir: str | Path,
@@ -91,17 +138,22 @@ def write_detection(
     """Write selected image artifacts and the JSON diagnostics manifest."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+
+    crops = output / "crops"
+    _remove_stale_crops(crops, remove_directory=not include_crops)
     if include_crops:
-        crops = output / "crops"
         crops.mkdir(parents=True, exist_ok=True)
         for region in result.regions:
-            region.image.save(crops / f"{region.region_id}.png", format="PNG")
+            _atomic_save_image(region.image, crops / f"{region.region_id}.png")
 
+    mask_path = output / "mask.png"
     if include_mask:
-        Image.fromarray(np.asarray(result.clean_mask, dtype=np.uint8) * 255).save(
-            output / "mask.png", format="PNG"
-        )
+        mask = Image.fromarray(np.asarray(result.clean_mask, dtype=np.uint8) * 255)
+        _atomic_save_image(mask, mask_path)
+    else:
+        mask_path.unlink(missing_ok=True)
 
+    overlay_path = output / "regions.png"
     if include_overlay:
         overlay = result.image.convert("RGB")
         draw = ImageDraw.Draw(overlay)
@@ -109,11 +161,11 @@ def write_detection(
             x0, y0, x1, y1 = region.bbox.as_tuple()
             draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(230, 45, 35), width=2)
             draw.text((x0, max(0, y0 - 12)), region.region_id, fill=(25, 75, 220))
-        overlay.save(output / "regions.png", format="PNG")
+        _atomic_save_image(overlay, overlay_path)
+    else:
+        overlay_path.unlink(missing_ok=True)
 
     manifest = output / "regions.json"
-    manifest.write_text(
-        json.dumps(detection_payload(result), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(detection_payload(result), ensure_ascii=False, indent=2) + "\n"
+    _atomic_write_text(payload, manifest)
     return manifest

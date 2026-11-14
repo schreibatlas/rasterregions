@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -51,6 +52,9 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
     assert result.diagnostics.image_size == (120, 60)
     assert result.diagnostics.raw_component_count == 3
     assert payload["rasterregions_version"]
+
+    assert payload["schema_version"] == 1
+    assert payload["component_index_namespace"] == "raw_mask"
     assert payload["image"] == {"width": 120, "height": 60}
     assert payload["parameters"]["expected_count_scope"] == "row"
     assert payload["mask"]["threshold"] is not None
@@ -85,6 +89,7 @@ def test_write_detection_can_disable_individual_artifacts(tmp_path) -> None:
     ImageDraw.Draw(image).rectangle((12, 12, 27, 27), fill="black")
     result = detect_regions(image)
 
+    write_detection(result, tmp_path)
     manifest = write_detection(
         result,
         tmp_path,
@@ -97,3 +102,51 @@ def test_write_detection_can_disable_individual_artifacts(tmp_path) -> None:
     assert not (tmp_path / "crops").exists()
     assert not (tmp_path / "regions.png").exists()
     assert not (tmp_path / "mask.png").exists()
+
+
+def test_write_detection_prunes_managed_files_and_preserves_unrelated(
+    tmp_path, monkeypatch
+) -> None:
+    import rasterregions.io as io_module
+
+    first_image = Image.new("RGB", (120, 60), "white")
+    first_draw = ImageDraw.Draw(first_image)
+    first_draw.rectangle((10, 15, 30, 40), fill="black")
+    first_draw.rectangle((75, 10, 95, 45), fill="black")
+    first = detect_regions(first_image)
+
+    second_image = Image.new("RGB", (50, 50), "white")
+    ImageDraw.Draw(second_image).rectangle((15, 15, 34, 34), fill="black")
+    second = detect_regions(second_image)
+    assert len(first.regions) == 2
+    assert len(second.regions) == 1
+
+    write_detection(first, tmp_path)
+    unrelated = tmp_path / "notes.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+    custom_crop = tmp_path / "crops" / "custom.txt"
+    custom_crop.write_text("keep", encoding="utf-8")
+
+    replacements: list[str] = []
+    original_replace = io_module.os.replace
+
+    def record_replace(source, destination) -> None:
+        replacements.append(Path(destination).name)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(io_module.os, "replace", record_replace)
+    manifest = write_detection(
+        second,
+        tmp_path,
+        include_overlay=False,
+        include_mask=False,
+    )
+
+    crop_names = sorted(path.name for path in (tmp_path / "crops").glob("region-*.png"))
+    assert crop_names == ["region-000.png"]
+    assert custom_crop.read_text(encoding="utf-8") == "keep"
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert not (tmp_path / "mask.png").exists()
+    assert not (tmp_path / "regions.png").exists()
+    assert json.loads(manifest.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert replacements[-1] == "regions.json"

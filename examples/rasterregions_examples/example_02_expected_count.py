@@ -6,14 +6,20 @@ from rasterregions import detect_regions
 from rasterregions.io import write_detection
 
 ROOT = Path(__file__).resolve().parent
-source = ROOT / "assets" / "02_expected_count_three.png"
-out = ROOT / "outputs" / "02_expected_count"
+BUILD = ROOT.parents[1] / "build" / "rasterregions_examples"
 
-result = detect_regions(source, expected_count=3)
-manifest = write_detection(result, out)
 
-assert result.status == "ok"
-assert len(result.regions) == 3
-print("bboxes:", [r.bbox.as_tuple() for r in result.regions])
-print("confidences:", [round(r.confidence, 3) for r in result.regions])
-print("manifest:", manifest)
+def main() -> None:
+    source = ROOT / "assets" / "02_expected_count_three.png"
+    result = detect_regions(source, expected_count=3)
+    manifest = write_detection(result, BUILD / "02_expected_count")
+
+    assert result.status == "ok"
+    assert len(result.regions) == 3
+    print("bboxes:", [region.bbox.as_tuple() for region in result.regions])
+    print("confidences:", [round(region.confidence, 3) for region in result.regions])
+    print("manifest:", manifest)
+
+
+if __name__ == "__main__":
+    main()

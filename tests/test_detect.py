@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import pytest
 from PIL import Image, ImageDraw
 
 from rasterregions import detect_regions, detect_rows
-from rasterregions.models import CleanupConfig, DetectionConfig
+from rasterregions.models import (
+    BBox,
+    CleanupConfig,
+    DetectionConfig,
+    GroupingConfig,
+    MaskConfig,
+    MaskResult,
+    PartitionConfig,
+)
 
 
 def _draw_shape(draw: ImageDraw.ImageDraw, x: int, y: int, kind: str) -> None:
@@ -237,3 +246,235 @@ def test_automatic_confidence_varies_with_separation_evidence() -> None:
     assert len(confidences) == 3
     assert all(0.0 <= confidence <= 1.0 for confidence in confidences)
     assert confidences[0] < confidences[-1]
+
+
+def test_detect_regions_rgba_composites_transparent_background() -> None:
+    import numpy as np
+
+    rgba = np.zeros((80, 120, 4), dtype=np.uint8)
+    rgba[20:60, 40:80, 3] = 255
+
+    result = detect_regions(rgba, mode="grayscale")
+
+    assert result.status == "ok"
+    assert not result.mask_result.mask[0, 0]
+    assert result.mask_result.mask[30, 50]
+    assert len(result.regions) == 1
+
+
+@pytest.mark.parametrize("mode", ["auto", "grayscale", "dark", "adaptive"])
+def test_float_grayscale_matches_uint8_detection(mode: str) -> None:
+    import numpy as np
+
+    float_image = np.ones((80, 120), dtype=np.float32)
+    float_image[20:60, 40:80] = 0.0
+    uint8_image = np.rint(float_image * 255).astype(np.uint8)
+
+    float_result = detect_regions(float_image, mode=mode)
+    uint8_result = detect_regions(uint8_image, mode=mode)
+
+    assert float_result.status == uint8_result.status
+    assert np.array_equal(float_result.mask_result.mask, uint8_result.mask_result.mask)
+    assert [region.bbox for region in float_result.regions] == [
+        region.bbox for region in uint8_result.regions
+    ]
+
+
+def test_path_pil_and_array_inputs_have_equivalent_detection(tmp_path) -> None:
+    import numpy as np
+
+    image = Image.new("RGB", (120, 80), "white")
+    ImageDraw.Draw(image).rectangle((40, 20, 79, 59), fill="black")
+    path = tmp_path / "page.png"
+    image.save(path)
+    opened = Image.open(path)
+    array = np.asarray(image)
+    float_array = array.astype(np.float32) / 255.0
+
+    results = [
+        detect_regions(path, mode="grayscale"),
+        detect_regions(opened, mode="grayscale"),
+        detect_regions(array, mode="grayscale"),
+        detect_regions(float_array, mode="grayscale"),
+    ]
+
+    for result in results[1:]:
+        assert result.status == results[0].status
+        assert np.array_equal(result.mask_result.mask, results[0].mask_result.mask)
+        assert [region.bbox for region in result.regions] == [
+            region.bbox for region in results[0].regions
+        ]
+
+
+def test_nonfinite_and_empty_grayscale_inputs_are_rejected() -> None:
+    import numpy as np
+    import pytest
+
+    nonfinite = np.ones((20, 20), dtype=np.float32)
+    nonfinite[0, 0] = np.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        detect_regions(nonfinite)
+    with pytest.raises(ValueError, match="empty"):
+        detect_regions(np.empty((0, 20), dtype=np.uint8))
+
+
+def test_path_and_pil_inputs_apply_exif_orientation(tmp_path) -> None:
+    image = Image.new("RGB", (40, 20), "white")
+    ImageDraw.Draw(image).rectangle((2, 3, 6, 9), fill="black")
+    exif = image.getexif()
+    exif[274] = 6
+    path = tmp_path / "oriented.png"
+    image.save(path, exif=exif)
+
+    path_result = detect_regions(path, mode="dark")
+    with Image.open(path) as opened:
+        pil_result = detect_regions(opened, mode="dark")
+
+    for result in (path_result, pil_result):
+        assert result.image.size == (20, 40)
+        assert result.mask_result.mask.shape == (40, 20)
+        assert result.mask_result.mask[4, 14]
+
+
+def test_cleanup_component_ids_remain_traceable_across_results() -> None:
+    image = Image.new("RGB", (200, 100), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 199, 99), outline="black", width=2)
+    for x in (30, 80, 130):
+        draw.rectangle((x, 30, x + 19, 59), fill="black")
+
+    result = detect_regions(image, mode="dark")
+    kept_ids = {
+        decision.component_index
+        for decision in result.component_decisions
+        if decision.action == "kept"
+    }
+    result_ids = {component.index for component in result.components}
+    row_ids = {index for row in result.rows for index in row.component_indices}
+    region_ids = {index for region in result.regions for index in region.component_indices}
+
+    assert result_ids == kept_ids
+    assert len(result_ids) == 3
+    assert row_ids <= result_ids
+    assert region_ids <= result_ids
+
+
+def test_detect_regions_labels_components_only_once(monkeypatch) -> None:
+    import importlib
+
+    cleanup_module = importlib.import_module("rasterregions._cleanup")
+    original_label = cleanup_module.label_components
+    calls = 0
+
+    def count_labels(mask):
+        nonlocal calls
+        calls += 1
+        return original_label(mask)
+
+    monkeypatch.setattr(cleanup_module, "label_components", count_labels)
+    result = detect_regions(_sample_page(), mode="dark")
+
+    assert result.status == "ok"
+    assert calls == 1
+
+
+def test_detection_configuration_rejects_invalid_values() -> None:
+    invalid_configs = (
+        lambda: CleanupConfig(tiny_area_ratio=1.1),
+        lambda: GroupingConfig(row_center_gap_ratio=-1.0),
+        lambda: MaskConfig(adaptive_window_size=4),
+        lambda: MaskConfig(dark_delta=float("nan")),
+        lambda: MaskConfig(saturation_threshold=1.1),
+        lambda: PartitionConfig(crossing_cost=float("inf")),
+        lambda: PartitionConfig(primary_area_ratio=-0.1),
+    )
+    for make_config in invalid_configs:
+        with pytest.raises(ValueError):
+            make_config()
+
+
+def test_adaptive_mask_config_is_forwarded_through_detection(monkeypatch) -> None:
+    import importlib
+
+    detect_module = importlib.import_module("rasterregions.detect")
+    original = detect_module.foreground_mask
+    observed_configs = []
+
+    def capture_config(image, mode, *, config):
+        observed_configs.append(config)
+        return original(image, mode=mode, config=config)
+
+    monkeypatch.setattr(detect_module, "foreground_mask", capture_config)
+    config = DetectionConfig(mask=MaskConfig(adaptive_window_size=9, adaptive_offset=3.0))
+    detect_regions(_sample_page(), mode="adaptive", config=config)
+
+    assert observed_configs == [config.mask]
+
+
+def test_satellite_component_is_assigned_to_only_one_row() -> None:
+    image = Image.new("RGB", (120, 110), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 15, 69, 34), fill="black")
+    draw.rectangle((40, 75, 69, 94), fill="black")
+    draw.rectangle((50, 48, 58, 56), fill="black")
+
+    result = detect_regions(
+        image,
+        mode="dark",
+        config=DetectionConfig(cleanup=CleanupConfig(tiny_area_ratio=0.005)),
+    )
+    satellite = next(
+        component for component in result.components if component.bbox == BBox(50, 48, 59, 57)
+    )
+    assigned_regions = [
+        region for region in result.regions if satellite.index in region.component_indices
+    ]
+
+    assert len(result.regions) == 2
+    assert len(assigned_regions) == 1
+
+
+def test_low_mask_confidence_does_not_gate_region_status(monkeypatch) -> None:
+    import importlib
+
+    detect_module = importlib.import_module("rasterregions.detect")
+    original = detect_module.foreground_mask
+
+    def low_confidence(image, mode, *, config):
+        result = original(image, mode=mode, config=config)
+        return MaskResult(
+            result.mask,
+            0.0,
+            result.method,
+            ("Mask confidence is low.",),
+            threshold=result.threshold,
+        )
+
+    monkeypatch.setattr(detect_module, "foreground_mask", low_confidence)
+    image = Image.new("RGB", (100, 80), "white")
+    ImageDraw.Draw(image).rectangle((35, 20, 64, 49), fill="black")
+    result = detect_regions(image, mode="dark", min_confidence=0.3)
+
+    assert result.status == "ok"
+    assert result.diagnostics is not None
+    assert result.diagnostics.mask_confidence == 0.0
+    assert "Mask confidence is low." in result.warnings
+
+
+def test_row_scope_only_computes_requested_partition_count(monkeypatch) -> None:
+    import importlib
+
+    partition_module = importlib.import_module("rasterregions._partition")
+    original = partition_module._row_partition_regions
+    attempted_counts = []
+
+    def record_count(*args, **kwargs):
+        attempted_counts.append(args[6])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(partition_module, "_row_partition_regions", record_count)
+    result = detect_regions(_two_row_page(), expected_count=2, mode="dark")
+
+    assert result.status == "ok"
+    assert attempted_counts == [2, 2]
