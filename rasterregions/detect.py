@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,21 @@ from PIL import Image
 
 from .components import components as label_components
 from .mask import foreground_mask
-from .models import BBox, Component, DetectionResult, MaskMode, Region, RowBand
+from .models import (
+    BBox,
+    CleanupConfig,
+    Component,
+    ComponentDecision,
+    DetectionConfig,
+    DetectionDiagnostics,
+    DetectionResult,
+    ExpectedCountScope,
+    GroupingConfig,
+    MaskMode,
+    PartitionBoundary,
+    Region,
+    RowBand,
+)
 from .regions import crop, tighten_bbox
 
 
@@ -45,55 +60,106 @@ def _size_scale(found: tuple[Component, ...] | list[Component]) -> tuple[float, 
     return primary_area, median_height
 
 
-def _is_page_artifact(component: Component, width: int, height: int) -> bool:
+def _is_page_artifact(
+    component: Component,
+    width: int,
+    height: int,
+    config: CleanupConfig | None = None,
+) -> bool:
+    config = config or CleanupConfig()
+    page_area = max(1, width * height)
     box_area = component.width * component.height
+    box_fraction = box_area / page_area
+    area_fraction = component.area / page_area
+    fill_ratio = component.area / max(1, box_area)
     touches_border = (
         component.bbox.x0 == 0
         or component.bbox.y0 == 0
         or component.bbox.x1 == width
         or component.bbox.y1 == height
     )
-    if touches_border and (box_area / (width * height) > 0.05 or component.width > width * 0.8):
+    horizontal_rule = (
+        component.width / max(1, width) >= config.rule_min_span_ratio
+        and component.width / max(1, component.height) >= config.rule_aspect_ratio
+    )
+    vertical_rule = (
+        component.height / max(1, height) >= config.rule_min_span_ratio
+        and component.height / max(1, component.width) >= config.rule_aspect_ratio
+    )
+    if horizontal_rule or vertical_rule:
         return True
-    if component.width >= width * 0.2 and component.width / max(1, component.height) >= 12:
+    if touches_border and (
+        component.width >= width * config.border_span_ratio
+        or component.height >= height * config.border_span_ratio
+    ):
         return True
-    if component.height >= height * 0.2 and component.height / max(1, component.width) >= 12:
+    if (
+        touches_border
+        and box_fraction > config.border_bbox_ratio
+        and fill_ratio < config.border_fill_ratio
+    ):
         return True
-    return box_area / (width * height) > 0.2
+    return area_fraction > config.max_component_area_ratio
 
 
 def _clean_page_mask(
     mask: np.ndarray,
-) -> tuple[np.ndarray, tuple[Component, ...], float, float, list[str]]:
+    config: CleanupConfig | None = None,
+) -> tuple[
+    np.ndarray,
+    tuple[Component, ...],
+    float,
+    float,
+    list[str],
+    tuple[ComponentDecision, ...],
+]:
+    config = config or CleanupConfig()
     height, width = mask.shape
     found = label_components(mask)
     if not found:
-        return mask.copy(), (), 0.0, 0.0, ["No foreground components were detected."]
-    non_artifacts = [c for c in found if not _is_page_artifact(c, width, height)]
+        return mask.copy(), (), 0.0, 0.0, ["No foreground components were detected."], ()
+    artifacts = {
+        component.index: _is_page_artifact(component, width, height, config) for component in found
+    }
+    non_artifacts = [component for component in found if not artifacts[component.index]]
     primary_area, _ = _size_scale(non_artifacts)
     cleaned = np.array(mask, dtype=bool, copy=True)
     warnings: list[str] = []
+    decisions: list[ComponentDecision] = []
     for component in found:
         reason = None
-        if _is_page_artifact(component, width, height):
+        if artifacts[component.index]:
             reason = "page border, rule, or oversized artifact"
-        elif primary_area and component.area < primary_area * 0.008:
+        elif primary_area and component.area < primary_area * config.tiny_area_ratio:
             reason = "tiny isolated noise"
         if reason:
             cleaned[component.ys, component.xs] = False
             warnings.append(f"Removed component {component.index}: {reason}.")
+        decisions.append(
+            ComponentDecision(
+                component.index,
+                component.bbox,
+                component.area,
+                "removed" if reason else "kept",
+                reason,
+            )
+        )
     kept = label_components(cleaned)
     primary_area, median_height = _size_scale(kept)
-    return cleaned, kept, primary_area, median_height, warnings
+    return cleaned, kept, primary_area, median_height, warnings, tuple(decisions)
 
 
 def _body_components(
-    found: tuple[Component, ...] | list[Component], primary_area: float, median_height: float
+    found: tuple[Component, ...] | list[Component],
+    primary_area: float,
+    median_height: float,
+    config: GroupingConfig | None = None,
 ) -> list[Component]:
     if not found:
         return []
-    minimum_area = primary_area * 0.18
-    minimum_height = median_height * 0.25
+    config = config or GroupingConfig()
+    minimum_area = primary_area * config.body_min_area_ratio
+    minimum_height = median_height * config.body_min_height_ratio
     bodies = [
         component
         for component in found
@@ -103,13 +169,18 @@ def _body_components(
     return bodies or [max(found, key=lambda component: component.area)]
 
 
-def detect_rows(mask: np.ndarray) -> tuple[RowBand, ...]:
+def detect_rows(
+    mask: np.ndarray,
+    *,
+    config: DetectionConfig | None = None,
+) -> tuple[RowBand, ...]:
     """Detect coherent foreground rows from component-center clustering."""
+    config = config or DetectionConfig()
     ink = np.asarray(mask, dtype=bool)
     if ink.ndim != 2:
         raise ValueError("mask must be two-dimensional")
-    _, found, primary_area, median_height, _ = _clean_page_mask(ink)
-    bodies = _body_components(found, primary_area, median_height)
+    _, found, primary_area, median_height, _, _ = _clean_page_mask(ink, config.cleanup)
+    bodies = _body_components(found, primary_area, median_height, config.grouping)
     if not bodies:
         return ()
     ordered = sorted(bodies, key=lambda component: component.center_y)
@@ -117,7 +188,7 @@ def detect_rows(mask: np.ndarray) -> tuple[RowBand, ...]:
     for component in ordered:
         if not rows or component.center_y - np.median(
             [member.center_y for member in rows[-1]]
-        ) > max(1.0, median_height * 0.72):
+        ) > max(1.0, median_height * config.grouping.row_center_gap_ratio):
             rows.append([component])
         else:
             rows[-1].append(component)
@@ -140,6 +211,7 @@ def _row_y_bounds(
     found: tuple[Component, ...],
     median_height: float,
     page_height: int,
+    config: GroupingConfig,
 ) -> tuple[int, int]:
     body_indices = set(row.component_indices)
     bodies = [component for component in found if component.index in body_indices]
@@ -147,14 +219,18 @@ def _row_y_bounds(
         component
         for component in found
         if component.index not in body_indices
-        and any(_satellite_score(component, body, median_height) is not None for body in bodies)
+        and any(
+            _satellite_score(component, body, median_height, config) is not None for body in bodies
+        )
     ]
     top = min([row.bbox.y0, *(component.bbox.y0 for component in satellites)])
     bottom = max([row.bbox.y1, *(component.bbox.y1 for component in satellites)])
     return max(0, top), min(page_height, bottom)
 
 
-def _group_nearby_bodies(bodies: list[Component], median_height: float) -> list[list[Component]]:
+def _group_nearby_bodies(
+    bodies: list[Component], median_height: float, config: GroupingConfig
+) -> list[list[Component]]:
     groups: list[list[Component]] = []
     for component in sorted(bodies, key=lambda item: item.bbox.x0):
         if not groups:
@@ -166,15 +242,20 @@ def _group_nearby_bodies(bodies: list[Component], median_height: float) -> list[
         previous_bottom = max(member.bbox.y1 for member in previous)
         gap = component.bbox.x0 - previous_right
         overlap = min(previous_bottom, component.bbox.y1) - max(previous_top, component.bbox.y0)
-        if gap <= max(1.0, median_height * 0.12) and overlap > 0:
+        if gap <= max(1.0, median_height * config.body_join_gap_ratio) and overlap > 0:
             previous.append(component)
         else:
             groups.append([component])
     return groups
 
 
-def _satellite_score(satellite: Component, body: Component, median_height: float) -> float | None:
-    if satellite.area >= body.area * 0.6:
+def _satellite_score(
+    satellite: Component,
+    body: Component,
+    median_height: float,
+    config: GroupingConfig,
+) -> float | None:
+    if satellite.area >= body.area * config.satellite_max_area_ratio:
         return None
     horizontal_gap = max(
         body.bbox.x0 - satellite.bbox.x1,
@@ -186,7 +267,10 @@ def _satellite_score(satellite: Component, body: Component, median_height: float
         satellite.bbox.y0 - body.bbox.y1,
         0,
     )
-    if horizontal_gap > median_height * 0.4 or vertical_gap > median_height * 1.25:
+    if (
+        horizontal_gap > median_height * config.satellite_max_horizontal_gap_ratio
+        or vertical_gap > median_height * config.satellite_max_vertical_gap_ratio
+    ):
         return None
     overlaps_x = max(
         0,
@@ -228,7 +312,7 @@ def _partition_row(
     found: tuple[Component, ...],
     *,
     x_offset: int,
-) -> tuple[list[int], float] | None:
+) -> tuple[list[int], float, float, tuple[PartitionBoundary, ...]] | None:
     projection = np.asarray(row_mask, dtype=np.uint8).sum(axis=0)
     occupied = np.flatnonzero(projection)
     if occupied.size == 0:
@@ -296,13 +380,48 @@ def _partition_row(
         boundary_indexes.append(cursor)
     boundary_indexes.reverse()
     boundaries = [left + cuts[index] for index in boundary_indexes]
-    confidences: list[float] = []
+    boundary_confidences: list[float] = []
+    partition_boundaries: list[PartitionBoundary] = []
     for boundary in boundaries[1:-1]:
         local_cut = boundary - left
         valley = float(projection[local_cut] / nonzero_scale)
         component_penalty = crossing.get(local_cut, 0)
-        confidences.append(float(np.clip(1.0 - valley - 0.55 * component_penalty, 0.0, 1.0)))
-    return boundaries, min(confidences, default=0.0)
+        confidence = float(np.clip(1.0 - valley - 0.55 * component_penalty, 0.0, 1.0))
+        boundary_confidences.append(confidence)
+        partition_boundaries.append(
+            PartitionBoundary(
+                x=x_offset + boundary,
+                projection=float(projection[local_cut]),
+                crossing_components=component_penalty,
+                confidence=confidence,
+            )
+        )
+    segment_confidences: list[float] = []
+    row_height = row_mask.shape[0]
+    for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+        width = end - start
+        local_start = start - left
+        local_end = end - left
+        ink = prefix[local_end] - prefix[local_start]
+        density = ink / max(1, row_height * width)
+        body_count = sum(
+            c.area >= primary_threshold and x_offset + start <= c.center_x < x_offset + end
+            for c in found
+        )
+        body_score = 1.0 if body_count else 0.0
+        density_score = float(np.clip(1.0 - abs(density - 0.08) / 0.55, 0.0, 1.0))
+        width_score = float(np.clip(width / max(1.0, median_height * 0.5), 0.0, 1.0))
+        segment_confidences.append(0.5 * body_score + 0.3 * density_score + 0.2 * width_score)
+
+    boundary_confidence = min(boundary_confidences, default=1.0)
+    segment_confidence = min(segment_confidences, default=0.0)
+    confidence = min(boundary_confidence, segment_confidence)
+    return (
+        boundaries,
+        confidence,
+        float(costs[expected_count, final_index]),
+        tuple(partition_boundaries),
+    )
 
 
 def _make_region(
@@ -349,8 +468,9 @@ def _automatic_regions(
     median_height: float,
     rows: tuple[RowBand, ...],
     padding: int,
+    grouping: GroupingConfig,
 ) -> list[Region]:
-    bodies = _body_components(found, primary_area, median_height)
+    bodies = _body_components(found, primary_area, median_height, grouping)
     body_indices = {component.index for component in bodies}
     regions: list[Region] = []
     reading_order = 0
@@ -359,7 +479,7 @@ def _automatic_regions(
         row_bodies = [c for c in bodies if c.index in row.component_indices]
         if not row_bodies:
             continue
-        groups = _group_nearby_bodies(row_bodies, median_height)
+        groups = _group_nearby_bodies(row_bodies, median_height, grouping)
         satellites = [c for c in found if c.index not in body_indices]
         attached: list[list[Component]] = [[] for _ in groups]
         for satellite in satellites:
@@ -368,7 +488,8 @@ def _automatic_regions(
                 scores = [
                     score
                     for body in group
-                    if (score := _satellite_score(satellite, body, median_height)) is not None
+                    if (score := _satellite_score(satellite, body, median_height, grouping))
+                    is not None
                 ]
                 if scores:
                     options.append((min(scores), group_index))
@@ -396,7 +517,19 @@ def _automatic_regions(
                 if next_group
                 else median_height
             )
-            confidence = 0.92 if min(left_gap, right_gap) >= median_height * 0.15 else 0.58
+            separation = float(
+                np.clip(min(left_gap, right_gap) / max(1.0, median_height * 0.5), 0.0, 1.0)
+            )
+            body_areas = np.asarray([component.area for component in group], dtype=float)
+            median_area = float(np.median(body_areas))
+            size_consistency = float(
+                np.clip(
+                    1.0 - np.median(np.abs(body_areas - median_area)) / max(1.0, median_area),
+                    0.0,
+                    1.0,
+                )
+            )
+            confidence = 0.65 * separation + 0.35 * size_consistency
             regions.append(
                 _make_region(
                     image,
@@ -415,6 +548,61 @@ def _automatic_regions(
     return regions
 
 
+def _row_partition_regions(
+    image: Image.Image,
+    mask: np.ndarray,
+    found: tuple[Component, ...],
+    row: RowBand,
+    row_index: int,
+    median_height: float,
+    expected_count: int,
+    padding: int,
+    grouping: GroupingConfig,
+) -> tuple[list[Region], float, float, tuple[PartitionBoundary, ...]] | None:
+    row_y0, row_y1 = _row_y_bounds(row, found, median_height, mask.shape[0], grouping)
+    row_mask = mask[row_y0:row_y1, :]
+    row_found = tuple(
+        component
+        for component in found
+        if component.bbox.y0 < row_y1 and component.bbox.y1 > row_y0
+    )
+    partition = _partition_row(row_mask, expected_count, row_found, x_offset=0)
+    if partition is None:
+        return None
+    boundaries, confidence, cost, partition_boundaries = partition
+    regions: list[Region] = []
+    for column_index, (x0, x1) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
+        segment = mask[row_y0:row_y1, x0:x1]
+        ys, xs = np.nonzero(segment)
+        if not len(xs):
+            return None
+        box = BBox(x0, row_y0 + int(ys.min()), x1, row_y0 + int(ys.max()) + 1)
+        member_indices = tuple(
+            component.index
+            for component in found
+            if component.bbox.x0 < x1
+            and component.bbox.x1 > x0
+            and component.bbox.y0 < row_y1
+            and component.bbox.y1 > row_y0
+        )
+        regions.append(
+            _make_region(
+                image,
+                mask,
+                box,
+                region_id=f"region-{column_index:03d}",
+                row_index=row_index,
+                column_index=column_index,
+                reading_order=column_index,
+                confidence=confidence,
+                component_indices=member_indices,
+                padding=padding,
+                clip=BBox(x0, row_y0, x1, row_y1),
+            )
+        )
+    return regions, confidence, cost + (1.0 - confidence), partition_boundaries
+
+
 def _expected_count_regions(
     image: Image.Image,
     mask: np.ndarray,
@@ -423,64 +611,101 @@ def _expected_count_regions(
     median_height: float,
     expected_count: int,
     padding: int,
-) -> tuple[list[Region], float] | None:
-    candidates: list[tuple[list[Region], float]] = []
+    grouping: GroupingConfig,
+    scope: ExpectedCountScope,
+) -> tuple[list[Region], float, tuple[PartitionBoundary, ...]] | None:
+    options_by_row: list[
+        dict[int, tuple[list[Region], float, float, tuple[PartitionBoundary, ...]]]
+    ] = []
     for row_index, row in enumerate(rows):
-        row_y0, row_y1 = _row_y_bounds(row, found, median_height, mask.shape[0])
-        row_mask = mask[row_y0:row_y1, :]
-        partition = _partition_row(row_mask, expected_count, found, x_offset=0)
-        if partition is None:
-            continue
-        boundaries, confidence = partition
-        regions: list[Region] = []
-        for column_index, (x0, x1) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
-            segment = mask[row_y0:row_y1, x0:x1]
-            ys, xs = np.nonzero(segment)
-            if not len(xs):
-                regions = []
-                break
-            box = BBox(x0, row_y0 + int(ys.min()), x1, row_y0 + int(ys.max()) + 1)
-            member_indices = tuple(
-                c.index
-                for c in found
-                if c.bbox.x0 < x1 and c.bbox.x1 > x0 and c.bbox.y0 < row_y1 and c.bbox.y1 > row_y0
+        row_options: dict[
+            int, tuple[list[Region], float, float, tuple[PartitionBoundary, ...]]
+        ] = {}
+        for count in range(1, expected_count + 1):
+            option = _row_partition_regions(
+                image,
+                mask,
+                found,
+                row,
+                row_index,
+                median_height,
+                count,
+                padding,
+                grouping,
             )
+            if option is not None:
+                row_options[count] = option
+        options_by_row.append(row_options)
+
+    if scope == "row":
+        candidates = [
+            options[expected_count] for options in options_by_row if expected_count in options
+        ]
+        if not candidates:
+            return None
+        selected = max(
+            candidates,
+            key=lambda item: (item[1], sum(int(region.mask.sum()) for region in item[0])),
+        )
+        return selected[0], selected[1], selected[3]
+    states: dict[int, tuple[float, list[tuple[int, int]]]] = {0: (0.0, [])}
+    for row_index, options in enumerate(options_by_row):
+        next_states: dict[int, tuple[float, list[tuple[int, int]]]] = {}
+        for used, (current_cost, choices) in states.items():
+            for count, (_, _confidence, cost, _) in options.items():
+                total = used + count
+                if total > expected_count:
+                    continue
+                candidate = (current_cost + cost, [*choices, (row_index, count)])
+                if total not in next_states or candidate[0] < next_states[total][0]:
+                    next_states[total] = candidate
+        states = next_states
+    if expected_count not in states:
+        return None
+
+    _, choices = states[expected_count]
+    regions: list[Region] = []
+    confidences: list[float] = []
+    partition_boundaries: list[PartitionBoundary] = []
+    for row_index, count in choices:
+        row_regions, confidence, _, row_boundaries = options_by_row[row_index][count]
+        confidences.append(confidence)
+        partition_boundaries.extend(row_boundaries)
+        for column_index, region in enumerate(row_regions):
+            reading_order = len(regions)
             regions.append(
-                _make_region(
-                    image,
-                    mask,
-                    box,
-                    region_id=f"region-{column_index:03d}",
+                replace(
+                    region,
+                    region_id=f"region-{reading_order:03d}",
                     row_index=row_index,
                     column_index=column_index,
-                    reading_order=column_index,
-                    confidence=confidence,
-                    component_indices=member_indices,
-                    padding=padding,
-                    clip=BBox(x0, row_y0, x1, row_y1),
+                    reading_order=reading_order,
                 )
             )
-        if len(regions) == expected_count:
-            candidates.append((regions, confidence))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: (item[1], sum(int(r.mask.sum()) for r in item[0])))
+    return regions, min(confidences, default=0.0), tuple(partition_boundaries)
 
 
 def detect_regions(
     source: str | Path | Image.Image | np.ndarray,
     *,
     expected_count: int | None = None,
+    expected_count_scope: ExpectedCountScope = "row",
     mode: MaskMode = "auto",
     padding: int | None = None,
     min_confidence: float = 0.3,
+    config: DetectionConfig | None = None,
 ) -> DetectionResult:
     """Detect anonymous ordered foreground regions.
 
     With no ``expected_count``, all rows and region groups are inferred. When
     ``expected_count`` is supplied, the best row is partitioned into exactly
     that many regions using projection valleys and component-crossing costs.
+    ``expected_count`` defaults to row scope, selecting the best qualifying row. Use
+    ``expected_count_scope="page"`` to constrain the total across all rows.
     """
+    config = config or DetectionConfig()
+    if expected_count_scope not in {"row", "page"}:
+        raise ValueError("expected_count_scope must be row or page")
     if expected_count is not None and expected_count < 1:
         raise ValueError("expected_count must be positive")
     if not 0.0 <= min_confidence <= 1.0:
@@ -488,17 +713,25 @@ def detect_regions(
 
     image, source_path = _load_image(source)
     mask_result = foreground_mask(image, mode=mode)
-    clean_mask, found, primary_area, median_height, warnings = _clean_page_mask(mask_result.mask)
-    rows = detect_rows(clean_mask)
+    (
+        clean_mask,
+        found,
+        primary_area,
+        median_height,
+        warnings,
+        component_decisions,
+    ) = _clean_page_mask(mask_result.mask, config.cleanup)
+    rows = detect_rows(clean_mask, config=config)
     if padding is None:
         padding = max(1, round(median_height * 0.08)) if median_height else 1
     if padding < 0:
         raise ValueError("padding must be nonnegative")
 
     status: str = "ok"
+    partition_boundaries: tuple[PartitionBoundary, ...] = ()
     if expected_count is None:
         regions = _automatic_regions(
-            image, clean_mask, found, primary_area, median_height, rows, padding
+            image, clean_mask, found, primary_area, median_height, rows, padding, config.grouping
         )
         if not regions:
             status = "failed"
@@ -506,14 +739,22 @@ def detect_regions(
             status = "ambiguous"
     else:
         selected = _expected_count_regions(
-            image, clean_mask, found, rows, median_height, expected_count, padding
+            image,
+            clean_mask,
+            found,
+            rows,
+            median_height,
+            expected_count,
+            padding,
+            config.grouping,
+            expected_count_scope,
         )
         if selected is None:
             regions = []
             status = "failed"
             warnings.append(f"Unable to recover {expected_count} credible regions.")
         else:
-            regions, confidence = selected
+            regions, confidence, partition_boundaries = selected
             if confidence < min_confidence:
                 regions = []
                 status = "failed"
@@ -523,6 +764,22 @@ def detect_regions(
                     f"below the required {min_confidence:.3f}."
                 )
 
+    diagnostics = DetectionDiagnostics(
+        image_size=image.size,
+        mask_threshold=mask_result.threshold,
+        raw_component_count=len(component_decisions),
+        cleaned_component_count=len(found),
+        component_decisions=component_decisions,
+        partition_boundaries=partition_boundaries,
+        mode=mode,
+        padding=padding,
+        min_confidence=min_confidence,
+        expected_count=expected_count,
+        expected_count_scope=expected_count_scope,
+        mask_method=mask_result.method,
+        mask_confidence=mask_result.confidence,
+        foreground_fraction=float(mask_result.mask.mean()),
+    )
     return DetectionResult(
         source_path=source_path,
         image=image,
@@ -534,4 +791,7 @@ def detect_regions(
         expected_count=expected_count,
         status=status,  # type: ignore[arg-type]
         warnings=tuple([*mask_result.warnings, *warnings]),
+        component_decisions=component_decisions,
+        expected_count_scope=expected_count_scope,
+        diagnostics=diagnostics,
     )

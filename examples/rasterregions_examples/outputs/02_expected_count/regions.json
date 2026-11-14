@@ -1,0 +1,171 @@
+{
+  "rasterregions_version": "0.1.0.dev2+g91d419cd2.d19800101",
+  "source": "02_expected_count_three.png",
+  "status": "ok",
+  "expected_count": 3,
+  "detected_count": 3,
+  "image": {
+    "width": 460,
+    "height": 150
+  },
+  "parameters": {
+    "mode": "auto",
+    "padding": 3,
+    "min_confidence": 0.3,
+    "expected_count": 3,
+    "expected_count_scope": "row"
+  },
+  "mask": {
+    "method": "grayscale",
+    "threshold": 0.0,
+    "confidence": 1.0,
+    "foreground_fraction": 0.014029,
+    "warnings": []
+  },
+  "cleanup": [
+    {
+      "component_index": 0,
+      "bbox": [
+        440,
+        12,
+        441,
+        13
+      ],
+      "area": 1,
+      "action": "removed",
+      "reason": "tiny isolated noise"
+    },
+    {
+      "component_index": 1,
+      "bbox": [
+        197,
+        45,
+        204,
+        52
+      ],
+      "area": 37,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 2,
+      "bbox": [
+        35,
+        55,
+        65,
+        89
+      ],
+      "area": 460,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 3,
+      "bbox": [
+        198,
+        56,
+        203,
+        78
+      ],
+      "area": 110,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 4,
+      "bbox": [
+        348,
+        56,
+        377,
+        88
+      ],
+      "area": 360,
+      "action": "kept",
+      "reason": null
+    }
+  ],
+  "rows": [
+    {
+      "row": 0,
+      "bbox": [
+        35,
+        55,
+        377,
+        89
+      ],
+      "component_indices": [
+        2,
+        1,
+        3
+      ]
+    }
+  ],
+  "partition_boundaries": [
+    {
+      "x": 65,
+      "projection": 0.0,
+      "crossing_components": 0,
+      "confidence": 1.0
+    },
+    {
+      "x": 204,
+      "projection": 0.0,
+      "crossing_components": 0,
+      "confidence": 1.0
+    }
+  ],
+  "warnings": [
+    "Removed component 0: tiny isolated noise."
+  ],
+  "regions": [
+    {
+      "id": "region-000",
+      "row": 0,
+      "column": 0,
+      "reading_order": 0,
+      "bbox": [
+        32,
+        52,
+        68,
+        92
+      ],
+      "confidence": 0.8536,
+      "component_indices": [
+        1
+      ]
+    },
+    {
+      "id": "region-001",
+      "row": 0,
+      "column": 1,
+      "reading_order": 1,
+      "bbox": [
+        194,
+        42,
+        207,
+        81
+      ],
+      "confidence": 0.8536,
+      "component_indices": [
+        0,
+        2
+      ]
+    },
+    {
+      "id": "region-002",
+      "row": 0,
+      "column": 2,
+      "reading_order": 2,
+      "bbox": [
+        345,
+        53,
+        380,
+        91
+      ],
+      "confidence": 0.8536,
+      "component_indices": [
+        3
+      ]
+    }
+  ]
+}

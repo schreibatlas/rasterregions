@@ -8,7 +8,7 @@ It was extracted from the generic image-segmentation work in InkGrammar.
 
 ## MVP scope
 
-- foreground-mask extraction for grayscale, dark-on-paper, and colored ink
+- foreground-mask extraction for grayscale, dark-on-paper, colored, hybrid, and adaptive modes
 - 8-connected component detection
 - removal of obvious page borders, long rules, and tiny isolated noise
 - row detection
@@ -56,6 +56,30 @@ result = detect_regions("written.png", expected_count=3)
 assert len(result.regions) == 3
 ```
 
+
+`expected_count` is row-scoped by default. It partitions the best qualifying row
+into the requested number of regions. To constrain the total over all detected
+rows, use page scope:
+
+```python
+result = detect_regions(
+    "worksheet.png", expected_count=8, expected_count_scope="page"
+)
+```
+
+Confidence values are deterministic heuristic scores in `[0, 1]`, based on
+separation and segment plausibility. They are not calibrated probabilities.
+
+
+Cleanup and grouping heuristics can be tuned through a configuration object:
+
+```python
+from rasterregions import CleanupConfig, DetectionConfig, detect_regions
+
+config = DetectionConfig(cleanup=CleanupConfig(rule_min_span_ratio=0.3))
+result = detect_regions("page.png", config=config)
+```
+
 Mask-only operation:
 
 ```python
@@ -64,6 +88,12 @@ from rasterregions import foreground_mask
 mask = foreground_mask(image, mode="auto")
 print(mask.method, mask.confidence)
 ```
+
+
+`auto` deterministically scores grayscale, dark-relative, color, and hybrid
+candidates. Explicit `color` mode remains color-only. The opt-in `adaptive` mode
+uses a local mean threshold for uneven illumination. `foreground_mask` also
+accepts `adaptive_window_size` and `adaptive_offset`.
 
 Component isolation:
 
@@ -85,6 +115,17 @@ For an expected number of regions:
 rasterregions detect written.png --expected-count 3 --output build/written
 ```
 
+
+For page-wide counts and machine-readable stdout:
+
+```bash
+rasterregions detect worksheet.png --expected-count 8 \
+  --expected-count-scope page --json --no-crops --no-overlay --output build/page
+```
+
+Use `--no-crops`, `--no-overlay`, or `--no-mask` to omit individual image
+artifacts. The JSON manifest is still written to the output directory.
+
 The output directory contains:
 
 ```text
@@ -96,6 +137,11 @@ crops/
   region-001.png
   ...
 ```
+
+
+`regions.json` adds the package version, image dimensions, effective parameters,
+mask threshold and foreground fraction, cleanup decisions, row metadata, and
+partition boundaries. Existing manifest keys remain available.
 
 ## Package layout
 

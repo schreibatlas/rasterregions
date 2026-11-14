@@ -1,0 +1,43 @@
+
+=== example_01_auto_regions.py ===
+status=ok regions=8 mask=grayscale
+region-000 row 0 col 0 bbox (32, 37, 68, 77) confidence 0.92
+region-001 row 0 col 1 bbox (154, 37, 167, 76) confidence 0.92
+region-002 row 0 col 2 bbox (270, 38, 305, 76) confidence 0.92
+region-003 row 0 col 3 bbox (410, 37, 421, 76) confidence 0.92
+region-004 row 1 col 0 bbox (40, 153, 75, 191) confidence 0.92
+region-005 row 1 col 1 bbox (172, 152, 207, 187) confidence 0.92
+region-006 row 1 col 2 bbox (304, 152, 317, 191) confidence 0.92
+region-007 row 1 col 3 bbox (417, 152, 452, 189) confidence 0.92
+warnings:
+- Removed component 0: tiny isolated noise.
+manifest: /mnt/data/rasterregions_examples/outputs/01_auto_regions/regions.json
+
+=== example_02_expected_count.py ===
+bboxes: [(32, 52, 68, 92), (194, 42, 207, 81), (345, 53, 380, 91)]
+confidences: [1.0, 1.0, 1.0]
+manifest: /mnt/data/rasterregions_examples/outputs/02_expected_count/regions.json
+
+=== example_03_color_mask.py ===
+selected mask method: color confidence: 1.0
+detected regions: 3
+
+=== example_04_dark_paper.py ===
+status: ok
+mask confidence: 1.0
+regions: [(42, 76, 78, 118), (199, 77, 212, 116), (344, 78, 381, 116)]
+
+=== example_05_component_isolation.py ===
+components: [(0, (205, 25, 216, 36), 97), (1, (35, 55, 106, 126), 3941), (2, (320, 55, 391, 136), 2911), (3, (175, 65, 246, 136), 5041)]
+candidates: [((205, 25, 216, 36), False, 'nearest-to-competing-center'), ((35, 55, 106, 126), False, 'nearest-to-competing-center'), ((320, 55, 391, 136), True, 'nearest-to-center'), ((175, 65, 246, 136), False, 'nearest-to-competing-center')]
+
+=== example_06_numpy_input.py ===
+source_path: None
+status/count: ok 3
+
+=== example_07_current_edge_cases.py ===
+mixed-ink auto color 1 [(175, 45, 246, 116)]
+mixed-ink dark dark 3 [(30, 45, 101, 116), (175, 45, 246, 116), (320, 45, 391, 116)]
+dark-gray grayscale foreground fraction: 0.0 ('No foreground pixels were detected.',)
+touching expected_count=3: failed 0 ('Removed component 0: page border, rule, or oversized artifact.', 'Unable to recover 3 credible regions.')
+single expected_count=1: failed 0 ('Unable to recover 1 credible regions: best partition confidence is 0.000, below the required 0.300.',)

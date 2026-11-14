@@ -40,3 +40,68 @@ def test_dark_mode_handles_gray_background() -> None:
     assert result.method == "dark"
     assert result.mask[8:32, 20].all()
     assert not result.mask[0, 0]
+
+
+def test_grayscale_otsu_uses_consistent_quantization() -> None:
+    image = np.full((40, 40, 3), 255, dtype=np.uint8)
+    image[10:30, 18:22] = 15
+
+    result = foreground_mask(image, mode="grayscale")
+
+    assert result.mask[10:30, 18:22].all()
+    assert result.threshold == 15.0
+    assert not result.mask[0, 0]
+
+
+def test_auto_preserves_black_and_colored_foreground_without_gray_guide() -> None:
+    image = Image.new("RGB", (120, 70), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((12, 18, 30, 48), fill="black")
+    draw.rectangle((49, 18, 67, 48), fill=(20, 70, 220))
+    draw.rectangle((86, 18, 104, 48), fill="black")
+    draw.line((3, 60, 116, 60), fill=(180, 180, 180), width=1)
+
+    result = foreground_mask(image, mode="auto")
+
+    assert result.method == "hybrid"
+    assert result.threshold == 175.0
+    assert result.mask[30, 20]
+    assert result.mask[30, 58]
+    assert result.mask[30, 95]
+    assert not result.mask[60, 50]
+
+
+def test_rgba_mask_composites_transparent_pixels_onto_white() -> None:
+    image = np.zeros((40, 40, 4), dtype=np.uint8)
+    image[10:30, 18:22, 3] = 255
+
+    result = foreground_mask(image, mode="grayscale")
+
+    assert result.mask[10:30, 18:22].all()
+    assert not result.mask[0, 0]
+
+
+def test_color_mode_remains_color_only() -> None:
+    image = Image.new("RGB", (80, 50), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((10, 10, 25, 35), fill="black")
+    draw.rectangle((45, 10, 60, 35), fill=(20, 70, 220))
+
+    result = foreground_mask(image, mode="color")
+
+    assert result.method == "color"
+    assert result.mask[20, 50]
+    assert not result.mask[20, 15]
+
+
+def test_adaptive_mode_handles_local_background_levels() -> None:
+    gradient = np.tile(np.linspace(220, 255, 100, dtype=np.uint8), (80, 1))
+    gradient[25:55, 48:52] = 30
+
+    result = foreground_mask(gradient, mode="adaptive", adaptive_window_size=31)
+
+    assert result.method == "adaptive"
+    assert result.threshold is None
+    assert result.mask[25:55, 48:52].all()
+    assert not result.mask[10, 10]
+    assert not result.mask[10, 90]

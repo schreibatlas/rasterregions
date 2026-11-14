@@ -1,0 +1,144 @@
+{
+  "rasterregions_version": "0.1.0.dev2+g91d419cd2.d19800101",
+  "source": "04_dark_ink_gray_paper.png",
+  "status": "ok",
+  "expected_count": null,
+  "detected_count": 3,
+  "image": {
+    "width": 500,
+    "height": 210
+  },
+  "parameters": {
+    "mode": "dark",
+    "padding": 3,
+    "min_confidence": 0.3,
+    "expected_count": null,
+    "expected_count_scope": "row"
+  },
+  "mask": {
+    "method": "dark",
+    "threshold": 171.0,
+    "confidence": 1.0,
+    "foreground_fraction": 0.010819,
+    "warnings": []
+  },
+  "cleanup": [
+    {
+      "component_index": 0,
+      "bbox": [
+        45,
+        79,
+        75,
+        115
+      ],
+      "area": 538,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 1,
+      "bbox": [
+        202,
+        80,
+        209,
+        87
+      ],
+      "area": 37,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 2,
+      "bbox": [
+        347,
+        81,
+        378,
+        113
+      ],
+      "area": 429,
+      "action": "kept",
+      "reason": null
+    },
+    {
+      "component_index": 3,
+      "bbox": [
+        203,
+        91,
+        209,
+        113
+      ],
+      "area": 132,
+      "action": "kept",
+      "reason": null
+    }
+  ],
+  "rows": [
+    {
+      "row": 0,
+      "bbox": [
+        45,
+        79,
+        378,
+        115
+      ],
+      "component_indices": [
+        0,
+        2,
+        3
+      ]
+    }
+  ],
+  "partition_boundaries": [],
+  "warnings": [],
+  "regions": [
+    {
+      "id": "region-000",
+      "row": 0,
+      "column": 0,
+      "reading_order": 0,
+      "bbox": [
+        42,
+        76,
+        78,
+        118
+      ],
+      "confidence": 1.0,
+      "component_indices": [
+        0
+      ]
+    },
+    {
+      "id": "region-001",
+      "row": 0,
+      "column": 1,
+      "reading_order": 1,
+      "bbox": [
+        199,
+        77,
+        212,
+        116
+      ],
+      "confidence": 1.0,
+      "component_indices": [
+        1,
+        3
+      ]
+    },
+    {
+      "id": "region-002",
+      "row": 0,
+      "column": 2,
+      "reading_order": 2,
+      "bbox": [
+        344,
+        78,
+        381,
+        116
+      ],
+      "confidence": 1.0,
+      "component_indices": [
+        2
+      ]
+    }
+  ]
+}

@@ -7,8 +7,9 @@ from typing import Literal
 import numpy as np
 from PIL import Image
 
-MaskMethod = Literal["grayscale", "dark", "color"]
-MaskMode = Literal["auto", "grayscale", "dark", "color"]
+MaskMethod = Literal["grayscale", "dark", "color", "hybrid", "adaptive"]
+MaskMode = Literal["auto", "grayscale", "dark", "color", "hybrid", "adaptive"]
+ExpectedCountScope = Literal["row", "page"]
 DetectionStatus = Literal["ok", "ambiguous", "failed"]
 
 
@@ -54,6 +55,8 @@ class MaskResult:
     method: MaskMethod
     warnings: tuple[str, ...] = ()
 
+    threshold: float | None = None
+
     def __post_init__(self) -> None:
         mask = np.asarray(self.mask, dtype=bool)
         if mask.ndim != 2:
@@ -90,6 +93,73 @@ class Component:
     @property
     def center_y(self) -> float:
         return self.bbox.center_y
+
+
+@dataclass(frozen=True)
+class ComponentDecision:
+    component_index: int
+    bbox: BBox
+    area: int
+    action: Literal["kept", "removed"]
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PartitionBoundary:
+    x: int
+    projection: float
+    crossing_components: int
+    confidence: float
+
+
+@dataclass(frozen=True)
+class CleanupConfig:
+    tiny_area_ratio: float = 0.008
+    rule_aspect_ratio: float = 12.0
+    rule_min_span_ratio: float = 0.20
+    border_span_ratio: float = 0.80
+    border_bbox_ratio: float = 0.20
+    border_fill_ratio: float = 0.15
+    max_component_area_ratio: float = 0.50
+
+
+@dataclass(frozen=True)
+class GroupingConfig:
+    body_min_area_ratio: float = 0.18
+    body_min_height_ratio: float = 0.25
+    row_center_gap_ratio: float = 0.72
+    body_join_gap_ratio: float = 0.12
+    satellite_max_area_ratio: float = 0.60
+    satellite_max_horizontal_gap_ratio: float = 0.40
+    satellite_max_vertical_gap_ratio: float = 1.25
+
+
+@dataclass(frozen=True)
+class DetectionConfig:
+    cleanup: CleanupConfig = field(default_factory=CleanupConfig)
+    grouping: GroupingConfig = field(default_factory=GroupingConfig)
+
+
+@dataclass(frozen=True)
+class DetectionDiagnostics:
+    image_size: tuple[int, int]
+    mask_threshold: float | None
+    raw_component_count: int
+    cleaned_component_count: int
+    component_decisions: tuple[ComponentDecision, ...]
+    partition_boundaries: tuple[PartitionBoundary, ...] = ()
+    mode: MaskMode = "auto"
+    padding: int = 0
+    min_confidence: float = 0.3
+    expected_count: int | None = None
+    expected_count_scope: ExpectedCountScope = "row"
+    mask_method: MaskMethod = "grayscale"
+    mask_confidence: float = 0.0
+    foreground_fraction: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
+        object.__setattr__(self, "partition_boundaries", tuple(self.partition_boundaries))
 
 
 @dataclass(frozen=True)
@@ -137,6 +207,9 @@ class DetectionResult:
     expected_count: int | None = None
     status: DetectionStatus = "ok"
     warnings: tuple[str, ...] = ()
+    component_decisions: tuple[ComponentDecision, ...] = ()
+    expected_count_scope: ExpectedCountScope = "row"
+    diagnostics: DetectionDiagnostics | None = None
 
     def __post_init__(self) -> None:
         clean = np.asarray(self.clean_mask, dtype=bool)
@@ -146,6 +219,7 @@ class DetectionResult:
         clean.setflags(write=False)
         object.__setattr__(self, "clean_mask", clean)
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
         if self.source_path is not None:
             object.__setattr__(self, "source_path", Path(self.source_path))
 
