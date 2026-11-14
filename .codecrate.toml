@@ -1,0 +1,25 @@
+[codecrate]
+output = "context_rasterregions.md"
+keep_docstrings = true
+dedupe = true
+metadata = false
+respect_gitignore = true
+exclude = ["*/.venv/*", "context_rasterregions.*"]
+gitignore_allow = ["rasterregions/_version.py"]
+include = [
+  "**/*.py",
+  "**/*.toml",
+  "**/*.md",
+  "**/*.json",
+  "**/*.txt",
+  "**/*.csv",
+  "**/*.tsv",
+  "**/*.yaml",
+  "**/*.yml",
+  "**/*.typed",
+  "LICENSE",
+]
+split_max_chars = 0
+layout = "full"
+profile = "portable-agent"
+emit_standalone_unpacker = true
