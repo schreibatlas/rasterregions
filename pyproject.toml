@@ -29,12 +29,20 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
+[project.urls]
+Homepage = "https://github.com/schreibatlas/rasterregions"
+Repository = "https://github.com/schreibatlas/rasterregions"
+Documentation = "https://github.com/schreibatlas/rasterregions/tree/main/docs"
+Issues = "https://github.com/schreibatlas/rasterregions/issues"
+Changelog = "https://github.com/schreibatlas/rasterregions/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
   "pytest>=8",
   "ruff>=0.8",
   "mypy>=1.10",
+  "twine>=5",
 ]
 
 [project.scripts]
@@ -54,7 +62,11 @@ addopts = "-q"
 pythonpath = ["."]
 
 [tool.ruff]
-extend-exclude = ["RASTERREGIONS_CODE_REVIEW.md"]
+extend-exclude = [
+  "RASTERREGIONS_CODE_REVIEW.md",
+  "RASTERREGIONS_V0_1_RELEASE_AND_INKGRAMMAR_REVIEW.md",
+  "rasterregions/_version.py",
+]
 target-version = "py310"
 line-length = 100
 

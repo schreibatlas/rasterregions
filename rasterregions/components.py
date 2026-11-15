@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import numpy as np
 
-from .models import BBox, Component, IsolationCandidate, IsolationResult
+from .models import (
+    BBox,
+    Component,
+    IsolationCandidate,
+    IsolationReason,
+    IsolationResult,
+)
 
 
 def components(mask: np.ndarray) -> tuple[Component, ...]:
-    """Label 8-connected foreground components.
+    """Label 8-connected foreground components in row-major discovery order.
 
-    The implementation is dependency-light and intentionally avoids requiring
-    SciPy or scikit-image.
+    Each component has a half-open bbox and read-only ``ys``/``xs`` pixel arrays.
+    The implementation avoids SciPy and scikit-image.
     """
     ink = np.asarray(mask, dtype=bool)
     if ink.ndim != 2:
@@ -54,7 +60,10 @@ def isolate_component(
     center: tuple[float, float],
     competing_centers: tuple[tuple[float, float], ...] = (),
 ) -> IsolationResult:
-    """Select the component nearest ``center`` and explain rejected candidates."""
+    """Select the component nearest ``center`` and explain every candidate decision.
+
+    Competing centers distinguish components closer to another anchor from those
+    that are simply not nearest to any supplied center."""
     found = components(mask)
     if not found:
         return IsolationResult(center=center, mask=np.asarray(mask, dtype=bool).copy())
@@ -67,7 +76,7 @@ def isolate_component(
     records: list[IsolationCandidate] = []
     for component in found:
         is_kept = component.index == kept.index
-        reason = "nearest-to-center"
+        reason: IsolationReason = "nearest-to-center"
         if is_kept:
             selected[component.ys, component.xs] = True
         elif competing_centers and min(

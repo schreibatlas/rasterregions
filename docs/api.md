@@ -1,6 +1,6 @@
-# API reference
+# Python API reference
 
-The package-level API re-exports the principal image, detection, configuration, and model types.
+The package-level namespace exports the supported models, configuration types, and core functions. The API docs are generated from the source docstrings:
 
 ```{eval-rst}
 .. automodule:: rasterregions
@@ -16,4 +16,4 @@ The package-level API re-exports the principal image, detection, configuration, 
 .. autofunction:: rasterregions.io.write_detection
 ```
 
-`DetectionResult`, `MaskResult`, `Region`, and `DetectionDiagnostics` are frozen data models. Image snapshots returned in the result are independent Pillow images and remain mutable by the caller. Component coordinate arrays are copied and read-only.
+See [Compatibility and schema policy](compatibility.md) for the pre-1.0 API and JSON manifest contracts.

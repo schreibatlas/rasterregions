@@ -13,6 +13,10 @@ from .models import DetectionResult
 
 
 def detection_payload(result: DetectionResult) -> dict:
+    """Return the schema-versioned JSON-compatible representation of ``result``.
+
+    Component indexes in the payload use the ``raw_mask`` namespace.
+    """
     from . import __version__
 
     diagnostics = result.diagnostics
@@ -34,6 +38,7 @@ def detection_payload(result: DetectionResult) -> dict:
             "min_confidence": diagnostics.min_confidence if diagnostics else 0.3,
             "expected_count": result.expected_count,
             "expected_count_scope": result.expected_count_scope,
+            "roi": list(diagnostics.roi.as_tuple()) if diagnostics and diagnostics.roi else None,
         },
         "mask": {
             "method": result.mask_result.method,
@@ -135,7 +140,10 @@ def write_detection(
     include_overlay: bool = True,
     include_mask: bool = True,
 ) -> Path:
-    """Write selected image artifacts and the JSON diagnostics manifest."""
+    """Write selected image artifacts and publish ``regions.json`` last.
+
+    Reruns remove stale managed crops and disabled mask/overlay artifacts while
+    leaving unrelated files in the output directory untouched."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 

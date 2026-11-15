@@ -478,3 +478,50 @@ def test_row_scope_only_computes_requested_partition_count(monkeypatch) -> None:
 
     assert result.status == "ok"
     assert attempted_counts == [2, 2]
+
+
+def test_expected_count_padding_stays_inside_partition_cells() -> None:
+    result = detect_regions(_sample_page(), expected_count=3, mode="dark", padding=30)
+
+    assert result.status == "ok"
+    assert result.diagnostics is not None
+    boundaries = tuple(boundary.x for boundary in result.diagnostics.partition_boundaries)
+    assert len(boundaries) == 2
+    edges = (0, *boundaries, result.image.width)
+    cells = tuple(zip(edges[:-1], edges[1:], strict=True))
+    for region, (left, right) in zip(result.regions, cells, strict=True):
+        assert left <= region.bbox.x0 < region.bbox.x1 <= right
+
+
+def test_roi_expected_count_uses_full_image_coordinates(tmp_path) -> None:
+    image = _two_row_page()
+    path = tmp_path / "page.png"
+    image.save(path)
+    roi = BBox(10, 10, 210, 60)
+
+    result = detect_regions(path, expected_count=2, mode="dark", padding=20, roi=roi)
+
+    assert result.status == "ok"
+    assert len(result.regions) == 2
+    assert result.source_path == path
+    assert result.image.size == image.size
+    assert result.mask_result.mask.shape == (130, 220)
+    assert result.diagnostics is not None
+    assert result.diagnostics.image_size == image.size
+    assert result.diagnostics.roi == roi
+    assert result.diagnostics.foreground_fraction == float(result.mask_result.mask.mean())
+    for region in result.regions:
+        assert roi.x0 <= region.bbox.x0 < region.bbox.x1 <= roi.x1
+        assert roi.y0 <= region.bbox.y0 < region.bbox.y1 <= roi.y1
+    for component in result.components:
+        assert roi.x0 <= component.bbox.x0 < component.bbox.x1 <= roi.x1
+        assert roi.y0 <= component.bbox.y0 < component.bbox.y1 <= roi.y1
+
+    outside_roi = result.mask_result.mask.copy()
+    outside_roi[roi.y0 : roi.y1, roi.x0 : roi.x1] = False
+    assert not outside_roi.any()
+
+
+def test_roi_must_fit_image() -> None:
+    with pytest.raises(ValueError, match="roi exceeds image bounds"):
+        detect_regions(_sample_page(), roi=BBox(250, 0, 261, 10))

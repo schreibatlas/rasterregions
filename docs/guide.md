@@ -1,91 +1,38 @@
-# User guide
+# Concepts and input contracts
 
-## Installation
+## Processing boundary
 
-Install the runtime package with pip:
+The library's domain-neutral pipeline is:
 
-```bash
-python -m pip install rasterregions
+```text
+image -> foreground mask -> components -> rows -> anonymous regions and crops
 ```
 
-The runtime dependencies are NumPy and Pillow. For development, install the optional tools with `python -m pip install -e ".[dev]"`.
+Applications own OCR, glyph identity, document semantics, and domain labels. A `Region` describes geometry and contains an image crop and mask; it does not claim what the foreground depicts.
 
-## Supported input and coordinate contract
+## Input images
 
-`detect_regions` and `foreground_mask` accept a path, a Pillow image, or a NumPy array. Arrays may be two-dimensional grayscale or have three RGB or four RGBA channels. Values must be finite numeric values. Floating-point arrays in `[0, 1]` are scaled to `[0, 255]`; conversion clips values to that range. RGBA inputs are composited over white.
+`detect_regions` and `foreground_mask` accept a filesystem path, a Pillow image, or a NumPy array. Arrays may be two-dimensional grayscale or have RGB/RGBA channels. Values must be finite numeric values. Floating-point arrays in `[0, 1]` are scaled to `[0, 255]`; values are clipped to that range during conversion. RGBA inputs are composited over white.
 
-Paths and Pillow inputs are transposed using their EXIF orientation before detection. Coordinates, masks, overlays, and crops therefore refer to the orientation-corrected image. NumPy arrays have no EXIF metadata and retain their supplied orientation. Bounding boxes use half-open coordinates `(x0, y0, x1, y1)`, where the right and bottom edges are excluded.
+Paths and Pillow images are transposed according to EXIF orientation before processing. Reported boxes, masks, overlays, and crops use the orientation-corrected coordinates. NumPy arrays have no EXIF metadata and retain their supplied orientation.
 
-## Detection
+## Coordinates and arrays
 
-Automatic detection returns anonymous regions in row-major reading order:
+`BBox(x0, y0, x1, y1)` uses half-open pixel coordinates: the left/top edges are included, while the right/bottom edges are excluded. A box has nonnegative origin and positive width and height. Region rows, columns, and reading-order indexes are zero-based. Rows are ordered top to bottom and regions within each row left to right. Right-to-left ordering is not inferred.
 
-```python
-from rasterregions import detect_regions
+Masks use boolean values with `True` for foreground. `MaskResult.mask`, `DetectionResult.clean_mask`, component coordinates, region masks, and isolation masks are copied read-only NumPy snapshots. Result dataclasses are frozen. Pillow images in results are independent mutable copies, so editing a crop does not modify the source or another result.
 
-result = detect_regions("page.jpg")
-for region in result.regions:
-    print(region.reading_order, region.bbox, region.confidence)
-```
+## Configuration and confidence
 
-Rows and columns are zero-based. Regions within a row are ordered from left to right. The library does not infer right-to-left ordering or semantic labels.
+`DetectionConfig` groups `CleanupConfig`, `GroupingConfig`, `MaskConfig`, and `PartitionConfig`. Configuration dataclasses validate their values and reject non-finite or out-of-domain settings rather than silently clamping them. See [Masking](masking.md) and [Detection](detection.md) for mode and parameter behavior.
 
-An expected count requests projection-based partitioning:
+Confidence values are deterministic heuristic scores in `[0, 1]`, not calibrated probabilities. Mask confidence is separate from region and partition confidence and does not gate detection status.
 
-```python
-result = detect_regions("worksheet.png", expected_count=8)
-```
+## Current limits
 
-The default `expected_count_scope="row"` partitions the best qualifying row. Use `expected_count_scope="page"` to constrain the total across detected rows. A caller should only provide a count when it has external evidence for that count.
+This release is an MVP for sparse images with separated foreground objects. Touching objects, dense prose, rotated layouts, nested regions, and arbitrary document layout require stronger algorithms. Use an expected count only when the caller has external evidence for it.
 
-## Masking and configuration
 
-`foreground_mask` supports `auto`, `grayscale`, `dark`, `color`, `hybrid`, and `adaptive` modes. Auto mode scores candidate masks. Explicit color mode remains color-only. Adaptive mode uses a local mean threshold for uneven illumination.
+## Benchmarks
 
-`DetectionConfig` groups `CleanupConfig`, `GroupingConfig`, `MaskConfig`, and `PartitionConfig`. These frozen configuration objects validate finite values and domain constraints. Adaptive settings can be passed through detection without adding command-line options:
-
-```python
-from rasterregions import DetectionConfig, MaskConfig, detect_regions
-
-config = DetectionConfig(mask=MaskConfig(adaptive_window_size=21, adaptive_offset=8.0))
-result = detect_regions("page.png", mode="adaptive", config=config)
-```
-
-`foreground_mask` also accepts the `adaptive_window_size` and `adaptive_offset` keyword arguments directly.
-
-## Status and confidence
-
-Statuses are `ok`, `ambiguous`, and `failed`:
-
-- Automatic detection is `ambiguous` if any returned region has confidence below `min_confidence`. The regions remain available for review.
-- Expected-count detection is `failed` if no credible partition is found or the best partition confidence is below `min_confidence`. In that case, the result has no regions.
-- Mask confidence is a separate diagnostic. It contributes warnings, but does not gate detection status.
-
-Mask, region, and partition confidence values are deterministic heuristic scores in `[0, 1]`. They are not calibrated probabilities and should not be compared as though they share one evidence scale.
-
-## Component identity and diagnostics
-
-Cleanup decisions, rows, regions, and the JSON payload refer to component indexes in the original foreground mask. The payload declares `component_index_namespace: "raw_mask"`; removed components can therefore leave gaps in the indexes of retained components.
-
-`DetectionResult.diagnostics` provides image dimensions, mask and cleanup information, parameters, and partition boundaries. `detection_payload(result)` returns a JSON-compatible representation with `schema_version` set to `1`.
-
-## Writing output artifacts
-
-`write_detection` writes the JSON manifest and optional crops, mask, and overlay:
-
-```python
-from rasterregions.io import write_detection
-
-manifest_path = write_detection(result, "build/regions")
-```
-
-The function returns the `regions.json` path. Reruns remove stale managed crop files and disabled mask or overlay outputs while preserving unrelated files. Image artifacts are replaced atomically and the JSON manifest is published last as the completion marker.
-
-The CLI exposes detection and artifact selection:
-
-```bash
-rasterregions detect page.png --expected-count 3 --output build/page
-rasterregions detect page.png --json --no-crops --no-overlay --output build/page
-```
-
-Use `rasterregions detect --help` for the complete option list.
+The opt-in benchmark suite provides deterministic dense/sparse component masks and partition rows of 2,000 or 4,000 pixels. Run it from the repository root with `python -m benchmarks.benchmark_workloads --repeat 5 --warmup 1`; see [Opt-in benchmarks](benchmarks.md) for workload definitions. Timings depend on the machine and are not CI assertions. Compare before/after runs under controlled conditions and include representative application workloads.

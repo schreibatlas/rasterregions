@@ -89,7 +89,7 @@ def test_frozen_models_normalize_sequence_fields() -> None:
     isolation = IsolationResult(
         center=(1.0, 1.0),
         mask=np.zeros((10, 10), dtype=bool),
-        candidates=[IsolationCandidate(BBox(1, 1, 3, 3), 4, True, "nearest")],
+        candidates=[IsolationCandidate(BBox(1, 1, 3, 3), 4, True, "nearest-to-center")],
     )
 
     assert isinstance(result.components, tuple)

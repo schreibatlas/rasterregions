@@ -8,7 +8,7 @@ from rasterregions import detect_regions, foreground_mask
 from rasterregions.io import write_detection
 
 ROOT = Path(__file__).resolve().parent
-BUILD = ROOT.parents[1] / "build" / "rasterregions_examples"
+BUILD = ROOT.parent / "build" / "examples"
 
 
 def main() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 from rasterregions import BBox, crop, detect_regions, tighten_bbox
@@ -150,3 +151,33 @@ def test_write_detection_prunes_managed_files_and_preserves_unrelated(
     assert not (tmp_path / "regions.png").exists()
     assert json.loads(manifest.read_text(encoding="utf-8"))["schema_version"] == 1
     assert replacements[-1] == "regions.json"
+
+
+def test_detection_payload_records_roi() -> None:
+    image = Image.new("RGB", (100, 80), "white")
+    ImageDraw.Draw(image).rectangle((35, 20, 64, 49), fill="black")
+    result = detect_regions(image, expected_count=1, mode="dark", roi=BBox(10, 10, 90, 70))
+
+    assert detection_payload(result)["parameters"]["roi"] == [10, 10, 90, 70]
+
+
+def test_tighten_bbox_padding_stays_inside_input_on_left_and_top() -> None:
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[5:8, 5:8] = True
+    bbox = BBox(5, 5, 10, 10)
+
+    assert tighten_bbox(mask, bbox, pad=2) == bbox
+
+
+def test_tighten_bbox_padding_stays_inside_input_on_right_and_bottom() -> None:
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[7:10, 7:10] = True
+
+    assert tighten_bbox(mask, BBox(0, 0, 10, 10), pad=3) == BBox(4, 4, 10, 10)
+
+
+def test_tighten_bbox_empty_mask_returns_original_bbox() -> None:
+    mask = np.zeros((20, 20), dtype=bool)
+    bbox = BBox(3, 4, 12, 13)
+
+    assert tighten_bbox(mask, bbox, pad=3) == bbox

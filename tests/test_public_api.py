@@ -12,3 +12,4 @@ def test_public_api_and_version_exist() -> None:
     assert rasterregions.ComponentDecision
     assert rasterregions.PartitionBoundary
     assert rasterregions.ExpectedCountScope
+    assert rasterregions.IsolationReason

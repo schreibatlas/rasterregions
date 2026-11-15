@@ -13,6 +13,12 @@ MaskMode = Literal["auto", "grayscale", "dark", "color", "hybrid", "adaptive"]
 ExpectedCountScope = Literal["row", "page"]
 DetectionStatus = Literal["ok", "ambiguous", "failed"]
 
+IsolationReason = Literal[
+    "nearest-to-center",
+    "nearest-to-competing-center",
+    "not-nearest-component",
+]
+
 
 @dataclass(frozen=True, order=True)
 class BBox:
@@ -51,6 +57,8 @@ class BBox:
 
 @dataclass(frozen=True)
 class MaskResult:
+    """A read-only two-dimensional foreground mask and its extraction quality."""
+
     mask: np.ndarray
     confidence: float
     method: MaskMethod
@@ -73,6 +81,8 @@ class MaskResult:
 
 @dataclass(frozen=True)
 class Component:
+    """An 8-connected foreground component with row-major index and pixel coordinates."""
+
     index: int
     bbox: BBox
     area: int
@@ -126,6 +136,8 @@ class Component:
 
 @dataclass(frozen=True)
 class ComponentDecision:
+    """A raw-mask component's cleanup disposition and explanation."""
+
     component_index: int
     bbox: BBox
     area: int
@@ -135,6 +147,8 @@ class ComponentDecision:
 
 @dataclass(frozen=True)
 class PartitionBoundary:
+    """A candidate partition cut with projection, crossings, and heuristic confidence."""
+
     x: int
     projection: float
     crossing_components: int
@@ -143,6 +157,8 @@ class PartitionBoundary:
 
 @dataclass(frozen=True)
 class CleanupConfig:
+    """Thresholds controlling border, rule, and tiny-component cleanup."""
+
     tiny_area_ratio: float = 0.008
     rule_aspect_ratio: float = 12.0
     rule_min_span_ratio: float = 0.20
@@ -179,6 +195,8 @@ class CleanupConfig:
 
 @dataclass(frozen=True)
 class GroupingConfig:
+    """Ratios controlling body grouping, row clustering, and satellite attachment."""
+
     body_min_area_ratio: float = 0.18
     body_min_height_ratio: float = 0.25
     row_center_gap_ratio: float = 0.72
@@ -218,6 +236,8 @@ class GroupingConfig:
 
 @dataclass(frozen=True)
 class MaskConfig:
+    """Thresholding and mask-quality parameters for foreground extraction."""
+
     saturation_threshold: float = 0.20
     color_max_value: float = 250.0
     paper_percentile: float = 95.0
@@ -302,6 +322,8 @@ class MaskConfig:
 
 @dataclass(frozen=True)
 class PartitionConfig:
+    """Costs and thresholds used by expected-count partition search."""
+
     crossing_cost: float = 5.0
     projection_cost: float = 3.0
     primary_area_ratio: float = 0.18
@@ -358,6 +380,8 @@ class PartitionConfig:
 
 @dataclass(frozen=True)
 class DetectionConfig:
+    """Combined immutable configuration for detection stages."""
+
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     mask: MaskConfig = field(default_factory=MaskConfig)
@@ -366,6 +390,8 @@ class DetectionConfig:
 
 @dataclass(frozen=True)
 class DetectionDiagnostics:
+    """Detection parameters and intermediate decisions for diagnostics."""
+
     image_size: tuple[int, int]
     mask_threshold: float | None
     raw_component_count: int
@@ -380,6 +406,7 @@ class DetectionDiagnostics:
     mask_method: MaskMethod = "grayscale"
     mask_confidence: float = 0.0
     foreground_fraction: float = 0.0
+    roi: BBox | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
@@ -388,6 +415,8 @@ class DetectionDiagnostics:
 
 @dataclass(frozen=True)
 class RowBand:
+    """A row envelope and the raw-mask component indexes assigned to it."""
+
     bbox: BBox
     component_indices: tuple[int, ...]
 
@@ -397,7 +426,7 @@ class RowBand:
 
 @dataclass(frozen=True)
 class Region:
-    """An anonymous region with an independent mutable PIL image snapshot."""
+    """An anonymous box, crop, and mask with reading-order metadata."""
 
     region_id: str
     bbox: BBox
@@ -426,7 +455,7 @@ class Region:
 
 @dataclass(frozen=True)
 class DetectionResult:
-    """Detection result whose PIL image is an independent mutable snapshot."""
+    """Detection output, diagnostics, immutable masks, and independent image snapshot."""
 
     source_path: Path | None
     image: Image.Image = field(repr=False, compare=False)
@@ -477,14 +506,18 @@ class DetectionResult:
 
 @dataclass(frozen=True)
 class IsolationCandidate:
+    """A component's disposition and reason in an isolation proposal."""
+
     bbox: BBox
     area: int
     kept: bool
-    reason: str
+    reason: IsolationReason
 
 
 @dataclass(frozen=True)
 class IsolationResult:
+    """A selected component mask and decisions for every candidate component."""
+
     center: tuple[float, float]
     mask: np.ndarray = field(repr=False, compare=False)
     candidates: tuple[IsolationCandidate, ...] = ()

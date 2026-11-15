@@ -53,6 +53,8 @@ def draw_glyph(draw: ImageDraw.ImageDraw, x: int, y: int, kind: str, *, fill="bl
 
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
+    for asset in ASSETS.glob("*.png"):
+        asset.unlink()
 
     image = Image.new("RGB", (520, 260), "white")
     draw = ImageDraw.Draw(image)
