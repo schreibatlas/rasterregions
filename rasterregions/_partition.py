@@ -302,7 +302,7 @@ def _partition_row(
                 key=lambda count: (abs(count - target_count), count),
             )[: spacing_config.max_count_candidates]
             candidate_counts.sort()
-        alternatives: list[tuple[float, int, PartitionResult]] = []
+        count_alternatives: list[tuple[float, int, PartitionResult]] = []
         for count in candidate_counts:
             result = _partition_row(
                 row_mask,
@@ -317,18 +317,18 @@ def _partition_row(
                 result_options = (result, *result.alternatives)
                 for option in result_options:
                     adjusted_cost = option.cost + spacing_config.complexity_penalty * (count - 1)
-                    alternatives.append((adjusted_cost, count, option))
-        if not alternatives:
+                    count_alternatives.append((adjusted_cost, count, option))
+        if not count_alternatives:
             if count_truncated:
                 raise SegmentationSearchLimitError(
                     "count-candidate budget exhausted before a feasible partition"
                 )
             return None
-        alternatives.sort(key=lambda item: (item[0], item[1], item[2].cut_positions))
-        selected_options = alternatives[: spacing_config.hypothesis_limit]
+        count_alternatives.sort(key=lambda item: (item[0], item[1], item[2].cut_positions))
+        selected_options = count_alternatives[: spacing_config.hypothesis_limit]
         best_cost, _, best = selected_options[0]
         count_costs: dict[int, float] = {}
-        for candidate_cost, count, _ in alternatives:
+        for candidate_cost, count, _ in count_alternatives:
             count_costs[count] = min(count_costs.get(count, float("inf")), candidate_cost)
         ordered_count_costs = sorted(count_costs.values())
         margin = None
@@ -538,12 +538,12 @@ def _partition_row(
     selected_boundaries: list[PartitionBoundary] = []
     for boundary in boundaries[1:-1]:
         local_cut = boundary - left
-        candidate = candidate_by_x.get(x_offset + boundary) if spacing_config else None
-        if candidate is not None:
-            confidence = candidate.confidence
+        component_penalty = crossing.get(local_cut, 0)
+        boundary_candidate = candidate_by_x.get(x_offset + boundary) if spacing_config else None
+        if boundary_candidate is not None:
+            confidence = boundary_candidate.confidence
         else:
             normalized_valley = float(projection[local_cut] / normalized_scale)
-            component_penalty = crossing.get(local_cut, 0)
             confidence = float(
                 np.clip(
                     1.0
@@ -555,9 +555,8 @@ def _partition_row(
             )
         boundary_confidences.append(confidence)
         if spacing_config:
-            candidate = candidate_by_x.get(x_offset + boundary)
-            if candidate is not None:
-                selected_boundaries.append(replace(candidate, selected=True))
+            if boundary_candidate is not None:
+                selected_boundaries.append(replace(boundary_candidate, selected=True))
         else:
             selected_boundaries.append(
                 PartitionBoundary(
@@ -618,7 +617,7 @@ def _partition_row(
         cut_crossing_cost=cut_crossing_cost,
     )
     if _collect_alternatives and len(final_paths) > 1:
-        alternatives: list[PartitionResult] = []
+        partition_alternatives: list[PartitionResult] = []
         for _, alternative_path in final_paths[1:]:
             alternative = _partition_row(
                 row_mask,
@@ -631,8 +630,8 @@ def _partition_row(
                 _collect_alternatives=False,
             )
             if alternative is not None:
-                alternatives.append(alternative)
-        result = replace(result, alternatives=tuple(alternatives))
+                partition_alternatives.append(alternative)
+        result = replace(result, alternatives=tuple(partition_alternatives))
     return replace(result, truncated=search_truncated)
 
 

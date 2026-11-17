@@ -442,7 +442,7 @@ def write_spaced_hypotheses(
     boundary_draw = ImageDraw.Draw(boundary_overlay)
     diagnostics = selected.diagnostics
     for boundary in diagnostics.partition_boundaries if diagnostics else ():
-        row = (
+        row_diagnostic = (
             next(
                 (
                     item
@@ -454,7 +454,7 @@ def write_spaced_hypotheses(
             if diagnostics
             else None
         )
-        y0, y1 = row.y_range if row else (0, selected.image.height)
+        y0, y1 = row_diagnostic.y_range if row_diagnostic else (0, selected.image.height)
         color = (230, 40, 40) if boundary.selected else (130, 130, 130)
         boundary_draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
     _atomic_save_image(boundary_overlay, output / "candidate_cuts.png")

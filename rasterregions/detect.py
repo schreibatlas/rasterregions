@@ -418,7 +418,7 @@ def detect_spaced_regions(
                             key=lambda count: (abs(count - target), count),
                         )[:candidate_limit]
                         candidate_counts.sort()
-            row_options: list[RowPartition] = []
+            count_options: list[RowPartition] = []
             seen_options: set[tuple[int, ...]] = set()
             for count in candidate_counts:
                 partition = _row_partition_regions(
@@ -439,8 +439,8 @@ def detect_spaced_regions(
                 for option in (partition, *partition.alternatives):
                     if option.cut_positions not in seen_options:
                         seen_options.add(option.cut_positions)
-                        row_options.append(option)
-            options_by_row.append(tuple(row_options))
+                        count_options.append(option)
+            options_by_row.append(tuple(count_options))
         page_options, page_search_truncated = _combine_page_partitions(
             options_by_row, expected_count, config.spacing
         )
@@ -498,10 +498,10 @@ def detect_spaced_regions(
                 config.partition,
                 config.spacing,
             )
-        row_options = (partition, *partition.alternatives) if partition is not None else ()
-        row_partition_options.append(row_options)
+        partition_options = (partition, *partition.alternatives) if partition is not None else ()
+        row_partition_options.append(partition_options)
         if expected_count is None and _row_hypotheses_out is not None:
-            _row_hypotheses_out.append(row_options)
+            _row_hypotheses_out.append(partition_options)
         row_warnings: list[str] = []
         row_regions: list[Region] = []
         row_boundaries: tuple[PartitionBoundary, ...] = ()
@@ -871,6 +871,7 @@ def _selected_page_hypothesis(
 ) -> PagePartitionHypothesis | None:
     if not result.regions:
         return None
+    assert result.unassigned_mask is not None
     diagnostics = result.diagnostics
     rows: list[RowPartitionHypothesis] = []
     regions_by_row = [
@@ -1105,7 +1106,7 @@ def _page_hypotheses_for_partitions(
             else None
         )
         if best_score is None:
-            choices = ((None, 0.0),)
+            choices: tuple[tuple[int | None, float], ...] = ((None, 0.0),)
         else:
             eligible = (
                 scored[:2]

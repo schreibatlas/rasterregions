@@ -96,28 +96,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"manifest: {args.output / 'regions.json'}")
         return 0 if result.status != "failed" else 2
     if args.command == "spaced":
-        result = detect_spaced_region_hypotheses(
+        hypotheses = detect_spaced_region_hypotheses(
             args.image,
             expected_count=args.expected_count,
             row_counts=args.row_counts,
             mode=args.mode,
             min_confidence=args.min_confidence,
         )
-        manifest = write_spaced_hypotheses(result, args.output)
+        manifest = write_spaced_hypotheses(hypotheses, args.output)
         if args.json_output:
-            print(json.dumps(spaced_hypotheses_payload(result), ensure_ascii=False))
+            print(json.dumps(spaced_hypotheses_payload(hypotheses), ensure_ascii=False))
         else:
-            print(f"status: {result.selected.status}")
-            print(f"regions: {len(result.selected.regions)}")
-            print(f"page hypotheses: {len(result.page_hypotheses)}")
-            diagnostics = result.selected.diagnostics
-            print(f"search truncated: {result.truncated}")
+            print(f"status: {hypotheses.selected.status}")
+            print(f"regions: {len(hypotheses.selected.regions)}")
+            print(f"page hypotheses: {len(hypotheses.page_hypotheses)}")
+            diagnostics = hypotheses.selected.diagnostics
+            print(f"search truncated: {hypotheses.truncated}")
             if diagnostics and diagnostics.search_limit:
                 print(f"search limit: {diagnostics.search_limit}")
-            if result.failure_reason:
-                print(f"failure: {result.failure_reason}")
+            if hypotheses.failure_reason:
+                print(f"failure: {hypotheses.failure_reason}")
             print(f"manifest: {manifest}")
-        return 0 if result.selected.status != "failed" else 2
+        return 0 if hypotheses.selected.status != "failed" else 2
     return 2
 
 
