@@ -29,6 +29,20 @@ manifest = write_detection(result, "build/page")
 print(result.status, manifest)
 ```
 
+## Spaced-region segmentation
+
+Use `detect_spaced_regions` when spacing and projection valleys should guide segmentation rather than the legacy grouped-region strategy:
+
+```python
+from rasterregions import detect_spaced_regions
+
+result = detect_spaced_regions("page.png", row_counts=[None, 4])
+print(result.status, result.diagnostics.row_count)
+```
+
+Each `row_counts` entry is an exact positive count or `None` for automatic inference. Ambiguous marks and pixels remain visible through diagnostics and `result.unassigned_mask`. See [Spaced-region segmentation](spaced-segmentation.md) for configuration, ownership, and examples.
+
+
 Regions are anonymous crops. `rasterregions` does not recognize text, glyphs, or other application-specific classes. See [Concepts](guide.md) for input and coordinate rules, then [Detection](detection.md) for expected counts, regions of interest, and status handling.
 
 ## Mask only

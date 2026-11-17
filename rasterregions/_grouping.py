@@ -3,7 +3,15 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from .models import BBox, Component, GroupingConfig, Region, RowBand
+from .models import (
+    BBox,
+    Component,
+    GroupingConfig,
+    Region,
+    RowBand,
+    SecondaryMarkAssignment,
+    SpacingConfig,
+)
 from .regions import crop, tighten_bbox
 
 
@@ -91,6 +99,132 @@ def _satellite_score(
         + vertical_gap / max(1.0, median_height)
         - 0.35 * overlaps_x / max(1.0, median_height)
     )
+
+
+
+def _spacing_body_components(
+    found: tuple[Component, ...] | list[Component],
+) -> list[Component]:
+    """Classify primary bodies using robust row-scale area and extent evidence."""
+    if not found:
+        return []
+    ordered = sorted(found, key=lambda component: component.area, reverse=True)
+    upper = ordered[: max(1, (len(ordered) + 1) // 2)]
+    area_scale = float(np.median([component.area for component in upper]))
+    extent_scale = float(
+        np.median([max(component.width, component.height) for component in upper])
+    )
+    bodies = [
+        component
+        for component in found
+        if (
+            component.area >= area_scale * 0.18
+            and max(component.width, component.height) >= extent_scale * 0.30
+        )
+        or (
+            component.area >= area_scale * 0.04
+            and max(component.width, component.height) >= extent_scale * 0.65
+        )
+        or (
+            component.area >= area_scale * 0.08
+            and component.width >= extent_scale * 0.75
+        )
+    ]
+    return bodies or [ordered[0]]
+
+
+def _spacing_attachment_score(
+    component: Component,
+    targets: tuple[Component, ...] | list[Component],
+    scale: float,
+) -> float | None:
+    """Return the best scale-normalized geometric score for one mark and target set."""
+    if not targets:
+        return None
+    scale = max(1.0, scale)
+    scores: list[float] = []
+    for target in targets:
+        horizontal_gap = max(
+            target.bbox.x0 - component.bbox.x1,
+            component.bbox.x0 - target.bbox.x1,
+            0,
+        )
+        vertical_gap = max(
+            target.bbox.y0 - component.bbox.y1,
+            component.bbox.y0 - target.bbox.y1,
+            0,
+        )
+        if horizontal_gap > 1.5 * scale or vertical_gap > 1.75 * scale:
+            continue
+        overlap_x = max(
+            0,
+            min(target.bbox.x1, component.bbox.x1)
+            - max(target.bbox.x0, component.bbox.x0),
+        )
+        overlap_y = max(
+            0,
+            min(target.bbox.y1, component.bbox.y1)
+            - max(target.bbox.y0, component.bbox.y0),
+        )
+        size_ratio = min(component.area, target.area) / max(1.0, target.area)
+        alignment_bonus = 0.30 * overlap_x / scale + 0.20 * overlap_y / scale
+        size_penalty = 0.15 * max(0.0, size_ratio - 0.45)
+        scores.append(
+            horizontal_gap / scale
+            + 0.7 * vertical_gap / scale
+            - alignment_bonus
+            + size_penalty
+        )
+    return max(0.0, min(scores)) if scores else None
+
+
+def _assign_spacing_marks(
+    marks: tuple[Component, ...] | list[Component],
+    bodies_by_region: tuple[tuple[Component, ...], ...] | list[list[Component]],
+    median_height: float,
+    config: SpacingConfig,
+    *,
+    region_indices: tuple[int, ...] | None = None,
+) -> tuple[tuple[SecondaryMarkAssignment, ...], tuple[tuple[Component, ...], ...]]:
+    """Assign each secondary component to at most one region, preserving close ties."""
+    indices = region_indices or tuple(range(len(bodies_by_region)))
+    assigned: list[list[Component]] = [[] for _ in bodies_by_region]
+    decisions: list[SecondaryMarkAssignment] = []
+    for mark in sorted(marks, key=lambda component: component.index):
+        scores = [
+            (score, region_index, local_index)
+            for local_index, (region_index, bodies) in enumerate(
+                zip(indices, bodies_by_region, strict=True)
+            )
+            if (score := _spacing_attachment_score(mark, bodies, median_height)) is not None
+        ]
+        scores.sort()
+        if not scores or scores[0][0] > 2.5:
+            decisions.append(
+                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
+            )
+            continue
+        best_score, target, local_target = scores[0]
+        second_score = scores[1][0] if len(scores) > 1 else None
+        margin = (
+            (second_score - best_score) / max(1.0, abs(second_score))
+            if second_score is not None
+            else None
+        )
+        if margin is not None and margin < config.mark_assignment_margin:
+            decisions.append(
+                SecondaryMarkAssignment(
+                    mark.index, None, best_score, second_score, margin, "ambiguous"
+                )
+            )
+            continue
+        assigned[local_target].append(mark)
+        decisions.append(
+            SecondaryMarkAssignment(
+                mark.index, target, best_score, second_score, margin, "assigned"
+            )
+        )
+    return tuple(decisions), tuple(tuple(group) for group in assigned)
 
 
 def _make_region(

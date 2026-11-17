@@ -13,6 +13,9 @@ from rasterregions.models import (
     MaskResult,
     Region,
     RowBand,
+    RowSegmentationDiagnostics,
+    SecondaryMarkAssignment,
+    SpacingConfig,
 )
 
 
@@ -119,3 +122,63 @@ def test_detection_result_rejects_diagnostic_fact_drift() -> None:
 
     with pytest.raises(ValueError, match="diagnostics"):
         _detection(diagnostics)
+
+
+
+def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> None:
+    config = SpacingConfig(width_prior_ratio=1.25, max_inferred_count=12)
+    row = RowSegmentationDiagnostics(
+        row_index=0,
+        bbox=BBox(2, 3, 22, 30),
+        component_indices=[1, 2],
+        y_range=(3, 30),
+        center_y=15.0,
+        baseline_y=28.0,
+        body_height=20.0,
+        inferred_count=2,
+        requested_count=2,
+        selected_boundaries=[12],
+        confidence=0.8,
+        cost=0.2,
+        alternative_cost_margin=0.3,
+        warnings=["one valley is weak"],
+    )
+    assignment = SecondaryMarkAssignment(3, None, 0.2, 0.18, 0.02, "ambiguous")
+
+    assert config.width_prior_ratio == 1.25
+    assert row.component_indices == (1, 2)
+    assert row.selected_boundaries == (12,)
+    assert row.warnings == ("one valley is weak",)
+    assert assignment.status == "ambiguous"
+    with pytest.raises(ValueError, match="positive integer"):
+        SpacingConfig(max_inferred_count=True)
+    with pytest.raises(ValueError, match="positive integers"):
+        RowSegmentationDiagnostics(
+            row_index=0,
+            bbox=BBox(2, 3, 22, 30),
+            component_indices=(),
+            y_range=(3, 30),
+            center_y=15.0,
+            baseline_y=28.0,
+            body_height=20.0,
+            inferred_count=0,
+            requested_count=None,
+            selected_boundaries=(),
+            confidence=0.8,
+            cost=0.2,
+            alternative_cost_margin=None,
+        )
+
+
+def test_detection_result_unassigned_mask_is_a_read_only_snapshot() -> None:
+    from dataclasses import replace
+
+    unassigned = np.zeros((10, 10), dtype=bool)
+    unassigned[7, 8] = True
+    result = replace(_detection(), unassigned_mask=unassigned)
+
+    assert result.unassigned_mask is not None
+    assert result.unassigned_mask[7, 8]
+    assert not result.unassigned_mask.flags.writeable
+    unassigned[7, 8] = False
+    assert result.unassigned_mask[7, 8]

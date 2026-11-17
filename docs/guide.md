@@ -24,13 +24,13 @@ Masks use boolean values with `True` for foreground. `MaskResult.mask`, `Detecti
 
 ## Configuration and confidence
 
-`DetectionConfig` groups `CleanupConfig`, `GroupingConfig`, `MaskConfig`, and `PartitionConfig`. Configuration dataclasses validate their values and reject non-finite or out-of-domain settings rather than silently clamping them. See [Masking](masking.md) and [Detection](detection.md) for mode and parameter behavior.
+`DetectionConfig` groups `CleanupConfig`, `GroupingConfig`, `MaskConfig`, `PartitionConfig`, and `SpacingConfig`. Spacing controls apply only to the opt-in `detect_spaced_regions` API; they do not change `detect_regions` defaults. Configuration dataclasses validate their values and reject non-finite or out-of-domain settings rather than silently clamping them. See [Masking](masking.md), [Detection](detection.md), and [Spaced-region segmentation](spaced-segmentation.md) for mode and parameter behavior.
 
 Confidence values are deterministic heuristic scores in `[0, 1]`, not calibrated probabilities. Mask confidence is separate from region and partition confidence and does not gate detection status.
 
 ## Current limits
 
-This release is an MVP for sparse images with separated foreground objects. Touching objects, dense prose, rotated layouts, nested regions, and arbitrary document layout require stronger algorithms. Use an expected count only when the caller has external evidence for it.
+This release targets sparse foreground objects. The opt-in `detect_spaced_regions` strategy can partition touching or connected forms when a caller supplies reliable per-row counts; without a clear cut it reports ambiguity. Dense prose, rotated layouts, nested regions, and arbitrary document layout remain outside the package's scope.
 
 
 ## Benchmarks

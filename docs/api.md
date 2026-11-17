@@ -8,6 +8,11 @@ The package-level namespace exports the supported models, configuration types, a
    :undoc-members:
 ```
 
+```{eval-rst}
+.. autofunction:: rasterregions.detect_spaced_regions
+   :no-index:
+```
+
 ## Output helpers
 
 ```{eval-rst}

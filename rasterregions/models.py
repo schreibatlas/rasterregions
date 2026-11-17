@@ -153,7 +153,13 @@ class PartitionBoundary:
     projection: float
     crossing_components: int
     confidence: float
+    valley_strength: float | None = None
+    component_indices: tuple[int, ...] = ()
+    selected: bool = True
+    kind: Literal["zero-run", "valley", "local-minimum", "component-midpoint"] = "valley"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "component_indices", tuple(self.component_indices))
 
 @dataclass(frozen=True)
 class CleanupConfig:
@@ -378,6 +384,56 @@ class PartitionConfig:
             raise ValueError("partition costs must be nonnegative")
 
 
+
+@dataclass(frozen=True)
+class SpacingConfig:
+    """Scale-relative controls for spacing-based region segmentation."""
+
+    padding_ratio: float = 0.08
+    width_prior_ratio: float | None = None
+    min_region_width_ratio: float = 0.15
+    max_region_width_ratio: float = 3.5
+    max_inferred_count: int = 24
+    complexity_penalty: float = 0.35
+    ambiguity_margin: float = 0.10
+    mark_assignment_margin: float = 0.15
+    row_assignment_margin: float = 0.15
+
+    def __post_init__(self) -> None:
+        values = (
+            self.padding_ratio,
+            self.min_region_width_ratio,
+            self.max_region_width_ratio,
+            self.complexity_penalty,
+            self.ambiguity_margin,
+            self.mark_assignment_margin,
+            self.row_assignment_margin,
+        )
+        if not all(isfinite(value) for value in values):
+            raise ValueError("spacing configuration values must be finite")
+        if self.width_prior_ratio is not None and (
+            not isfinite(self.width_prior_ratio) or self.width_prior_ratio <= 0.0
+        ):
+            raise ValueError("width_prior_ratio must be finite and positive when supplied")
+        if self.padding_ratio < 0.0:
+            raise ValueError("padding_ratio must be nonnegative")
+        if (
+            self.min_region_width_ratio <= 0.0
+            or self.max_region_width_ratio < self.min_region_width_ratio
+        ):
+            raise ValueError("region width ratios must be positive and ordered")
+        if (
+            isinstance(self.max_inferred_count, bool)
+            or not isinstance(self.max_inferred_count, int)
+            or self.max_inferred_count < 1
+        ):
+            raise ValueError("max_inferred_count must be a positive integer")
+        if self.complexity_penalty < 0.0:
+            raise ValueError("complexity_penalty must be nonnegative")
+        margins = (self.ambiguity_margin, self.mark_assignment_margin, self.row_assignment_margin)
+        if any(not 0.0 <= margin <= 1.0 for margin in margins):
+            raise ValueError("spacing confidence margins must be between zero and one")
+
 @dataclass(frozen=True)
 class DetectionConfig:
     """Combined immutable configuration for detection stages."""
@@ -386,6 +442,7 @@ class DetectionConfig:
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     mask: MaskConfig = field(default_factory=MaskConfig)
     partition: PartitionConfig = field(default_factory=PartitionConfig)
+    spacing: SpacingConfig = field(default_factory=SpacingConfig)
 
 
 @dataclass(frozen=True)
@@ -408,10 +465,46 @@ class DetectionDiagnostics:
     foreground_fraction: float = 0.0
     roi: BBox | None = None
 
+    row_segmentation: tuple[RowSegmentationDiagnostics, ...] = ()
+    secondary_mark_assignments: tuple[SecondaryMarkAssignment, ...] = ()
+    selected_region_count: int | None = None
+    row_count: int | None = None
+    best_second_best_partition_margin: float | None = None
+    width_prior_deviation: float | None = None
+    body_counts_per_region: tuple[int, ...] = ()
+    unassigned_ink_fraction: float = 0.0
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
         object.__setattr__(self, "partition_boundaries", tuple(self.partition_boundaries))
-
+        object.__setattr__(self, "row_segmentation", tuple(self.row_segmentation))
+        object.__setattr__(
+            self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
+        )
+        object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in self.body_counts_per_region
+        ):
+            raise ValueError("body counts must be nonnegative integers")
+        if self.width_prior_deviation is not None and (
+            not isfinite(self.width_prior_deviation) or self.width_prior_deviation < 0.0
+        ):
+            raise ValueError("width_prior_deviation must be finite and nonnegative")
+        if (
+            not isfinite(self.unassigned_ink_fraction)
+            or not 0.0 <= self.unassigned_ink_fraction <= 1.0
+        ):
+            raise ValueError("unassigned_ink_fraction must be between zero and one")
+        for count in (self.selected_region_count, self.row_count):
+            if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+            ):
+                raise ValueError("diagnostic counts must be nonnegative integers")
+        if self.best_second_best_partition_margin is not None and (
+            not isfinite(self.best_second_best_partition_margin)
+            or self.best_second_best_partition_margin < 0.0
+        ):
+            raise ValueError("partition margin must be finite and nonnegative")
 
 @dataclass(frozen=True)
 class RowBand:
@@ -422,6 +515,116 @@ class RowBand:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+
+
+@dataclass(frozen=True)
+class RowSegmentationDiagnostics:
+    """Stable row-level ownership, partition, and confidence evidence."""
+
+    row_index: int
+    bbox: BBox
+    component_indices: tuple[int, ...]
+    y_range: tuple[int, int]
+    center_y: float
+    baseline_y: float
+    body_height: float
+    inferred_count: int | None
+    requested_count: int | None
+    selected_boundaries: tuple[int, ...]
+    confidence: float
+    cost: float
+    alternative_cost_margin: float | None
+    width_prior_deviation: float | None = None
+    body_counts_per_region: tuple[int, ...] = ()
+    warnings: tuple[str, ...] = ()
+    ambiguous_component_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "component_indices", tuple(self.component_indices))
+        object.__setattr__(self, "selected_boundaries", tuple(self.selected_boundaries))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(
+            self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
+        )
+        object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in self.body_counts_per_region
+        ):
+            raise ValueError("body counts must be nonnegative integers")
+        if self.width_prior_deviation is not None and (
+            not isfinite(self.width_prior_deviation) or self.width_prior_deviation < 0.0
+        ):
+            raise ValueError("width_prior_deviation must be finite and nonnegative")
+        if (
+            isinstance(self.row_index, bool)
+            or not isinstance(self.row_index, int)
+            or self.row_index < 0
+        ):
+            raise ValueError("row_index must be a nonnegative integer")
+        if self.y_range[0] < 0 or self.y_range[1] <= self.y_range[0]:
+            raise ValueError("y_range must be a positive half-open interval")
+        if not self.bbox.y0 <= self.y_range[0] < self.y_range[1] <= self.bbox.y1:
+            raise ValueError("y_range must lie within the row bbox")
+        finite_values = (
+            self.center_y,
+            self.baseline_y,
+            self.body_height,
+            self.confidence,
+            self.cost,
+        )
+        if not all(isfinite(value) for value in finite_values):
+            raise ValueError("row diagnostic values must be finite")
+        if self.body_height <= 0.0 or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError(
+                "body_height must be positive and confidence must be between zero and one"
+            )
+        if self.cost < 0.0:
+            raise ValueError("row partition cost must be nonnegative")
+        if self.alternative_cost_margin is not None and (
+            not isfinite(self.alternative_cost_margin) or self.alternative_cost_margin < 0.0
+        ):
+            raise ValueError("alternative_cost_margin must be finite and nonnegative")
+        for count in (self.inferred_count, self.requested_count):
+            if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count < 1
+            ):
+                raise ValueError("row counts must be positive integers")
+
+
+@dataclass(frozen=True)
+class SecondaryMarkAssignment:
+    """A globally considered secondary component and its assignment margin."""
+
+    component_index: int
+    target_region_index: int | None
+    best_score: float | None
+    second_best_score: float | None
+    margin: float | None
+    status: Literal["assigned", "ambiguous", "unassigned"]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.component_index, bool)
+            or not isinstance(self.component_index, int)
+            or self.component_index < 0
+        ):
+            raise ValueError("component_index must be a nonnegative integer")
+        if self.target_region_index is not None and (
+            isinstance(self.target_region_index, bool)
+            or not isinstance(self.target_region_index, int)
+            or self.target_region_index < 0
+        ):
+            raise ValueError("target_region_index must be a nonnegative integer")
+        scores = (self.best_score, self.second_best_score, self.margin)
+        if any(value is not None and not isfinite(value) for value in scores):
+            raise ValueError("mark assignment scores must be finite")
+        if self.margin is not None and self.margin < 0.0:
+            raise ValueError("mark assignment margin must be nonnegative")
+        if self.status == "assigned" and self.target_region_index is None:
+            raise ValueError("assigned marks must name a target region")
+        if self.status != "assigned" and self.target_region_index is not None:
+            raise ValueError("unassigned or ambiguous marks cannot name a target region")
 
 
 @dataclass(frozen=True)
@@ -470,6 +673,7 @@ class DetectionResult:
     component_decisions: tuple[ComponentDecision, ...] = ()
     expected_count_scope: ExpectedCountScope = "row"
     diagnostics: DetectionDiagnostics | None = None
+    unassigned_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "components", tuple(self.components))
@@ -480,6 +684,16 @@ class DetectionResult:
             raise ValueError("clean mask must match raw mask shape")
         clean = np.array(clean, copy=True)
         clean.setflags(write=False)
+        unassigned = (
+            np.zeros_like(clean)
+            if self.unassigned_mask is None
+            else np.asarray(self.unassigned_mask, dtype=bool)
+        )
+        if unassigned.shape != clean.shape:
+            raise ValueError("unassigned mask must match clean mask shape")
+        unassigned = np.array(unassigned, copy=True)
+        unassigned.setflags(write=False)
+        object.__setattr__(self, "unassigned_mask", unassigned)
         object.__setattr__(self, "clean_mask", clean)
         object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
@@ -530,3 +744,6 @@ class IsolationResult:
         mask = np.array(mask, copy=True)
         mask.setflags(write=False)
         object.__setattr__(self, "mask", mask)
+
+
+

@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from rasterregions import BBox, crop, detect_regions, tighten_bbox
+from rasterregions import BBox, crop, detect_regions, detect_spaced_regions, tighten_bbox
 from rasterregions.io import detection_payload, write_detection
 
 
@@ -181,3 +181,18 @@ def test_tighten_bbox_empty_mask_returns_original_bbox() -> None:
     bbox = BBox(3, 4, 12, 13)
 
     assert tighten_bbox(mask, bbox, pad=3) == bbox
+
+
+
+def test_spacing_diagnostics_are_serialized() -> None:
+    image = Image.new("RGB", (80, 60), "white")
+    ImageDraw.Draw(image).rectangle((25, 15, 49, 44), fill="black")
+
+    result = detect_spaced_regions(image, mode="dark")
+    payload = detection_payload(result)
+
+    assert result.status == "ok"
+    assert payload["spacing"]["selected_region_count"] == 1
+    assert payload["spacing"]["row_count"] == 1
+    assert payload["spacing"]["unassigned_ink_pixels"] == 0
+    assert payload["spacing"]["rows"][0]["inferred_count"] == 1

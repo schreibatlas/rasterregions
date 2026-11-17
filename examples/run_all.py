@@ -13,6 +13,7 @@ EXAMPLE_SCRIPTS = (
     "05_component_isolation.py",
     "06_numpy_input.py",
     "07_edge_cases.py",
+        "08_spaced_regions.py",
 )
 
 

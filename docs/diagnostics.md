@@ -12,6 +12,9 @@
 - cleanup decisions and their component bboxes;
 - rows, partition boundaries, warnings, and region geometry/confidence.
 
+
+
+Spacing-mode results add a `spacing` object to `detection_payload`: row-level counts and warnings, candidate and selected boundary evidence, secondary-mark assignments and margins, body counts, width-prior deviation, and unassigned-ink fraction/pixel count. The exact owner pixels are available through each `Region.mask` and `DetectionResult.unassigned_mask`; their union accounts for the cleaned foreground.
 Component indexes in cleanup decisions, rows, and regions use the explicitly named `raw_mask` namespace. Removed components may therefore leave gaps in indexes for retained components.
 
 ## Write artifacts

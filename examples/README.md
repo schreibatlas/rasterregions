@@ -20,4 +20,5 @@ python examples/run_all.py
 - `06_numpy_input.py`: pass a NumPy image directly.
 - `07_edge_cases.py`: mixed content, grayscale quantization, touching components, and one-region partitioning.
 
+- `08_spaced_regions.py`: write a synthetic spacing example's mask, row/component/boundary/region overlays, and JSON diagnostics.
 Fixture generation can also be run by itself with `python examples/generate_assets.py`. The documentation figures are regenerated or checked with `python docs/generate_visual_examples.py` and `python docs/generate_visual_examples.py --check`; see [the visual examples page](../docs/examples.md).

@@ -26,11 +26,22 @@ print(result.status, manifest)
 
 Set `expected_count` when external evidence provides a count. The default count scope partitions one qualifying row; `expected_count_scope="page"` constrains a count across rows. Pass a `BBox` as `roi` to constrain analysis while keeping full-image result coordinates.
 
+
+For sparse objects separated by spacing evidence, opt into `detect_spaced_regions`. It supports per-row exact count hints or deterministic count inference, reports ambiguity, and keeps exact foreground ownership in each region mask. This does not change `detect_regions` defaults; see [Spaced-region segmentation](docs/spaced-segmentation.md).
+
+```python
+from rasterregions import detect_spaced_regions
+
+result = detect_spaced_regions("page.png", row_counts=[None, 4])
+print(result.status, len(result.regions), result.unassigned_mask.sum())
+```
+
 ## Capabilities
 
 - deterministic grayscale, dark-relative, color, hybrid, and adaptive foreground masks;
 - 8-connected components, row grouping, anonymous ordered regions, and crops;
 - optional expected-count partitioning using projection valleys and component-crossing costs;
+- opt-in spacing-based row segmentation with per-row count hints, exact pixel ownership, and ambiguity diagnostics;
 - nearest-component isolation proposals with explicit reason values;
 - JSON, mask, crop, and overlay diagnostics through Python and the CLI.
 
@@ -42,6 +53,7 @@ Confidence values are heuristic scores, not calibrated probabilities. Automatic 
 - [Concepts and input contracts](docs/guide.md)
 - [Foreground masking](docs/masking.md)
 - [Region detection](docs/detection.md)
+- [Spaced-region segmentation](docs/spaced-segmentation.md)
 - [Components and isolation](docs/components.md)
 - [Diagnostics and output files](docs/diagnostics.md)
 - [Command-line interface](docs/cli.md)

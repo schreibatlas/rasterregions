@@ -16,6 +16,21 @@ result = detect_regions("written-row.png", expected_count=3)
 
 The default `expected_count_scope="row"` partitions the best qualifying row. Use `expected_count_scope="page"` to constrain the total across detected rows. A credible partition returns the requested number of regions. If no credible partition is found, or its confidence is below `min_confidence`, status is `failed` and `regions` is empty.
 
+## Spaced-region segmentation
+
+`detect_spaced_regions(source, *, mode="auto", row_counts=None, min_confidence=0.3, config=None)` is a separate, opt-in API. It uses row envelopes, scale-aware width priors, projection valleys, component crossings, and a dynamic-programming partitioner. `detect_regions` and its expected-count behavior remain unchanged.
+
+`row_counts` has one entry per detected row. A positive integer requests an exact partition for that row; `None` asks the algorithm to infer a bounded count. Similar-cost counts, uncertain mark ownership, strong internal valleys in one connected body, or unassigned cleaned ink are reported as `ambiguous` rather than hidden. `DetectionResult.unassigned_mask` and per-region masks preserve exact pixel ownership.
+
+```python
+from rasterregions import detect_spaced_regions
+
+result = detect_spaced_regions("row.png", row_counts=[3, None])
+print(result.status, result.diagnostics.row_segmentation)
+```
+
+See [Spaced-region segmentation](spaced-segmentation.md) for configuration, output diagnostics, and the synthetic artifact example.
+
 ## Regions of interest
 
 Pass a half-open `BBox` to constrain analysis. The result still uses full-image coordinates, and the raw and cleaned masks have the full image dimensions. Pixels outside the ROI are false. Diagnostics and `regions.json` record the ROI.

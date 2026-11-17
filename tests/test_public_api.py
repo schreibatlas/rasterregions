@@ -13,3 +13,7 @@ def test_public_api_and_version_exist() -> None:
     assert rasterregions.PartitionBoundary
     assert rasterregions.ExpectedCountScope
     assert rasterregions.IsolationReason
+    assert callable(rasterregions.detect_spaced_regions)
+    assert rasterregions.SpacingConfig().max_inferred_count > 0
+    assert rasterregions.RowSegmentationDiagnostics
+    assert rasterregions.SecondaryMarkAssignment

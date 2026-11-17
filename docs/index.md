@@ -10,6 +10,7 @@ getting-started
 guide
 masking
 detection
+spaced-segmentation
 components
 diagnostics
 cli

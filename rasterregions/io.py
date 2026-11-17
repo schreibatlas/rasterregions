@@ -23,7 +23,7 @@ def detection_payload(result: DetectionResult) -> dict:
     decisions = diagnostics.component_decisions if diagnostics else result.component_decisions
     boundaries = diagnostics.partition_boundaries if diagnostics else ()
     width, height = diagnostics.image_size if diagnostics else result.image.size
-    return {
+    payload = {
         "rasterregions_version": __version__,
         "schema_version": 1,
         "component_index_namespace": "raw_mask",
@@ -88,6 +88,71 @@ def detection_payload(result: DetectionResult) -> dict:
             for region in result.regions
         ],
     }
+    if diagnostics is not None and (
+        diagnostics.row_count is not None
+        or diagnostics.row_segmentation
+        or diagnostics.secondary_mark_assignments
+    ):
+        payload["spacing"] = {
+            "selected_region_count": diagnostics.selected_region_count,
+            "row_count": diagnostics.row_count,
+            "best_second_best_partition_margin": diagnostics.best_second_best_partition_margin,
+            "unassigned_ink_fraction": round(diagnostics.unassigned_ink_fraction, 6),
+            "unassigned_ink_pixels": int(result.unassigned_mask.sum()),
+            "width_prior_deviation": diagnostics.width_prior_deviation,
+            "body_counts_per_region": list(diagnostics.body_counts_per_region),
+            "rows": [
+                {
+                    "row_index": row.row_index,
+                    "bbox": list(row.bbox.as_tuple()),
+                    "component_indices": list(row.component_indices),
+                    "y_range": list(row.y_range),
+                    "center_y": round(row.center_y, 4),
+                    "baseline_y": round(row.baseline_y, 4),
+                    "body_height": round(row.body_height, 4),
+                    "width_prior_deviation": row.width_prior_deviation,
+                    "body_counts_per_region": list(row.body_counts_per_region),
+                    "inferred_count": row.inferred_count,
+                    "requested_count": row.requested_count,
+                    "selected_boundaries": list(row.selected_boundaries),
+                    "confidence": round(row.confidence, 4),
+                    "cost": round(row.cost, 4),
+                    "alternative_cost_margin": (
+                        round(row.alternative_cost_margin, 4)
+                        if row.alternative_cost_margin is not None
+                        else None
+                    ),
+                    "ambiguous_component_indices": list(row.ambiguous_component_indices),
+                    "warnings": list(row.warnings),
+                }
+                for row in diagnostics.row_segmentation
+            ],
+            "candidate_boundaries": [
+                {
+                    "x": boundary.x,
+                    "projection": boundary.projection,
+                    "crossing_components": boundary.crossing_components,
+                    "component_indices": list(boundary.component_indices),
+                    "selected": boundary.selected,
+                    "kind": boundary.kind,
+                    "confidence": round(boundary.confidence, 4),
+                    "valley_strength": boundary.valley_strength,
+                }
+                for boundary in diagnostics.partition_boundaries
+            ],
+            "secondary_mark_assignments": [
+                {
+                    "component_index": assignment.component_index,
+                    "target_region_index": assignment.target_region_index,
+                    "best_score": assignment.best_score,
+                    "second_best_score": assignment.second_best_score,
+                    "margin": assignment.margin,
+                    "status": assignment.status,
+                }
+                for assignment in diagnostics.secondary_mark_assignments
+            ],
+        }
+    return payload
 
 
 def _atomic_save_image(image: Image.Image, destination: Path) -> None:

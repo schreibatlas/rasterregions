@@ -29,6 +29,10 @@ The second fixture contains three separated foreground shapes. Supplying `expect
 :alt: The three expected-count regions drawn over the input row.
 :width: 460px
 ```
+## Spaced-region segmentation
+
+The opt-in `08_spaced_regions.py` example uses synthetic slanted bodies and writes the input mask, row overlay, component overlay, candidate-boundary overlay, final region overlay, and JSON diagnostics to `build/examples/08_spaced_regions/`. It is included in `python examples/run_all.py`.
+
 
 ## Regenerate and check the figures
 
@@ -67,3 +71,4 @@ Standalone scripts:
 - `05_component_isolation.py`: connected components and anchor isolation.
 - `06_numpy_input.py`: NumPy image input.
 - `07_edge_cases.py`: mixed content, grayscale quantization, touching objects, and one-region partitioning.
+- `08_spaced_regions.py`: opt-in spacing-based segmentation and diagnostic overlays.
