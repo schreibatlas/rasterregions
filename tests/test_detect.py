@@ -106,6 +106,20 @@ def test_expected_count_recovers_three_regions() -> None:
     assert any("rule" in warning for warning in result.warnings)
 
 
+def test_expected_count_compacts_flat_projection_valleys() -> None:
+    image = Image.new("RGB", (420, 150), "white")
+    draw = ImageDraw.Draw(image)
+    for x in (35, 165, 295):
+        draw.rounded_rectangle((x, 48, x + 72, 108), radius=10, outline="black", width=7)
+    draw.line((107, 78, 165, 78), fill="black", width=2)
+    draw.line((237, 78, 295, 78), fill="black", width=2)
+
+    result = detect_regions(image, expected_count=3)
+
+    assert result.status == "ok"
+    assert len(result.regions) == 3
+
+
 def test_wrong_expected_count_returns_failed_result() -> None:
     result = detect_regions(_sample_page(), expected_count=4, mode="dark")
 

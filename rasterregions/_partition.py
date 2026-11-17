@@ -128,13 +128,18 @@ def _candidate_cut_positions(projection: np.ndarray, config: PartitionConfig) ->
         if np.any(projection)
         else 0.0
     )
-    for x in range(1, width - 1):
-        if (
-            projection[x] <= projection[x - 1]
-            and projection[x] <= projection[x + 1]
-            and projection[x] <= scale
-        ):
-            positions.add(x)
+    local_minima = (
+        np.flatnonzero(
+            (projection[1:-1] <= projection[:-2])
+            & (projection[1:-1] <= projection[2:])
+            & (projection[1:-1] <= scale)
+        )
+        + 1
+    )
+    if local_minima.size:
+        plateau_starts = np.flatnonzero(np.diff(local_minima) > 1) + 1
+        for plateau in np.split(local_minima, plateau_starts):
+            positions.add((int(plateau[0]) + int(plateau[-1])) // 2)
     return sorted(positions)
 
 
