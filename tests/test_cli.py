@@ -70,3 +70,32 @@ def test_cli_failed_detection_keeps_nonzero_exit_status(tmp_path, capsys) -> Non
 
     assert status == 2
     assert "status: failed" in capsys.readouterr().out
+
+
+def test_spaced_cli_writes_hypotheses_and_reports_search(tmp_path, capsys) -> None:
+    image_path = tmp_path / "page.png"
+    _two_row_page().save(image_path)
+    output = tmp_path / "spaced"
+
+    status = main(
+        [
+            "spaced",
+            str(image_path),
+            "--output",
+            str(output),
+            "--expected-count",
+            "4",
+            "--row-counts",
+            "auto,auto",
+            "--mode",
+            "dark",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert payload["segmentation"] == "spaced"
+    assert payload["page_hypotheses"][0]["count"] == 4
+    assert "search_limit" in payload["selected"]["spacing"]
+    assert (output / "hypotheses.json").is_file()

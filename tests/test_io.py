@@ -6,8 +6,20 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from rasterregions import BBox, crop, detect_regions, detect_spaced_regions, tighten_bbox
-from rasterregions.io import detection_payload, write_detection
+from rasterregions import (
+    BBox,
+    crop,
+    detect_regions,
+    detect_spaced_region_hypotheses,
+    detect_spaced_regions,
+    tighten_bbox,
+)
+from rasterregions.io import (
+    detection_payload,
+    spaced_hypotheses_payload,
+    write_detection,
+    write_spaced_hypotheses,
+)
 
 
 def test_tighten_bbox_and_crop_preserve_pixels() -> None:
@@ -195,3 +207,24 @@ def test_spacing_diagnostics_are_serialized() -> None:
     assert payload["spacing"]["row_count"] == 1
     assert payload["spacing"]["unassigned_ink_pixels"] == 0
     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
+
+
+def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
+    image = Image.new("RGB", (100, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((15, 55, 49, 18), fill="black", width=3)
+    draw.line((44, 55, 70, 18), fill="black", width=3)
+    result = detect_spaced_region_hypotheses(image, mode="dark", expected_count=2)
+
+    payload = spaced_hypotheses_payload(result)
+    encoded = json.dumps(payload)
+    manifest = write_spaced_hypotheses(result, tmp_path)
+
+    assert json.loads(encoded)["search"]["truncated"] == result.truncated
+    assert payload["page_hypotheses"][0]["count"] == 2
+    assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
+    assert (tmp_path / "cleaned_mask.png").is_file()
+    assert (tmp_path / "candidate_cuts.png").is_file()
+    assert (tmp_path / "selected_partition.png").is_file()
+    assert (tmp_path / "alternative_partition_2.png").is_file()
+    assert manifest.is_file()

@@ -10,7 +10,12 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from .components import components, isolate_component
-from .detect import detect_regions, detect_rows, detect_spaced_regions
+from .detect import (
+    detect_regions,
+    detect_rows,
+    detect_spaced_region_hypotheses,
+    detect_spaced_regions,
+)
 from .mask import foreground_mask
 from .models import (
     BBox,
@@ -30,12 +35,18 @@ from .models import (
     MaskMethod,
     MaskMode,
     MaskResult,
+    PagePartitionHypothesis,
     PartitionBoundary,
     PartitionConfig,
     Region,
+    RegionFrame,
+    RegionHypothesis,
     RowBand,
+    RowPartitionHypothesis,
     RowSegmentationDiagnostics,
     SecondaryMarkAssignment,
+    SegmentationSearchLimitError,
+    SpacedSegmentationHypotheses,
     SpacingConfig,
 )
 from .regions import crop, tighten_bbox
@@ -66,18 +77,25 @@ __all__ = [
     "MaskMethod",
     "MaskMode",
     "MaskResult",
+    "PagePartitionHypothesis",
     "PartitionBoundary",
     "PartitionConfig",
     "Region",
+    "RegionFrame",
+    "RegionHypothesis",
     "RowBand",
+    "RowPartitionHypothesis",
     "RowSegmentationDiagnostics",
     "SecondaryMarkAssignment",
+    "SegmentationSearchLimitError",
+    "SpacedSegmentationHypotheses",
     "SpacingConfig",
     "__version__",
     "components",
     "crop",
     "detect_regions",
     "detect_spaced_regions",
+    "detect_spaced_region_hypotheses",
     "detect_rows",
     "foreground_mask",
     "isolate_component",

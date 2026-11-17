@@ -43,10 +43,43 @@ Every `Region.mask` contains only pixels owned by that region. Region masks neve
 - **Connected components** are 8-connected foreground pixel sets.
 - **Grouped regions** from `detect_regions` attach plausible components using the legacy grouping strategy.
 - **Spaced-region segmentation** from `detect_spaced_regions` partitions each row using spacing, projection, body-count, width, and ownership evidence.
-- **Expected-count partitioning** through `detect_regions(expected_count=...)` remains a separate legacy behavior for callers that already know a count. The new API accepts optional per-row count hints without changing that contract.
+- **Expected-count partitioning** through `detect_regions(expected_count=...)` remains a separate legacy behavior. For spaced segmentation, `expected_count` is a page total and `row_counts` optionally provides per-row evidence.
 
-The synthetic example writes an input mask, row and component overlays, a candidate-boundary overlay, a final region overlay, and JSON diagnostics under `build/examples/08_spaced_regions/`:
-
+The synthetic example writes a cleaned mask, row and candidate-cut overlays, the selected partition, up to two alternative partitions, unassigned ink, and a JSON hypothesis payload under `build/examples/08_spaced_regions/`:
 ```bash
 python examples/08_spaced_regions.py
 ```
+
+
+## Bounded row and page hypotheses
+
+`detect_spaced_regions` accepts `expected_count` as generic page-level count evidence. It generates bounded row-count and partition candidates, then combines them with dynamic programming. A page allocation is returned only when its row counts sum exactly to the requested total. If none is feasible, the result is failed with an explicit warning and all cleaned ink remains unassigned. Existing `DetectionResult` fields and `detect_regions` behavior remain unchanged.
+
+Use `detect_spaced_region_hypotheses` when downstream code needs alternatives and stable normalization frames:
+
+```python
+from rasterregions import detect_spaced_region_hypotheses
+
+hypotheses = detect_spaced_region_hypotheses(
+    "page.png",
+    expected_count=5,
+    row_counts=[None, None],
+)
+selected = hypotheses.selected
+best_page = hypotheses.page_hypotheses[0] if hypotheses.page_hypotheses else None
+print(hypotheses.truncated, hypotheses.failure_reason)
+```
+
+When page hypotheses exist, hypothesis zero matches `selected`. Row and page hypotheses expose costs, boundary evidence, cut-crossing costs, body counts, region widths, frames, secondary-mark assignments, and unassigned-ink fractions. A detached mark can appear assigned to different regions in separate page hypotheses, including an explicit unassigned option. Every page hypothesis owns each cleaned foreground pixel exactly once, either through one region mask or its unassigned mask.
+
+`SpacingConfig` bounds candidate boundaries, row counts, row and page search states, secondary-mark branches, and returned hypotheses. `truncated=True` means at least one configured bound removed alternatives. The selected result and search diagnostics remain available when a bounded search finds no feasible page allocation.
+
+Serialize the aggregate result with `rasterregions.io.spaced_hypotheses_payload`. Masks are JSON-compatible row runs, and region runs are relative to their bounding boxes. `write_spaced_hypotheses` writes the payload plus cleaned-mask, row, candidate-cut, selected-partition, alternative-partition, and unassigned-ink images.
+
+The CLI exposes the same path:
+
+```bash
+rasterregions spaced page.png --expected-count 5 --row-counts auto,auto --output build/page-segmentation
+```
+
+`--row-counts` accepts comma-separated positive counts or `auto`, with one entry required per detected row. The CLI reports the number of returned page hypotheses and whether search was truncated; `hypotheses.json` includes the limiting budget and detailed alternatives.

@@ -155,11 +155,15 @@ class PartitionBoundary:
     confidence: float
     valley_strength: float | None = None
     component_indices: tuple[int, ...] = ()
+    crossing_cost: float = 0.0
     selected: bool = True
     kind: Literal["zero-run", "valley", "local-minimum", "component-midpoint"] = "valley"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+
+        if not isfinite(self.crossing_cost) or self.crossing_cost < 0.0:
+            raise ValueError("boundary crossing_cost must be finite and nonnegative")
 
 
 @dataclass(frozen=True)
@@ -399,6 +403,13 @@ class SpacingConfig:
     mark_assignment_margin: float = 0.15
     row_assignment_margin: float = 0.15
 
+    hypothesis_limit: int = 5
+    max_candidate_boundaries: int = 256
+    max_count_candidates: int = 24
+    max_partition_states: int = 100_000
+    max_page_states: int = 50_000
+    max_secondary_mark_branches: int = 32
+
     def __post_init__(self) -> None:
         values = (
             self.padding_ratio,
@@ -428,6 +439,18 @@ class SpacingConfig:
             or self.max_inferred_count < 1
         ):
             raise ValueError("max_inferred_count must be a positive integer")
+        limits = (
+            self.hypothesis_limit,
+            self.max_candidate_boundaries,
+            self.max_count_candidates,
+            self.max_partition_states,
+            self.max_page_states,
+            self.max_secondary_mark_branches,
+        )
+        if any(
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 for limit in limits
+        ):
+            raise ValueError("spacing search limits must be positive integers")
         if self.complexity_penalty < 0.0:
             raise ValueError("complexity_penalty must be nonnegative")
         margins = (self.ambiguity_margin, self.mark_assignment_margin, self.row_assignment_margin)
@@ -474,6 +497,8 @@ class DetectionDiagnostics:
     width_prior_deviation: float | None = None
     body_counts_per_region: tuple[int, ...] = ()
     unassigned_ink_fraction: float = 0.0
+    search_truncated: bool = False
+    search_limit: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
@@ -719,6 +744,201 @@ class DetectionResult:
             )
             if not consistent:
                 raise ValueError("diagnostics must agree with canonical result and mask fields")
+
+
+@dataclass(frozen=True)
+class RegionFrame:
+    """Generic row geometry for downstream region normalization."""
+
+    baseline_y: float
+    body_height: float
+    row_center_y: float
+    row_index: int
+
+    def __post_init__(self) -> None:
+        values = (self.baseline_y, self.body_height, self.row_center_y)
+        if not all(isfinite(value) for value in values) or self.body_height <= 0.0:
+            raise ValueError("region frame values must be finite and body_height positive")
+        if (
+            isinstance(self.row_index, bool)
+            or not isinstance(self.row_index, int)
+            or self.row_index < 0
+        ):
+            raise ValueError("row_index must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class RegionHypothesis:
+    """One anonymous foreground region within a segmentation hypothesis."""
+
+    bbox: BBox
+    mask: np.ndarray = field(repr=False, compare=False)
+    component_indices: tuple[int, ...]
+    frame: RegionFrame
+    cost: float
+    confidence: float
+    warnings: tuple[str, ...]
+    cut_crossing_cost: float = 0.0
+
+    body_count: int = 0
+
+    def __post_init__(self) -> None:
+        mask = np.asarray(self.mask, dtype=bool)
+        if mask.shape != (self.bbox.height, self.bbox.width):
+            raise ValueError("region hypothesis mask dimensions must match bbox")
+        if not all(
+            isfinite(value) for value in (self.cost, self.confidence, self.cut_crossing_cost)
+        ):
+            raise ValueError("region hypothesis scores must be finite")
+        if (
+            isinstance(self.body_count, bool)
+            or not isinstance(self.body_count, int)
+            or self.body_count < 0
+        ):
+            raise ValueError("body_count must be a nonnegative integer")
+        if self.cost < 0.0 or self.cut_crossing_cost < 0.0 or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("region hypothesis costs must be nonnegative and confidence in [0, 1]")
+        snapshot = np.array(mask, copy=True)
+        snapshot.setflags(write=False)
+        object.__setattr__(self, "mask", snapshot)
+        object.__setattr__(self, "component_indices", tuple(self.component_indices))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+
+@dataclass(frozen=True)
+class RowPartitionHypothesis:
+    """A bounded row partition candidate and its ownership evidence."""
+
+    row_index: int
+    count: int
+    boundaries: tuple[int, ...]
+    regions: tuple[RegionHypothesis, ...]
+    cost: float
+    unassigned_ink_fraction: float
+    secondary_mark_assignments: tuple[SecondaryMarkAssignment, ...]
+
+    boundary_evidence: tuple[PartitionBoundary, ...] = ()
+    cut_crossing_cost: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.row_index, bool)
+            or not isinstance(self.row_index, int)
+            or self.row_index < 0
+        ):
+            raise ValueError("row_index must be a nonnegative integer")
+        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
+            raise ValueError("count must be a positive integer")
+        boundaries = tuple(self.boundaries)
+        regions = tuple(self.regions)
+        if (
+            len(regions) != self.count
+            or len(boundaries) != self.count + 1
+            or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
+        ):
+            raise ValueError("row hypothesis count and boundaries must match its regions")
+        if not isfinite(self.cost) or self.cost < 0.0:
+            raise ValueError("row hypothesis cost must be finite and nonnegative")
+        if not isfinite(self.cut_crossing_cost) or self.cut_crossing_cost < 0.0:
+            raise ValueError("cut_crossing_cost must be finite and nonnegative")
+        if (
+            not isfinite(self.unassigned_ink_fraction)
+            or not 0.0 <= self.unassigned_ink_fraction <= 1.0
+        ):
+            raise ValueError("unassigned_ink_fraction must be between zero and one")
+        object.__setattr__(self, "boundaries", boundaries)
+        object.__setattr__(self, "regions", regions)
+        object.__setattr__(
+            self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
+        )
+        object.__setattr__(self, "boundary_evidence", tuple(self.boundary_evidence))
+
+
+@dataclass(frozen=True)
+class PagePartitionHypothesis:
+    """One page allocation assembled from row partition hypotheses."""
+
+    row_hypotheses: tuple[RowPartitionHypothesis, ...]
+    count: int
+    cost: float
+    unassigned_ink_fraction: float
+    unassigned_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        rows = tuple(self.row_hypotheses)
+        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
+            raise ValueError("page hypothesis count must be a positive integer")
+        if sum(row.count for row in rows) != self.count:
+            raise ValueError("page hypothesis row counts must sum to count")
+        if not isfinite(self.cost) or self.cost < 0.0:
+            raise ValueError("page hypothesis cost must be finite and nonnegative")
+        if (
+            not isfinite(self.unassigned_ink_fraction)
+            or not 0.0 <= self.unassigned_ink_fraction <= 1.0
+        ):
+            raise ValueError("unassigned_ink_fraction must be between zero and one")
+        object.__setattr__(self, "row_hypotheses", rows)
+        if self.unassigned_mask is not None:
+            unassigned = np.asarray(self.unassigned_mask, dtype=bool)
+            if unassigned.ndim != 2:
+                raise ValueError("page unassigned_mask must be two-dimensional")
+            unassigned = np.array(unassigned, copy=True)
+            unassigned.setflags(write=False)
+            object.__setattr__(self, "unassigned_mask", unassigned)
+
+    @property
+    def regions(self) -> tuple[RegionHypothesis, ...]:
+        return tuple(region for row in self.row_hypotheses for region in row.regions)
+
+
+@dataclass(frozen=True)
+class SpacedSegmentationHypotheses:
+    """Selected segmentation and bounded row/page alternatives."""
+
+    selected: DetectionResult
+    row_hypotheses: tuple[tuple[RowPartitionHypothesis, ...], ...]
+    page_hypotheses: tuple[PagePartitionHypothesis, ...]
+    truncated: bool
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        rows = tuple(tuple(hypotheses) for hypotheses in self.row_hypotheses)
+        pages = tuple(self.page_hypotheses)
+        if self.failure_reason is not None and not self.failure_reason:
+            raise ValueError("failure_reason must be nonempty when supplied")
+        if pages:
+            selected_regions = self.selected.regions
+            hypothesis_regions = pages[0].regions
+            if len(selected_regions) != len(hypothesis_regions) or any(
+                region.bbox != hypothesis.bbox or not np.array_equal(region.mask, hypothesis.mask)
+                for region, hypothesis in zip(selected_regions, hypothesis_regions, strict=True)
+            ):
+                raise ValueError("selected result must match page hypothesis zero")
+            for page in pages:
+                if page.unassigned_mask is None:
+                    raise ValueError("page hypotheses must include an unassigned_mask")
+                unassigned = page.unassigned_mask
+                if unassigned.shape != self.selected.clean_mask.shape:
+                    raise ValueError("page unassigned_mask must match selected foreground shape")
+                ownership = np.zeros_like(self.selected.clean_mask)
+                for region in page.regions:
+                    bbox = region.bbox
+                    if bbox.x1 > ownership.shape[1] or bbox.y1 > ownership.shape[0]:
+                        raise ValueError("page region hypothesis exceeds foreground bounds")
+                    local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
+                    if np.any(local & region.mask):
+                        raise ValueError("page region ownership masks must be pairwise disjoint")
+                    local |= region.mask
+                if np.any(ownership & unassigned) or not np.array_equal(
+                    ownership | unassigned, self.selected.clean_mask
+                ):
+                    raise ValueError("page hypotheses must conserve cleaned foreground ownership")
+        object.__setattr__(self, "row_hypotheses", rows)
+        object.__setattr__(self, "page_hypotheses", pages)
+
+
+class SegmentationSearchLimitError(RuntimeError):
+    """Raised when a configured segmentation search budget prevents a safe result."""
 
 
 @dataclass(frozen=True)

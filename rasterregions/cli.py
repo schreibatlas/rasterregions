@@ -5,8 +5,34 @@ import json
 from pathlib import Path
 
 from . import __version__
-from .detect import detect_regions
-from .io import detection_payload, write_detection
+from .detect import detect_regions, detect_spaced_region_hypotheses
+from .io import (
+    detection_payload,
+    spaced_hypotheses_payload,
+    write_detection,
+    write_spaced_hypotheses,
+)
+
+
+def _parse_row_counts(value: str) -> tuple[int | None, ...]:
+    counts: list[int | None] = []
+    for item in value.split(","):
+        token = item.strip().lower()
+        if token in {"auto", "none"}:
+            counts.append(None)
+            continue
+        try:
+            count = int(token)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "row counts must be positive integers or 'auto'"
+            ) from error
+        if count < 1:
+            raise argparse.ArgumentTypeError("row counts must be positive integers or 'auto'")
+        counts.append(count)
+    if not counts:
+        raise argparse.ArgumentTypeError("at least one row count is required")
+    return tuple(counts)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--no-crops", action="store_false", dest="include_crops", default=True)
     detect.add_argument("--no-overlay", action="store_false", dest="include_overlay", default=True)
     detect.add_argument("--no-mask", action="store_false", dest="include_mask", default=True)
+    spaced = sub.add_parser("spaced", help="segment sparse regions and return top-K hypotheses")
+    spaced.add_argument("image", type=Path)
+    spaced.add_argument("--output", "-o", type=Path, required=True)
+    spaced.add_argument("--expected-count", type=int, default=None)
+    spaced.add_argument("--row-counts", type=_parse_row_counts, default=None)
+    spaced.add_argument(
+        "--mode",
+        choices=("auto", "grayscale", "dark", "color", "hybrid", "adaptive"),
+        default="auto",
+    )
+    spaced.add_argument("--min-confidence", type=float, default=0.3)
+    spaced.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -57,6 +95,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"regions: {len(result.regions)}")
             print(f"manifest: {args.output / 'regions.json'}")
         return 0 if result.status != "failed" else 2
+    if args.command == "spaced":
+        result = detect_spaced_region_hypotheses(
+            args.image,
+            expected_count=args.expected_count,
+            row_counts=args.row_counts,
+            mode=args.mode,
+            min_confidence=args.min_confidence,
+        )
+        manifest = write_spaced_hypotheses(result, args.output)
+        if args.json_output:
+            print(json.dumps(spaced_hypotheses_payload(result), ensure_ascii=False))
+        else:
+            print(f"status: {result.selected.status}")
+            print(f"regions: {len(result.selected.regions)}")
+            print(f"page hypotheses: {len(result.page_hypotheses)}")
+            diagnostics = result.selected.diagnostics
+            print(f"search truncated: {result.truncated}")
+            if diagnostics and diagnostics.search_limit:
+                print(f"search limit: {diagnostics.search_limit}")
+            if result.failure_reason:
+                print(f"failure: {result.failure_reason}")
+            print(f"manifest: {manifest}")
+        return 0 if result.selected.status != "failed" else 2
     return 2
 
 

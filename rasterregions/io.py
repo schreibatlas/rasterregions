@@ -9,7 +9,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .models import DetectionResult
+from .models import (
+    DetectionResult,
+    PagePartitionHypothesis,
+    RegionHypothesis,
+    RowPartitionHypothesis,
+    SpacedSegmentationHypotheses,
+)
 
 
 def detection_payload(result: DetectionResult) -> dict:
@@ -100,6 +106,8 @@ def detection_payload(result: DetectionResult) -> dict:
             "best_second_best_partition_margin": diagnostics.best_second_best_partition_margin,
             "unassigned_ink_fraction": round(diagnostics.unassigned_ink_fraction, 6),
             "unassigned_ink_pixels": int(result.unassigned_mask.sum()),
+            "search_truncated": diagnostics.search_truncated,
+            "search_limit": diagnostics.search_limit,
             "width_prior_deviation": diagnostics.width_prior_deviation,
             "body_counts_per_region": list(diagnostics.body_counts_per_region),
             "rows": [
@@ -153,6 +161,142 @@ def detection_payload(result: DetectionResult) -> dict:
                 for assignment in diagnostics.secondary_mark_assignments
             ],
         }
+    return payload
+
+
+def _mask_runs(mask: np.ndarray) -> list[list[int]]:
+    runs: list[list[int]] = []
+    for y, row in enumerate(np.asarray(mask, dtype=bool)):
+        xs = np.flatnonzero(row)
+        if not len(xs):
+            continue
+        start = previous = int(xs[0])
+        for value in xs[1:]:
+            x = int(value)
+            if x != previous + 1:
+                runs.append([y, start, previous + 1])
+                start = x
+            previous = x
+        runs.append([y, start, previous + 1])
+    return runs
+
+
+def _boundary_payload(boundary) -> dict:
+    return {
+        "x": boundary.x,
+        "kind": boundary.kind,
+        "selected": boundary.selected,
+        "projection": round(boundary.projection, 6),
+        "valley_strength": boundary.valley_strength,
+        "crossing_components": boundary.crossing_components,
+        "component_indices": list(boundary.component_indices),
+        "crossing_cost": round(boundary.crossing_cost, 6),
+        "confidence": round(boundary.confidence, 6),
+    }
+
+
+def _assignment_payload(assignment) -> dict:
+    return {
+        "component_index": assignment.component_index,
+        "target_region_index": assignment.target_region_index,
+        "best_score": assignment.best_score,
+        "second_best_score": assignment.second_best_score,
+        "margin": assignment.margin,
+        "status": assignment.status,
+    }
+
+
+def _region_hypothesis_payload(region: RegionHypothesis) -> dict:
+    return {
+        "bbox": list(region.bbox.as_tuple()),
+        "width": region.bbox.width,
+        "height": region.bbox.height,
+        "area": int(region.mask.sum()),
+        "mask_runs": _mask_runs(region.mask),
+        "component_indices": list(region.component_indices),
+        "body_count": region.body_count,
+        "frame": {
+            "row_index": region.frame.row_index,
+            "baseline_y": round(region.frame.baseline_y, 4),
+            "body_height": round(region.frame.body_height, 4),
+            "row_center_y": round(region.frame.row_center_y, 4),
+        },
+        "cost": round(region.cost, 6),
+        "cut_crossing_cost": round(region.cut_crossing_cost, 6),
+        "confidence": round(region.confidence, 6),
+        "warnings": list(region.warnings),
+    }
+
+
+def _row_hypothesis_payload(row: RowPartitionHypothesis) -> dict:
+    return {
+        "row_index": row.row_index,
+        "count": row.count,
+        "boundaries": list(row.boundaries),
+        "boundary_evidence": [_boundary_payload(boundary) for boundary in row.boundary_evidence],
+        "cost": round(row.cost, 6),
+        "cost_components": {
+            "row_partition": round(row.cost, 6),
+            "cut_crossing": round(row.cut_crossing_cost, 6),
+            "unassigned_ink_fraction": round(row.unassigned_ink_fraction, 6),
+        },
+        "unassigned_ink_fraction": round(row.unassigned_ink_fraction, 6),
+        "regions": [_region_hypothesis_payload(region) for region in row.regions],
+        "secondary_mark_assignments": [
+            _assignment_payload(assignment) for assignment in row.secondary_mark_assignments
+        ],
+    }
+
+
+def _page_hypothesis_payload(
+    page: PagePartitionHypothesis,
+    cleaned_foreground_pixels: int,
+) -> dict:
+    unassigned = page.unassigned_mask
+    assert unassigned is not None
+    row_cost = sum(row.cost for row in page.row_hypotheses)
+    return {
+        "count": page.count,
+        "allocation": [row.count for row in page.row_hypotheses],
+        "cost": round(page.cost, 6),
+        "cost_components": {
+            "row_partitions": round(row_cost, 6),
+            "secondary_mark_and_ownership": round(
+                max(0.0, page.cost - row_cost - page.unassigned_ink_fraction), 6
+            ),
+            "unassigned_ink_fraction": round(page.unassigned_ink_fraction, 6),
+        },
+        "unassigned_ink_fraction": round(page.unassigned_ink_fraction, 6),
+        "unassigned_ink_pixels": int(unassigned.sum()),
+        "unassigned_mask_runs": _mask_runs(unassigned),
+        "cleaned_foreground_pixels": cleaned_foreground_pixels,
+        "rows": [_row_hypothesis_payload(row) for row in page.row_hypotheses],
+    }
+
+
+def spaced_hypotheses_payload(
+    result: SpacedSegmentationHypotheses,
+) -> dict:
+    """Return JSON-compatible selected, alternative, and search diagnostics."""
+    selected = result.selected
+    diagnostics = selected.diagnostics
+    payload = {
+        "schema_version": 1,
+        "segmentation": "spaced",
+        "selected": detection_payload(selected),
+        "row_hypotheses": [
+            [_row_hypothesis_payload(row) for row in options] for options in result.row_hypotheses
+        ],
+        "page_hypotheses": [
+            _page_hypothesis_payload(page, int(selected.clean_mask.sum()))
+            for page in result.page_hypotheses
+        ],
+        "search": {
+            "truncated": result.truncated,
+            "limit": diagnostics.search_limit if diagnostics else None,
+            "failure_reason": result.failure_reason,
+        },
+    }
     return payload
 
 
@@ -241,5 +385,100 @@ def write_detection(
 
     manifest = output / "regions.json"
     payload = json.dumps(detection_payload(result), ensure_ascii=False, indent=2) + "\n"
+    _atomic_write_text(payload, manifest)
+    return manifest
+
+
+def _save_page_ownership_overlay(
+    image: Image.Image,
+    page: PagePartitionHypothesis,
+    destination: Path,
+) -> None:
+    overlay = image.convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    colors = ((230, 70, 70), (40, 160, 80), (40, 100, 220), (210, 130, 20))
+    for index, region in enumerate(page.regions):
+        color = colors[index % len(colors)]
+        pixels = [
+            (region.bbox.x0 + int(x), region.bbox.y0 + int(y))
+            for y, x in zip(*np.nonzero(region.mask), strict=True)
+        ]
+        draw.point(pixels, fill=color)
+        draw.rectangle(
+            (
+                region.bbox.x0,
+                region.bbox.y0,
+                region.bbox.x1 - 1,
+                region.bbox.y1 - 1,
+            ),
+            outline=color,
+            width=1,
+        )
+    if page.unassigned_mask is not None:
+        ys, xs = np.nonzero(page.unassigned_mask)
+        draw.point(list(zip(xs.tolist(), ys.tolist(), strict=True)), fill=(245, 150, 20))
+    _atomic_save_image(overlay, destination)
+
+
+def write_spaced_hypotheses(
+    result: SpacedSegmentationHypotheses,
+    output_dir: str | Path,
+) -> Path:
+    """Write hypothesis JSON and selected/alternative ownership overlays."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    selected = result.selected
+    clean = Image.fromarray(np.asarray(selected.clean_mask, dtype=np.uint8) * 255)
+    _atomic_save_image(clean, output / "cleaned_mask.png")
+
+    row_overlay = selected.image.convert("RGB")
+    row_draw = ImageDraw.Draw(row_overlay)
+    for row in selected.rows:
+        x0, y0, x1, y1 = row.bbox.as_tuple()
+        row_draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(30, 110, 220), width=1)
+    _atomic_save_image(row_overlay, output / "rows.png")
+
+    boundary_overlay = selected.image.convert("RGB")
+    boundary_draw = ImageDraw.Draw(boundary_overlay)
+    diagnostics = selected.diagnostics
+    for boundary in diagnostics.partition_boundaries if diagnostics else ():
+        row = (
+            next(
+                (
+                    item
+                    for item in diagnostics.row_segmentation
+                    if boundary.x in item.selected_boundaries
+                ),
+                None,
+            )
+            if diagnostics
+            else None
+        )
+        y0, y1 = row.y_range if row else (0, selected.image.height)
+        color = (230, 40, 40) if boundary.selected else (130, 130, 130)
+        boundary_draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
+    _atomic_save_image(boundary_overlay, output / "candidate_cuts.png")
+
+    if result.page_hypotheses:
+        _save_page_ownership_overlay(
+            selected.image,
+            result.page_hypotheses[0],
+            output / "selected_partition.png",
+        )
+        for index, page in enumerate(result.page_hypotheses[1:3], start=2):
+            _save_page_ownership_overlay(
+                selected.image,
+                page,
+                output / f"alternative_partition_{index}.png",
+            )
+        unassigned = result.page_hypotheses[0].unassigned_mask
+    else:
+        unassigned = selected.unassigned_mask
+    if unassigned is not None:
+        unassigned_image = Image.fromarray(np.asarray(unassigned, dtype=np.uint8) * 255)
+        _atomic_save_image(unassigned_image, output / "unassigned_ink.png")
+
+    manifest = output / "hypotheses.json"
+    payload = json.dumps(spaced_hypotheses_payload(result), ensure_ascii=False, indent=2) + "\n"
     _atomic_write_text(payload, manifest)
     return manifest
