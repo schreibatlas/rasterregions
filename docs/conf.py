@@ -45,6 +45,7 @@ nitpick_ignore = [
     ("py:class", "numpy.typing.ArrayLike"),
     ("py:class", "PIL.Image.Image"),
     ("py:class", "rasterregions._image.NormalizedImage"),
+    ("py:class", "rasterregions._partition.RowPartition"),
 ]
 
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
