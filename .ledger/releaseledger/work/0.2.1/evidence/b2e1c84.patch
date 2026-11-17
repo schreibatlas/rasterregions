@@ -1,0 +1,2727 @@
+ docs/spaced-segmentation.md              |  39 +-
+ examples/08_spaced_regions.py            |  73 +--
+ rasterregions/__init__.py                |  20 +-
+ rasterregions/_partition.py              | 318 ++++++++++---
+ rasterregions/cli.py                     |  65 ++-
+ rasterregions/detect.py                  | 777 ++++++++++++++++++++++++++++++-
+ rasterregions/io.py                      | 241 +++++++++-
+ rasterregions/models.py                  | 220 +++++++++
+ tests/test_cli.py                        |  29 ++
+ tests/test_io.py                         |  37 +-
+ tests/test_page_expected_count.py        |  59 +++
+ tests/test_region_frames.py              | 173 +++++++
+ tests/test_secondary_mark_hypotheses.py  |  40 ++
+ tests/test_segmentation_search_limits.py |  51 ++
+ tests/test_spaced_region_hypotheses.py   |  44 ++
+ 15 files changed, 2032 insertions(+), 154 deletions(-)
+
+diff --git a/docs/spaced-segmentation.md b/docs/spaced-segmentation.md
+index f8bbab5..3a7509b 100644
+--- a/docs/spaced-segmentation.md
++++ b/docs/spaced-segmentation.md
+@@ -43,10 +43,43 @@ Every `Region.mask` contains only pixels owned by that region. Region masks neve
+ - **Connected components** are 8-connected foreground pixel sets.
+ - **Grouped regions** from `detect_regions` attach plausible components using the legacy grouping strategy.
+ - **Spaced-region segmentation** from `detect_spaced_regions` partitions each row using spacing, projection, body-count, width, and ownership evidence.
+-- **Expected-count partitioning** through `detect_regions(expected_count=...)` remains a separate legacy behavior for callers that already know a count. The new API accepts optional per-row count hints without changing that contract.
+-
+-The synthetic example writes an input mask, row and component overlays, a candidate-boundary overlay, a final region overlay, and JSON diagnostics under `build/examples/08_spaced_regions/`:
++- **Expected-count partitioning** through `detect_regions(expected_count=...)` remains a separate legacy behavior. For spaced segmentation, `expected_count` is a page total and `row_counts` optionally provides per-row evidence.
+
++The synthetic example writes a cleaned mask, row and candidate-cut overlays, the selected partition, up to two alternative partitions, unassigned ink, and a JSON hypothesis payload under `build/examples/08_spaced_regions/`:
+ ```bash
+ python examples/08_spaced_regions.py
+ ```
++
++
++## Bounded row and page hypotheses
++
++`detect_spaced_regions` accepts `expected_count` as generic page-level count evidence. It generates bounded row-count and partition candidates, then combines them with dynamic programming. A page allocation is returned only when its row counts sum exactly to the requested total. If none is feasible, the result is failed with an explicit warning and all cleaned ink remains unassigned. Existing `DetectionResult` fields and `detect_regions` behavior remain unchanged.
++
++Use `detect_spaced_region_hypotheses` when downstream code needs alternatives and stable normalization frames:
++
++```python
++from rasterregions import detect_spaced_region_hypotheses
++
++hypotheses = detect_spaced_region_hypotheses(
++    "page.png",
++    expected_count=5,
++    row_counts=[None, None],
++)
++selected = hypotheses.selected
++best_page = hypotheses.page_hypotheses[0] if hypotheses.page_hypotheses else None
++print(hypotheses.truncated, hypotheses.failure_reason)
++```
++
++When page hypotheses exist, hypothesis zero matches `selected`. Row and page hypotheses expose costs, boundary evidence, cut-crossing costs, body counts, region widths, frames, secondary-mark assignments, and unassigned-ink fractions. A detached mark can appear assigned to different regions in separate page hypotheses, including an explicit unassigned option. Every page hypothesis owns each cleaned foreground pixel exactly once, either through one region mask or its unassigned mask.
++
++`SpacingConfig` bounds candidate boundaries, row counts, row and page search states, secondary-mark branches, and returned hypotheses. `truncated=True` means at least one configured bound removed alternatives. The selected result and search diagnostics remain available when a bounded search finds no feasible page allocation.
++
++Serialize the aggregate result with `rasterregions.io.spaced_hypotheses_payload`. Masks are JSON-compatible row runs, and region runs are relative to their bounding boxes. `write_spaced_hypotheses` writes the payload plus cleaned-mask, row, candidate-cut, selected-partition, alternative-partition, and unassigned-ink images.
++
++The CLI exposes the same path:
++
++```bash
++rasterregions spaced page.png --expected-count 5 --row-counts auto,auto --output build/page-segmentation
++```
++
++`--row-counts` accepts comma-separated positive counts or `auto`, with one entry required per detected row. The CLI reports the number of returned page hypotheses and whether search was truncated; `hypotheses.json` includes the limiting budget and detailed alternatives.
+diff --git a/examples/08_spaced_regions.py b/examples/08_spaced_regions.py
+index fe3d2eb..8d865a4 100644
+--- a/examples/08_spaced_regions.py
++++ b/examples/08_spaced_regions.py
+@@ -1,15 +1,13 @@
+-"""Write overlays and diagnostics for opt-in spaced-region segmentation."""
++"""Write bounded spaced-segmentation hypotheses and visual diagnostics."""
+
+ from __future__ import annotations
+
+-import json
+ from pathlib import Path
+
+-import numpy as np
+ from PIL import Image, ImageDraw
+
+-from rasterregions import detect_spaced_regions
+-from rasterregions.io import detection_payload
++from rasterregions import detect_spaced_region_hypotheses
++from rasterregions.io import write_spaced_hypotheses
+
+ ROOT = Path(__file__).resolve().parent
+ BUILD = ROOT.parent / "build" / "examples" / "08_spaced_regions"
+@@ -24,66 +22,13 @@ def _synthetic_page() -> Image.Image:
+
+
+ def main() -> None:
+-    result = detect_spaced_regions(_synthetic_page(), mode="dark")
++    hypotheses = detect_spaced_region_hypotheses(_synthetic_page(), mode="dark")
+     BUILD.mkdir(parents=True, exist_ok=True)
+-
+-    Image.fromarray(result.mask_result.mask.astype(np.uint8) * 255).save(BUILD / "input_mask.png")
+-
+-    row_overlay = result.image.copy()
+-    draw = ImageDraw.Draw(row_overlay)
+-    for row in result.rows:
+-        draw.rectangle(row.bbox.as_tuple(), outline=(30, 110, 220), width=1)
+-    row_overlay.save(BUILD / "row_overlay.png")
+-
+-    component_overlay = result.image.copy()
+-    draw = ImageDraw.Draw(component_overlay)
+-    colors = ((230, 70, 70), (40, 160, 80), (40, 100, 220), (210, 130, 20))
+-    for index, component in enumerate(result.components):
+-        draw.point(
+-            list(zip(component.xs.tolist(), component.ys.tolist(), strict=True)),
+-            fill=colors[index % len(colors)],
+-        )
+-        draw.rectangle(component.bbox.as_tuple(), outline=colors[index % len(colors)])
+-    component_overlay.save(BUILD / "component_overlay.png")
+-
+-    boundary_overlay = result.image.copy()
+-    draw = ImageDraw.Draw(boundary_overlay)
+-    for boundary in result.diagnostics.partition_boundaries:
+-        row = (
+-            next(
+-                (
+-                    diagnostic
+-                    for diagnostic in result.diagnostics.row_segmentation
+-                    if boundary.x in diagnostic.selected_boundaries
+-                ),
+-                None,
+-            )
+-            if boundary.selected
+-            else None
+-        )
+-        y0, y1 = row.y_range if row else (0, result.image.height)
+-        color = (230, 40, 40) if boundary.selected else (130, 130, 130)
+-        draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
+-    boundary_overlay.save(BUILD / "candidate_boundary_overlay.png")
+-
+-    region_overlay = Image.new("RGB", result.image.size, "white")
+-    draw = ImageDraw.Draw(region_overlay)
+-    for index, region in enumerate(result.regions):
+-        color = colors[index % len(colors)]
+-        pixels = [
+-            (region.bbox.x0 + int(x), region.bbox.y0 + int(y))
+-            for y, x in zip(*np.nonzero(region.mask), strict=True)
+-        ]
+-        draw.point(pixels, fill=color)
+-        draw.rectangle(region.bbox.as_tuple(), outline=color, width=1)
+-    region_overlay.save(BUILD / "final_region_overlay.png")
+-
+-    (BUILD / "diagnostics.json").write_text(
+-        json.dumps(detection_payload(result), indent=2) + "\n",
+-        encoding="utf-8",
+-    )
+-    print("status:", result.status)
+-    print("regions:", len(result.regions))
++    write_spaced_hypotheses(hypotheses, BUILD)
++    print("status:", hypotheses.selected.status)
++    print("selected regions:", len(hypotheses.selected.regions))
++    print("page hypotheses:", len(hypotheses.page_hypotheses))
++    print("search truncated:", hypotheses.truncated)
+     print("artifacts:", BUILD)
+
+
+diff --git a/rasterregions/__init__.py b/rasterregions/__init__.py
+index 79d519b..b7dcab9 100644
+--- a/rasterregions/__init__.py
++++ b/rasterregions/__init__.py
+@@ -10,7 +10,12 @@ from __future__ import annotations
+ from importlib.metadata import PackageNotFoundError, version
+
+ from .components import components, isolate_component
+-from .detect import detect_regions, detect_rows, detect_spaced_regions
++from .detect import (
++    detect_regions,
++    detect_rows,
++    detect_spaced_region_hypotheses,
++    detect_spaced_regions,
++)
+ from .mask import foreground_mask
+ from .models import (
+     BBox,
+@@ -30,12 +35,18 @@ from .models import (
+     MaskMethod,
+     MaskMode,
+     MaskResult,
++    PagePartitionHypothesis,
+     PartitionBoundary,
+     PartitionConfig,
+     Region,
++    RegionFrame,
++    RegionHypothesis,
+     RowBand,
++    RowPartitionHypothesis,
+     RowSegmentationDiagnostics,
+     SecondaryMarkAssignment,
++    SegmentationSearchLimitError,
++    SpacedSegmentationHypotheses,
+     SpacingConfig,
+ )
+ from .regions import crop, tighten_bbox
+@@ -66,18 +77,25 @@ __all__ = [
+     "MaskMethod",
+     "MaskMode",
+     "MaskResult",
++    "PagePartitionHypothesis",
+     "PartitionBoundary",
+     "PartitionConfig",
+     "Region",
++    "RegionFrame",
++    "RegionHypothesis",
+     "RowBand",
++    "RowPartitionHypothesis",
+     "RowSegmentationDiagnostics",
+     "SecondaryMarkAssignment",
++    "SegmentationSearchLimitError",
++    "SpacedSegmentationHypotheses",
+     "SpacingConfig",
+     "__version__",
+     "components",
+     "crop",
+     "detect_regions",
+     "detect_spaced_regions",
++    "detect_spaced_region_hypotheses",
+     "detect_rows",
+     "foreground_mask",
+     "isolate_component",
+diff --git a/rasterregions/_partition.py b/rasterregions/_partition.py
+index 913baaf..847885a 100644
+--- a/rasterregions/_partition.py
++++ b/rasterregions/_partition.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+
++from collections.abc import Sequence
+ from dataclasses import dataclass, replace
+ from typing import Literal
+
+@@ -17,6 +18,7 @@ from .models import (
+     PartitionConfig,
+     Region,
+     RowBand,
++    SegmentationSearchLimitError,
+     SpacingConfig,
+ )
+
+@@ -31,6 +33,9 @@ class PartitionResult:
+     alternative_cost_margin: float | None = None
+     width_prior_deviation: float | None = None
+     body_counts_per_region: tuple[int, ...] = ()
++    alternatives: tuple[PartitionResult, ...] = ()
++    truncated: bool = False
++    cut_crossing_cost: float = 0.0
+
+
+ @dataclass(frozen=True)
+@@ -43,6 +48,61 @@ class RowPartition:
+     width_prior_deviation: float | None = None
+     body_counts_per_region: tuple[int, ...] = ()
+
++    alternatives: tuple[RowPartition, ...] = ()
++    truncated: bool = False
++    cut_positions: tuple[int, ...] = ()
++    cut_crossing_cost: float = 0.0
++
++
++def _combine_page_partitions(
++    options_by_row: Sequence[Sequence[RowPartition]],
++    expected_count: int,
++    spacing: SpacingConfig,
++) -> tuple[tuple[tuple[RowPartition, ...], ...], bool]:
++    """Return bounded, deterministic exact-total row allocations."""
++    limit = spacing.hypothesis_limit
++    states: dict[int, list[tuple[float, tuple[RowPartition, ...]]]] = {0: [(0.0, ())]}
++    visited = 0
++    truncated = False
++    for row_options in options_by_row:
++        next_states: dict[int, list[tuple[float, tuple[RowPartition, ...]]]] = {}
++        for used_count in sorted(states):
++            for current_cost, selected_rows in states[used_count]:
++                for option in sorted(
++                    row_options,
++                    key=lambda row: (row.cut_positions[-1] if row.cut_positions else 0, row.cost),
++                ):
++                    total = used_count + len(option.regions)
++                    if total > expected_count:
++                        continue
++                    if visited >= spacing.max_page_states:
++                        truncated = True
++                        break
++                    visited += 1
++                    bucket = next_states.setdefault(total, [])
++                    bucket.append((current_cost + option.cost, (*selected_rows, option)))
++                if truncated:
++                    break
++            if truncated:
++                break
++        for total, candidates in next_states.items():
++            candidates.sort(
++                key=lambda item: (
++                    item[0],
++                    tuple((row.cut_positions, len(row.regions)) for row in item[1]),
++                )
++            )
++            if len(candidates) > limit:
++                truncated = True
++                next_states[total] = candidates[:limit]
++        states = next_states
++        if truncated and not states:
++            break
++    candidates = states.get(expected_count, [])
++    if len(candidates) > limit:
++        truncated = True
++    return tuple(rows for _, rows in candidates[:limit]), truncated
++
+
+ @dataclass(frozen=True)
+ class ExpectedCountResult:
+@@ -87,11 +147,11 @@ def _spacing_candidate_boundaries(
+     config: PartitionConfig,
+     spacing: SpacingConfig,
+     scale: float,
+-) -> tuple[list[int], tuple[PartitionBoundary, ...], dict[int, float]]:
+-    """Find scale-smoothed valleys and plausible component-center midpoints."""
++) -> tuple[list[int], tuple[PartitionBoundary, ...], dict[int, float], dict[int, float], bool]:
++    """Find bounded scale-smoothed valleys and plausible component-center midpoints."""
+     width = len(projection)
+     if width < 2:
+-        return [0, width], (), {}
++        return [0, width], (), {}, {}, False
+     smooth_width = min(width, max(1, int(round(max(1.0, scale) * 0.08))))
+     if smooth_width > 1:
+         kernel = np.ones(smooth_width, dtype=float) / smooth_width
+@@ -100,7 +160,7 @@ def _spacing_candidate_boundaries(
+         smoothed = projection.astype(float)
+     occupied = smoothed[smoothed > 0]
+     if occupied.size == 0:
+-        return [0, width], (), {}
++        return [0, width], (), {}, {}, False
+     normalization = max(1.0, scale)
+     valley_level = float(np.percentile(occupied, config.candidate_valley_percentile))
+     candidate_kinds: dict[
+@@ -125,23 +185,17 @@ def _spacing_candidate_boundaries(
+             candidate_kinds.setdefault(x, "local-minimum")
+
+     likely_bodies = _spacing_body_components(found)
+-    for left_body, right_body in zip(
+-        sorted(likely_bodies, key=lambda item: item.center_x)[:-1],
+-        sorted(likely_bodies, key=lambda item: item.center_x)[1:],
+-        strict=True,
+-    ):
++    ordered_bodies = sorted(likely_bodies, key=lambda item: item.center_x)
++    for left_body, right_body in zip(ordered_bodies[:-1], ordered_bodies[1:], strict=True):
+         midpoint = int(round((left_body.center_x + right_body.center_x) / 2.0))
+         local = midpoint - x_offset - left
+         if 0 < local < width and smoothed[local] <= max(valley_level * 1.5, scale * 0.5):
+             candidate_kinds.setdefault(local, "component-midpoint")
+
+     candidate_positions = sorted(candidate_kinds)
+-    cap = min(
+-        256,
+-        max(32, int(width / max(1.0, scale * 0.08))),
+-        max(32, spacing.max_inferred_count * 12),
+-    )
+-    if len(candidate_positions) > cap:
++    cap = spacing.max_candidate_boundaries
++    candidates_truncated = len(candidate_positions) > cap
++    if candidates_truncated:
+         candidate_positions = sorted(
+             candidate_positions,
+             key=lambda x: (smoothed[x] / normalization, x),
+@@ -150,6 +204,7 @@ def _spacing_candidate_boundaries(
+
+     boundaries: list[PartitionBoundary] = []
+     boundary_cost: dict[int, float] = {}
++    boundary_crossing_cost: dict[int, float] = {}
+     for cut in candidate_positions:
+         absolute_x = x_offset + left + cut
+         crossing = tuple(
+@@ -169,9 +224,9 @@ def _spacing_candidate_boundaries(
+                 1.0,
+             )
+         )
+-        boundary_cost[cut] = normalized_projection * config.projection_cost + len(
+-            crossing
+-        ) * config.crossing_cost * min(1.0, normalized_projection)
++        crossing_cost = len(crossing) * config.crossing_cost * min(1.0, normalized_projection)
++        boundary_crossing_cost[cut] = crossing_cost
++        boundary_cost[cut] = normalized_projection * config.projection_cost + crossing_cost
+         boundaries.append(
+             PartitionBoundary(
+                 x=absolute_x,
+@@ -182,9 +237,16 @@ def _spacing_candidate_boundaries(
+                 selected=False,
+                 kind=candidate_kinds[cut],
+                 valley_strength=strength,
++                crossing_cost=crossing_cost,
+             )
+         )
+-    return [0, *candidate_positions, width], tuple(boundaries), boundary_cost
++    return (
++        [0, *candidate_positions, width],
++        tuple(boundaries),
++        boundary_cost,
++        boundary_crossing_cost,
++        candidates_truncated,
++    )
+
+
+ def _partition_row(
+@@ -195,6 +257,8 @@ def _partition_row(
+     x_offset: int,
+     config: PartitionConfig,
+     spacing_config: SpacingConfig | None = None,
++    _forced_cut_positions: tuple[int, ...] | None = None,
++    _collect_alternatives: bool = True,
+ ) -> PartitionResult | None:
+     projection = np.asarray(row_mask, dtype=np.uint8).sum(axis=0).astype(float)
+     occupied = np.flatnonzero(projection)
+@@ -224,8 +288,17 @@ def _partition_row(
+             spacing_config.max_inferred_count,
+             max(minimum_count, int(np.ceil(row_width / max(1.0, smallest_width)))),
+         )
++        candidate_counts = list(range(minimum_count, maximum_count + 1))
++        count_truncated = len(candidate_counts) > spacing_config.max_count_candidates
++        if count_truncated:
++            target_count = row_width / max(1.0, row_width_prior)
++            candidate_counts = sorted(
++                candidate_counts,
++                key=lambda count: (abs(count - target_count), count),
++            )[: spacing_config.max_count_candidates]
++            candidate_counts.sort()
+         alternatives: list[tuple[float, int, PartitionResult]] = []
+-        for count in range(minimum_count, maximum_count + 1):
++        for count in candidate_counts:
+             result = _partition_row(
+                 row_mask,
+                 count,
+@@ -233,19 +306,46 @@ def _partition_row(
+                 x_offset=x_offset,
+                 config=config,
+                 spacing_config=spacing_config,
++                _collect_alternatives=_collect_alternatives,
+             )
+             if result is not None:
+-                adjusted_cost = result.cost + spacing_config.complexity_penalty * (count - 1)
+-                alternatives.append((adjusted_cost, count, result))
++                result_options = (result, *result.alternatives)
++                for option in result_options:
++                    adjusted_cost = option.cost + spacing_config.complexity_penalty * (count - 1)
++                    alternatives.append((adjusted_cost, count, option))
+         if not alternatives:
++            if count_truncated:
++                raise SegmentationSearchLimitError(
++                    "count-candidate budget exhausted before a feasible partition"
++                )
+             return None
+         alternatives.sort(key=lambda item: (item[0], item[1], item[2].cut_positions))
+-        best_cost, _, best = alternatives[0]
++        selected_options = alternatives[: spacing_config.hypothesis_limit]
++        best_cost, _, best = selected_options[0]
++        count_costs: dict[int, float] = {}
++        for candidate_cost, count, _ in alternatives:
++            count_costs[count] = min(count_costs.get(count, float("inf")), candidate_cost)
++        ordered_count_costs = sorted(count_costs.values())
+         margin = None
+-        if len(alternatives) > 1:
+-            second_cost = alternatives[1][0]
+-            margin = max(0.0, second_cost - best_cost) / max(1.0, abs(second_cost))
+-        return replace(best, cost=best_cost, alternative_cost_margin=margin)
++        if len(ordered_count_costs) > 1:
++            second_count_cost = ordered_count_costs[1]
++            margin = max(0.0, second_count_cost - best_cost) / max(1.0, abs(second_count_cost))
++        rest = tuple(
++            replace(
++                option,
++                cost=cost,
++                alternatives=(),
++                truncated=option.truncated or count_truncated,
++            )
++            for cost, _, option in selected_options[1:]
++        )
++        return replace(
++            best,
++            cost=best_cost,
++            alternative_cost_margin=margin,
++            alternatives=rest,
++            truncated=best.truncated or count_truncated,
++        )
+
+     if spacing_config is None:
+         cuts = _candidate_cut_positions(projection, config)
+@@ -266,8 +366,18 @@ def _partition_row(
+             + crossing.get(cut, 0) * config.crossing_cost
+             for cut in cuts[1:-1]
+         }
++        boundary_crossing_cost = {
++            cut: crossing.get(cut, 0) * config.crossing_cost for cut in cuts[1:-1]
++        }
++        candidates_truncated = False
+     else:
+-        cuts, candidate_boundaries, candidate_costs = _spacing_candidate_boundaries(
++        (
++            cuts,
++            candidate_boundaries,
++            candidate_costs,
++            boundary_crossing_cost,
++            candidates_truncated,
++        ) = _spacing_candidate_boundaries(
+             projection,
+             found,
+             x_offset=x_offset,
+@@ -284,6 +394,9 @@ def _partition_row(
+             for cut in cuts[1:-1]
+         }
+         boundary_cost = candidate_costs
++    if _forced_cut_positions is not None:
++        forced = set(_forced_cut_positions)
++        cuts = [cut for cut in cuts if cut in forced]
+     if len(cuts) < expected_count + 1:
+         return None
+
+@@ -352,33 +465,67 @@ def _partition_row(
+             return component_cost + narrow_cost + wide_cost + width_cost + density_cost + area_cost
+         return component_cost + narrow_cost + area_cost
+
+-    costs = np.full((expected_count + 1, len(cuts)), np.inf)
+-    previous = np.full((expected_count + 1, len(cuts)), -1, dtype=int)
+-    costs[0, 0] = 0.0
++    top_k = spacing_config.hypothesis_limit if spacing_config else 1
++    max_states = spacing_config.max_partition_states if spacing_config else 100_000
++    paths_by_state: dict[tuple[int, int], list[tuple[float, tuple[int, ...]]]] = {
++        (0, 0): [(0.0, (0,))]
++    }
++    visited_states = 0
++    state_budget_exhausted = False
++    path_budget_exhausted = False
+     for segments in range(1, expected_count + 1):
+         for end_index in range(1, len(cuts)):
+             end = cuts[end_index]
++            candidates: list[tuple[float, tuple[int, ...]]] = []
+             for start_index in range(end_index):
+-                if not np.isfinite(costs[segments - 1, start_index]):
++                prefixes = paths_by_state.get((segments - 1, start_index), ())
++                if not prefixes:
+                     continue
+                 start = cuts[start_index]
+                 extra_boundary = boundary_cost.get(start, 0.0) if start_index else 0.0
+-                score = costs[segments - 1, start_index] + segment_cost(start, end) + extra_boundary
+-                if score < costs[segments, end_index]:
+-                    costs[segments, end_index] = score
+-                    previous[segments, end_index] = start_index
++                segment_score = segment_cost(start, end) + extra_boundary
++                if not np.isfinite(segment_score):
++                    continue
++                for prefix_cost, prefix_path in prefixes:
++                    if visited_states >= max_states:
++                        state_budget_exhausted = True
++                        break
++                    visited_states += 1
++                    candidates.append((prefix_cost + segment_score, (*prefix_path, end_index)))
++                if state_budget_exhausted:
++                    break
++            if candidates:
++                candidates.sort(key=lambda item: (item[0], item[1]))
++                unique: list[tuple[float, tuple[int, ...]]] = []
++                seen_paths: set[tuple[int, ...]] = set()
++                for candidate in candidates:
++                    if candidate[1] in seen_paths:
++                        continue
++                    seen_paths.add(candidate[1])
++                    unique.append(candidate)
++                    if spacing_config is not None and len(unique) > top_k:
++                        path_budget_exhausted = True
++                    if len(unique) == top_k + 1:
++                        break
++                paths_by_state[(segments, end_index)] = unique
++            if state_budget_exhausted:
++                break
++        if state_budget_exhausted:
++            break
+     final_index = len(cuts) - 1
+-    if not np.isfinite(costs[expected_count, final_index]):
++    final_paths = paths_by_state.get((expected_count, final_index), [])
++    search_truncated = candidates_truncated or state_budget_exhausted or path_budget_exhausted
++    if not final_paths:
++        if candidates_truncated or state_budget_exhausted:
++            raise SegmentationSearchLimitError(
++                "partition search budget exhausted before a feasible result"
++            )
+         return None
+-
+-    boundary_indexes = [final_index]
+-    cursor = final_index
+-    for segments in range(expected_count, 0, -1):
+-        cursor = int(previous[segments, cursor])
+-        if cursor < 0:
+-            return None
+-        boundary_indexes.append(cursor)
+-    boundary_indexes.reverse()
++    if len(final_paths) > top_k:
++        search_truncated = True
++        final_paths = final_paths[:top_k]
++    selected_path_cost, selected_path = final_paths[0]
++    boundary_indexes = list(selected_path)
+     boundaries = [left + cuts[index] for index in boundary_indexes]
+     selected_x = {x_offset + boundary for boundary in boundaries[1:-1]}
+     candidate_by_x = {boundary.x: boundary for boundary in candidate_boundaries}
+@@ -413,6 +560,7 @@ def _partition_row(
+                     projection=float(projection[local_cut]),
+                     crossing_components=component_penalty,
+                     confidence=confidence,
++                    crossing_cost=component_penalty * config.crossing_cost,
+                 )
+             )
+
+@@ -447,14 +595,40 @@ def _partition_row(
+     boundary_confidence = min(boundary_confidences, default=1.0)
+     segment_confidence = min(segment_confidences, default=0.0)
+     confidence = min(boundary_confidence, segment_confidence)
+-    return PartitionResult(
++    margin = None
++    if len(final_paths) > 1:
++        second_cost = final_paths[1][0]
++        margin = max(0.0, second_cost - selected_path_cost) / max(1.0, abs(second_cost))
++    cut_crossing_cost = sum(
++        boundary_crossing_cost.get(cuts[index], 0.0) for index in boundary_indexes[1:-1]
++    )
++    result = PartitionResult(
+         tuple(boundaries),
+         confidence,
+-        float(costs[expected_count, final_index]),
++        selected_path_cost,
+         tuple(selected_boundaries),
++        alternative_cost_margin=margin,
+         width_prior_deviation=(float(np.mean(width_deviations)) if width_deviations else None),
+         body_counts_per_region=tuple(body_counts),
++        cut_crossing_cost=cut_crossing_cost,
+     )
++    if _collect_alternatives and len(final_paths) > 1:
++        alternatives: list[PartitionResult] = []
++        for _, alternative_path in final_paths[1:]:
++            alternative = _partition_row(
++                row_mask,
++                expected_count,
++                found,
++                x_offset=x_offset,
++                config=config,
++                spacing_config=spacing_config,
++                _forced_cut_positions=tuple(cuts[index] for index in alternative_path),
++                _collect_alternatives=False,
++            )
++            if alternative is not None:
++                alternatives.append(alternative)
++        result = replace(result, alternatives=tuple(alternatives))
++    return replace(result, truncated=search_truncated)
+
+
+ def _row_partition_regions(
+@@ -469,6 +643,8 @@ def _row_partition_regions(
+     grouping: GroupingConfig,
+     partition_config: PartitionConfig,
+     spacing_config: SpacingConfig | None = None,
++    _partition_override: PartitionResult | None = None,
++    _collect_alternatives: bool = True,
+ ) -> RowPartition | None:
+     if spacing_config:
+         row_y0, row_y1 = row.bbox.y0, row.bbox.y1
+@@ -486,14 +662,17 @@ def _row_partition_regions(
+         )
+         region_mask = mask
+     row_mask = region_mask[row_y0:row_y1, :]
+-    partition = _partition_row(
+-        row_mask,
+-        expected_count,
+-        row_found,
+-        x_offset=0,
+-        config=partition_config,
+-        spacing_config=spacing_config,
+-    )
++    partition = _partition_override
++    if partition is None:
++        partition = _partition_row(
++            row_mask,
++            expected_count,
++            row_found,
++            x_offset=0,
++            config=partition_config,
++            spacing_config=spacing_config,
++            _collect_alternatives=_collect_alternatives,
++        )
+     if partition is None:
+         return None
+     boundaries = partition.cut_positions
+@@ -534,7 +713,7 @@ def _row_partition_regions(
+                 clip=BBox(x0, row_y0, x1, row_y1),
+             )
+         )
+-    return RowPartition(
++    result = RowPartition(
+         tuple(regions),
+         confidence,
+         cost + (1.0 - confidence),
+@@ -542,7 +721,32 @@ def _row_partition_regions(
+         partition.alternative_cost_margin,
+         partition.width_prior_deviation,
+         partition.body_counts_per_region,
++        truncated=partition.truncated,
++        cut_positions=partition.cut_positions,
++        cut_crossing_cost=partition.cut_crossing_cost,
+     )
++    if _collect_alternatives and partition.alternatives:
++        alternatives: list[RowPartition] = []
++        for alternative_partition in partition.alternatives:
++            alternative = _row_partition_regions(
++                image,
++                mask,
++                found,
++                row,
++                row_index,
++                median_height,
++                expected_count,
++                padding,
++                grouping,
++                partition_config,
++                spacing_config,
++                _partition_override=alternative_partition,
++                _collect_alternatives=False,
++            )
++            if alternative is not None:
++                alternatives.append(alternative)
++        result = replace(result, alternatives=tuple(alternatives))
++    return result
+
+
+ def _expected_count_regions(
+diff --git a/rasterregions/cli.py b/rasterregions/cli.py
+index 80901df..755e75d 100644
+--- a/rasterregions/cli.py
++++ b/rasterregions/cli.py
+@@ -5,8 +5,34 @@ import json
+ from pathlib import Path
+
+ from . import __version__
+-from .detect import detect_regions
+-from .io import detection_payload, write_detection
++from .detect import detect_regions, detect_spaced_region_hypotheses
++from .io import (
++    detection_payload,
++    spaced_hypotheses_payload,
++    write_detection,
++    write_spaced_hypotheses,
++)
++
++
++def _parse_row_counts(value: str) -> tuple[int | None, ...]:
++    counts: list[int | None] = []
++    for item in value.split(","):
++        token = item.strip().lower()
++        if token in {"auto", "none"}:
++            counts.append(None)
++            continue
++        try:
++            count = int(token)
++        except ValueError as error:
++            raise argparse.ArgumentTypeError(
++                "row counts must be positive integers or 'auto'"
++            ) from error
++        if count < 1:
++            raise argparse.ArgumentTypeError("row counts must be positive integers or 'auto'")
++        counts.append(count)
++    if not counts:
++        raise argparse.ArgumentTypeError("at least one row count is required")
++    return tuple(counts)
+
+
+ def build_parser() -> argparse.ArgumentParser:
+@@ -29,6 +55,18 @@ def build_parser() -> argparse.ArgumentParser:
+     detect.add_argument("--no-crops", action="store_false", dest="include_crops", default=True)
+     detect.add_argument("--no-overlay", action="store_false", dest="include_overlay", default=True)
+     detect.add_argument("--no-mask", action="store_false", dest="include_mask", default=True)
++    spaced = sub.add_parser("spaced", help="segment sparse regions and return top-K hypotheses")
++    spaced.add_argument("image", type=Path)
++    spaced.add_argument("--output", "-o", type=Path, required=True)
++    spaced.add_argument("--expected-count", type=int, default=None)
++    spaced.add_argument("--row-counts", type=_parse_row_counts, default=None)
++    spaced.add_argument(
++        "--mode",
++        choices=("auto", "grayscale", "dark", "color", "hybrid", "adaptive"),
++        default="auto",
++    )
++    spaced.add_argument("--min-confidence", type=float, default=0.3)
++    spaced.add_argument("--json", action="store_true", dest="json_output")
+     return parser
+
+
+@@ -57,6 +95,29 @@ def main(argv: list[str] | None = None) -> int:
+             print(f"regions: {len(result.regions)}")
+             print(f"manifest: {args.output / 'regions.json'}")
+         return 0 if result.status != "failed" else 2
++    if args.command == "spaced":
++        result = detect_spaced_region_hypotheses(
++            args.image,
++            expected_count=args.expected_count,
++            row_counts=args.row_counts,
++            mode=args.mode,
++            min_confidence=args.min_confidence,
++        )
++        manifest = write_spaced_hypotheses(result, args.output)
++        if args.json_output:
++            print(json.dumps(spaced_hypotheses_payload(result), ensure_ascii=False))
++        else:
++            print(f"status: {result.selected.status}")
++            print(f"regions: {len(result.selected.regions)}")
++            print(f"page hypotheses: {len(result.page_hypotheses)}")
++            diagnostics = result.selected.diagnostics
++            print(f"search truncated: {result.truncated}")
++            if diagnostics and diagnostics.search_limit:
++                print(f"search limit: {diagnostics.search_limit}")
++            if result.failure_reason:
++                print(f"failure: {result.failure_reason}")
++            print(f"manifest: {manifest}")
++        return 0 if result.selected.status != "failed" else 2
+     return 2
+
+
+diff --git a/rasterregions/detect.py b/rasterregions/detect.py
+index 081b1bd..334546c 100644
+--- a/rasterregions/detect.py
++++ b/rasterregions/detect.py
+@@ -12,10 +12,16 @@ from ._grouping import (
+     _assign_spacing_marks,
+     _automatic_regions,
+     _make_region,
++    _spacing_attachment_score,
+     _spacing_body_components,
+ )
+ from ._image import normalize_image
+-from ._partition import _expected_count_regions, _row_partition_regions
++from ._partition import (
++    RowPartition,
++    _combine_page_partitions,
++    _expected_count_regions,
++    _row_partition_regions,
++)
+ from ._rows import (
+     _rows_from_components,
+     _spacing_rows_from_components,
+@@ -32,13 +38,24 @@ from .models import (
+     ExpectedCountScope,
+     MaskMode,
+     MaskResult,
++    PagePartitionHypothesis,
+     PartitionBoundary,
+     Region,
++    RegionFrame,
++    RegionHypothesis,
++    RowBand,
++    RowPartitionHypothesis,
+     RowSegmentationDiagnostics,
+     SecondaryMarkAssignment,
++    SpacedSegmentationHypotheses,
+ )
+
+-__all__ = ["detect_regions", "detect_rows", "detect_spaced_regions"]
++__all__ = [
++    "detect_regions",
++    "detect_rows",
++    "detect_spaced_regions",
++    "detect_spaced_region_hypotheses",
++]
+
+
+ def _translate_roi_result(
+@@ -259,23 +276,60 @@ def detect_regions(
+     )
+
+
++def _combine_unconstrained_rows(
++    options_by_row: Sequence[Sequence[RowPartition]],
++    config: DetectionConfig,
++) -> tuple[tuple[tuple[RowPartition, ...], ...], bool]:
++    states: list[tuple[float, tuple[RowPartition, ...]]] = [(0.0, ())]
++    visited = 0
++    truncated = False
++    for row_options in options_by_row:
++        candidates: list[tuple[float, tuple[RowPartition, ...]]] = []
++        for cost, selected in states:
++            for option in row_options:
++                if visited >= config.spacing.max_page_states:
++                    truncated = True
++                    break
++                visited += 1
++                candidates.append((cost + option.cost, (*selected, option)))
++            if truncated:
++                break
++        candidates.sort(
++            key=lambda item: (
++                item[0],
++                tuple((row.cut_positions, len(row.regions)) for row in item[1]),
++            )
++        )
++        if len(candidates) > config.spacing.hypothesis_limit:
++            truncated = True
++        states = candidates[: config.spacing.hypothesis_limit]
++        if not states:
++            break
++    return tuple(rows for _, rows in states), truncated
++
++
+ def detect_spaced_regions(
+     source: str | Path | Image.Image | np.ndarray,
+     *,
+     mode: MaskMode = "auto",
+     row_counts: Sequence[int | None] | None = None,
++    expected_count: int | None = None,
+     min_confidence: float = 0.3,
+     config: DetectionConfig | None = None,
++    _row_hypotheses_out: list[tuple[RowPartition, ...]] | None = None,
++    _page_options_out: list[tuple[RowPartition, ...]] | None = None,
++    _truncated_out: list[bool] | None = None,
+ ) -> DetectionResult:
+-    """Detect anonymous regions using row-scale spacing and projection evidence.
+-
+-    ``row_counts`` optionally gives an exact positive region count for each detected
+-    row; ``None`` entries request automatic inference. Use ``DetectionConfig.spacing``
+-    to tune scale-relative padding, width priors, and ambiguity margins.
+-    """
++    """Detect anonymous regions with spacing evidence and optional page count."""
+     config = config or DetectionConfig()
+     if not 0.0 <= min_confidence <= 1.0:
+         raise ValueError("min_confidence must be between zero and one")
++    if expected_count is not None and (
++        isinstance(expected_count, bool)
++        or not isinstance(expected_count, int)
++        or expected_count < 1
++    ):
++        raise ValueError("expected_count must be a positive integer")
+     normalized = normalize_image(source)
+     image = normalized.image
+     mask_result = foreground_mask(normalized, mode=mode, config=config.mask)
+@@ -324,13 +378,96 @@ def detect_spaced_regions(
+     )
+     padding = max(0, round(body_height * config.spacing.padding_ratio))
+
++    page_options: tuple[tuple[RowPartition, ...], ...] = ()
++    selected_partitions: tuple[RowPartition, ...] | None = None
++    page_search_truncated = False
++    page_allocation_failure: str | None = None
++    if expected_count is not None:
++        options_by_row: list[tuple[RowPartition, ...]] = []
++        count_candidates_truncated = False
++        for row_index, row in enumerate(rows):
++            members = tuple(
++                component
++                for component in cleaned.components
++                if component.index in row.component_indices
++            )
++            row_body_ids = layout.body_component_indices[row_index]
++            row_bodies = [component_by_index[index] for index in row_body_ids]
++            row_height = float(
++                np.median([component.height for component in row_bodies or list(members)])
++            )
++            row_padding = max(0, round(row_height * config.spacing.padding_ratio))
++            requested_count = requested[row_index]
++            if requested_count is not None:
++                candidate_counts = [requested_count]
++            else:
++                candidate_limit = config.spacing.max_count_candidates
++                count_candidates_truncated |= expected_count > candidate_limit
++                if expected_count <= candidate_limit:
++                    candidate_counts = list(range(1, expected_count + 1))
++                else:
++                    target = expected_count / max(1, len(rows))
++                    spaced = np.linspace(1, expected_count, candidate_limit).round().astype(int)
++                    candidate_counts = sorted(
++                        set(spaced.tolist())
++                        | {max(1, int(np.floor(target))), max(1, int(np.ceil(target)))}
++                    )
++                    if len(candidate_counts) > candidate_limit:
++                        candidate_counts = sorted(
++                            candidate_counts,
++                            key=lambda count: (abs(count - target), count),
++                        )[:candidate_limit]
++                        candidate_counts.sort()
++            row_options: list[RowPartition] = []
++            seen_options: set[tuple[int, ...]] = set()
++            for count in candidate_counts:
++                partition = _row_partition_regions(
++                    image,
++                    cleaned.mask,
++                    cleaned.components,
++                    row,
++                    row_index,
++                    cleaned.median_height,
++                    count,
++                    row_padding,
++                    config.grouping,
++                    config.partition,
++                    config.spacing,
++                )
++                if partition is None:
++                    continue
++                for option in (partition, *partition.alternatives):
++                    if option.cut_positions not in seen_options:
++                        seen_options.add(option.cut_positions)
++                        row_options.append(option)
++            options_by_row.append(tuple(row_options))
++        page_options, page_search_truncated = _combine_page_partitions(
++            options_by_row, expected_count, config.spacing
++        )
++        page_search_truncated |= count_candidates_truncated
++        if _row_hypotheses_out is not None:
++            _row_hypotheses_out.extend(options_by_row)
++        if _page_options_out is not None:
++            _page_options_out.extend(page_options)
++        if page_options:
++            selected_partitions = page_options[0]
++            requested = tuple(len(partition.regions) for partition in selected_partitions)
++        else:
++            page_allocation_failure = (
++                f"No feasible row allocation sums to expected_count={expected_count}."
++            )
++            if page_search_truncated:
++                page_allocation_failure += " Search budgets limited the candidate allocations."
++    elif _page_options_out is not None:
++        _page_options_out.clear()
+     regions: list[Region] = []
+     row_diagnostics: list[RowSegmentationDiagnostics] = []
+     partition_boundaries: list[PartitionBoundary] = []
+-    spacing_warnings: list[str] = []
+-    failed_row = False
++    spacing_warnings = [page_allocation_failure] if page_allocation_failure else []
++    failed_row = page_allocation_failure is not None
+     low_confidence = False
+
++    row_partition_options: list[tuple[RowPartition, ...]] = []
+     for row_index, (row, requested_count) in enumerate(zip(rows, requested, strict=True)):
+         members = tuple(
+             component
+@@ -343,19 +480,28 @@ def detect_spaced_regions(
+             np.median([component.height for component in row_bodies or list(members)])
+         )
+         row_padding = max(0, round(row_height * config.spacing.padding_ratio))
+-        partition = _row_partition_regions(
+-            image,
+-            cleaned.mask,
+-            cleaned.components,
+-            row,
+-            row_index,
+-            cleaned.median_height,
+-            requested_count,
+-            row_padding,
+-            config.grouping,
+-            config.partition,
+-            config.spacing,
+-        )
++        if page_allocation_failure is not None:
++            partition = None
++        elif selected_partitions is not None:
++            partition = selected_partitions[row_index]
++        else:
++            partition = _row_partition_regions(
++                image,
++                cleaned.mask,
++                cleaned.components,
++                row,
++                row_index,
++                cleaned.median_height,
++                requested_count,
++                row_padding,
++                config.grouping,
++                config.partition,
++                config.spacing,
++            )
++        row_options = (partition, *partition.alternatives) if partition is not None else ()
++        row_partition_options.append(row_options)
++        if expected_count is None and _row_hypotheses_out is not None:
++            _row_hypotheses_out.append(row_options)
+         row_warnings: list[str] = []
+         row_regions: list[Region] = []
+         row_boundaries: tuple[PartitionBoundary, ...] = ()
+@@ -456,6 +602,13 @@ def detect_spaced_regions(
+                 )
+             )
+
++    if expected_count is None:
++        page_options, page_search_truncated = (
++            _combine_unconstrained_rows(row_partition_options, config) if rows else ((), False)
++        )
++        if _page_options_out is not None:
++            _page_options_out.extend(page_options)
++
+     def component_pixels_in_region(region: Region, component: Component) -> bool:
+         ys = component.ys
+         xs = component.xs
+@@ -615,6 +768,17 @@ def detect_spaced_regions(
+     body_counts_per_region = tuple(
+         count for diagnostic in row_diagnostics for count in diagnostic.body_counts_per_region
+     )
++    row_search_truncated = any(
++        option.truncated for options in row_partition_options for option in options
++    )
++    search_truncated = page_search_truncated or row_search_truncated
++    search_limit = (
++        "page-allocation-budget"
++        if page_search_truncated
++        else "row-partition-budget"
++        if row_search_truncated
++        else None
++    )
+     diagnostics = DetectionDiagnostics(
+         image_size=image.size,
+         mask_threshold=mask_result.threshold,
+@@ -625,6 +789,8 @@ def detect_spaced_regions(
+         mode=mode,
+         padding=padding,
+         min_confidence=min_confidence,
++        expected_count=expected_count,
++        expected_count_scope="page" if expected_count is not None else "row",
+         mask_method=mask_result.method,
+         mask_confidence=mask_result.confidence,
+         foreground_fraction=float(mask_result.mask.mean()),
+@@ -636,8 +802,10 @@ def detect_spaced_regions(
+         width_prior_deviation=float(np.mean(deviations)) if deviations else None,
+         body_counts_per_region=body_counts_per_region,
+         unassigned_ink_fraction=unassigned_fraction,
++        search_truncated=search_truncated,
++        search_limit=search_limit,
+     )
+-    return DetectionResult(
++    result = DetectionResult(
+         source_path=normalized.source_path,
+         image=image,
+         mask_result=mask_result,
+@@ -645,9 +813,570 @@ def detect_spaced_regions(
+         components=cleaned.components,
+         rows=rows,
+         regions=tuple(owned_regions),
++        expected_count=expected_count,
++        expected_count_scope="page" if expected_count is not None else "row",
+         status=status,
+         warnings=tuple([*mask_result.warnings, *cleaned.warnings, *spacing_warnings]),
+         component_decisions=cleaned.component_decisions,
+         diagnostics=diagnostics,
+         unassigned_mask=unassigned_mask,
+     )
++    if _truncated_out is not None:
++        _truncated_out.append(search_truncated)
++    return result
++
++
++def _region_frame(result: DetectionResult, row_index: int) -> RegionFrame:
++    diagnostics = result.diagnostics
++    row_diagnostic = (
++        diagnostics.row_segmentation[row_index]
++        if diagnostics is not None and row_index < len(diagnostics.row_segmentation)
++        else None
++    )
++    row = result.rows[row_index]
++    return RegionFrame(
++        baseline_y=row_diagnostic.baseline_y if row_diagnostic else float(row.bbox.y1),
++        body_height=row_diagnostic.body_height if row_diagnostic else float(row.bbox.height),
++        row_center_y=row_diagnostic.center_y if row_diagnostic else row.bbox.center_y,
++        row_index=row_index,
++    )
++
++
++def _row_boundary_positions(
++    row: RowBand,
++    regions: Sequence[Region],
++    partition: RowPartition | None,
++) -> tuple[int, ...]:
++    if partition is not None and len(partition.cut_positions) == len(regions) + 1:
++        return partition.cut_positions
++    internal = tuple(
++        sorted(
++            boundary
++            for boundary in (
++                [item.x for item in partition.partition_boundaries if item.selected]
++                if partition is not None
++                else []
++            )
++            if row.bbox.x0 < boundary < row.bbox.x1
++        )
++    )
++    if len(internal) != len(regions) - 1:
++        internal = tuple(region.bbox.x1 for region in regions[:-1])
++    return (row.bbox.x0, *internal, row.bbox.x1)
++
++
++def _selected_page_hypothesis(
++    result: DetectionResult,
++    selected_partitions: Sequence[RowPartition] | None,
++) -> PagePartitionHypothesis | None:
++    if not result.regions:
++        return None
++    diagnostics = result.diagnostics
++    rows: list[RowPartitionHypothesis] = []
++    regions_by_row = [
++        sorted(
++            (region for region in result.regions if region.row_index == row_index),
++            key=lambda region: region.reading_order,
++        )
++        for row_index in range(len(result.rows))
++    ]
++    assignments = diagnostics.secondary_mark_assignments if diagnostics else ()
++    body_ids = {component.index for component in _spacing_body_components(result.components)}
++    for row_index, row_regions in enumerate(regions_by_row):
++        if not row_regions:
++            continue
++        row = result.rows[row_index]
++        row_diagnostic = (
++            diagnostics.row_segmentation[row_index]
++            if diagnostics and row_index < len(diagnostics.row_segmentation)
++            else None
++        )
++        part = (
++            selected_partitions[row_index]
++            if selected_partitions and row_index < len(selected_partitions)
++            else None
++        )
++        frame = _region_frame(result, row_index)
++        region_hypotheses = tuple(
++            RegionHypothesis(
++                bbox=region.bbox,
++                mask=region.mask,
++                component_indices=region.component_indices,
++                frame=frame,
++                cost=row_diagnostic.cost if row_diagnostic else 0.0,
++                confidence=region.confidence,
++                warnings=row_diagnostic.warnings if row_diagnostic else (),
++                cut_crossing_cost=(
++                    part.cut_crossing_cost / max(1, len(row_regions)) if part else 0.0
++                ),
++                body_count=(
++                    row_diagnostic.body_counts_per_region[region_index]
++                    if row_diagnostic and region_index < len(row_diagnostic.body_counts_per_region)
++                    else sum(index in body_ids for index in region.component_indices)
++                ),
++            )
++            for region_index, region in enumerate(row_regions)
++        )
++        row_assignments = tuple(
++            assignment
++            for assignment in assignments
++            if assignment.component_index in row.component_indices
++            or (
++                row_diagnostic
++                and assignment.component_index in row_diagnostic.ambiguous_component_indices
++            )
++        )
++        boundaries = _row_boundary_positions(row, row_regions, part)
++        if len(boundaries) != len(row_regions) + 1:
++            boundaries = (
++                row.bbox.x0,
++                *tuple(region.bbox.x1 for region in row_regions[:-1]),
++                row.bbox.x1,
++            )
++        rows.append(
++            RowPartitionHypothesis(
++                row_index=row_index,
++                count=len(row_regions),
++                boundaries=boundaries,
++                regions=region_hypotheses,
++                cost=row_diagnostic.cost if row_diagnostic else 0.0,
++                unassigned_ink_fraction=(
++                    result.unassigned_mask[row.bbox.y0 : row.bbox.y1].sum()
++                    / max(1, result.clean_mask[row.bbox.y0 : row.bbox.y1].sum())
++                ),
++                secondary_mark_assignments=row_assignments,
++                boundary_evidence=(
++                    part.partition_boundaries
++                    if part
++                    else tuple(
++                        boundary
++                        for boundary in (diagnostics.partition_boundaries if diagnostics else ())
++                        if boundary.x in boundaries[1:-1]
++                    )
++                ),
++                cut_crossing_cost=part.cut_crossing_cost if part else 0.0,
++            )
++        )
++    unassigned_fraction = diagnostics.unassigned_ink_fraction if diagnostics else 0.0
++    return PagePartitionHypothesis(
++        row_hypotheses=tuple(rows),
++        count=len(result.regions),
++        cost=sum(row.cost for row in rows) + unassigned_fraction,
++        unassigned_ink_fraction=unassigned_fraction,
++        unassigned_mask=result.unassigned_mask,
++    )
++
++
++def _row_hypothesis_from_partition(
++    result: DetectionResult,
++    row_index: int,
++    partition: RowPartition,
++    region_offset: int,
++) -> RowPartitionHypothesis:
++    frame = _region_frame(result, row_index)
++    body_ids = {component.index for component in _spacing_body_components(result.components)}
++    regions = tuple(
++        RegionHypothesis(
++            bbox=region.bbox,
++            mask=region.mask,
++            component_indices=region.component_indices,
++            frame=frame,
++            cost=partition.cost / max(1, len(partition.regions)),
++            confidence=partition.confidence,
++            warnings=(),
++            cut_crossing_cost=(partition.cut_crossing_cost / max(1, len(partition.regions))),
++            body_count=sum(index in body_ids for index in region.component_indices),
++        )
++        for region in partition.regions
++    )
++    row_assignments: list[SecondaryMarkAssignment] = []
++    row = result.rows[row_index]
++    for component in result.components:
++        if component.index in body_ids or component.index not in row.component_indices:
++            continue
++        owners = [
++            local_index
++            for local_index, region in enumerate(partition.regions)
++            if component.index in region.component_indices
++        ]
++        if len(owners) == 1:
++            row_assignments.append(
++                SecondaryMarkAssignment(
++                    component.index,
++                    region_offset + owners[0],
++                    None,
++                    None,
++                    None,
++                    "assigned",
++                )
++            )
++        else:
++            row_assignments.append(
++                SecondaryMarkAssignment(component.index, None, None, None, None, "unassigned")
++            )
++    return RowPartitionHypothesis(
++        row_index=row_index,
++        count=len(regions),
++        boundaries=partition.cut_positions,
++        regions=regions,
++        cost=partition.cost,
++        unassigned_ink_fraction=0.0,
++        secondary_mark_assignments=tuple(row_assignments),
++        boundary_evidence=partition.partition_boundaries,
++        cut_crossing_cost=partition.cut_crossing_cost,
++    )
++
++
++def _page_hypotheses_for_partitions(
++    result: DetectionResult,
++    partitions: Sequence[RowPartition],
++    config: DetectionConfig,
++) -> tuple[tuple[PagePartitionHypothesis, ...], bool]:
++    if not partitions:
++        return (), False
++    region_specs = [
++        (row_index, row_partition, region)
++        for row_index, row_partition in enumerate(partitions)
++        for region in row_partition.regions
++    ]
++    if not region_specs:
++        return (), False
++    shape = result.clean_mask.shape
++    body_components = _spacing_body_components(result.components)
++    body_ids = {component.index for component in body_components}
++    secondary = [component for component in result.components if component.index not in body_ids]
++    secondary_ids = {component.index for component in secondary}
++    body_ids = {component.index for component in result.components} - secondary_ids
++    base_masks: list[np.ndarray] = []
++    body_groups: list[tuple[Component, ...]] = []
++    for _, _, region in region_specs:
++        full = np.zeros(shape, dtype=bool)
++        full[region.bbox.y0 : region.bbox.y1, region.bbox.x0 : region.bbox.x1] = region.mask
++        base_masks.append(full)
++        body_groups.append(
++            tuple(
++                component
++                for component in result.components
++                if component.index in body_ids and np.any(full[component.ys, component.xs])
++            )
++        )
++    for component in secondary:
++        for full in base_masks:
++            full[component.ys, component.xs] = False
++
++    row_for_component = {
++        component_index: row_index
++        for row_index, row in enumerate(result.rows)
++        for component_index in row.component_indices
++    }
++    mark_options: list[
++        tuple[
++            Component,
++            float | None,
++            float | None,
++            float | None,
++            tuple[tuple[int | None, float], ...],
++        ]
++    ] = []
++    body_height = (
++        float(
++            np.median(
++                [component.height for component in result.components if component.index in body_ids]
++            )
++        )
++        if body_ids
++        else 1.0
++    )
++    for component in sorted(secondary, key=lambda item: item.index):
++        row_index = row_for_component.get(component.index)
++        scored: list[tuple[float, int]] = []
++        for region_index, (target_row, _, _) in enumerate(region_specs):
++            if row_index is not None and target_row != row_index:
++                continue
++            score = _spacing_attachment_score(component, body_groups[region_index], body_height)
++            if score is not None:
++                scored.append((score, region_index))
++        scored.sort(key=lambda item: (item[0], item[1]))
++        best_score = scored[0][0] if scored and scored[0][0] <= 2.5 else None
++        second_score = scored[1][0] if best_score is not None and len(scored) > 1 else None
++        margin = (
++            (second_score - best_score) / max(1.0, abs(second_score))
++            if best_score is not None and second_score is not None
++            else None
++        )
++        if best_score is None:
++            choices = ((None, 0.0),)
++        else:
++            eligible = (
++                scored[:2]
++                if margin is not None and margin < config.spacing.mark_assignment_margin
++                else scored[:1]
++            )
++            choices = tuple((target, score) for score, target in eligible) + ((None, 2.5),)
++        mark_options.append((component, best_score, second_score, margin, choices))
++
++    branches: list[tuple[float, tuple[int | None, ...]]] = [(0.0, ())]
++    branches_truncated = False
++    for _, _, _, _, choices in mark_options:
++        expanded = [
++            (cost + choice_cost, (*selected, target))
++            for cost, selected in branches
++            for target, choice_cost in choices
++        ]
++        expanded.sort(
++            key=lambda item: (
++                item[0],
++                tuple(-1 if target is None else target for target in item[1]),
++            )
++        )
++        if len(expanded) > config.spacing.max_secondary_mark_branches:
++            branches_truncated = True
++        branches = expanded[: config.spacing.max_secondary_mark_branches]
++
++    pages: list[PagePartitionHypothesis] = []
++    for branch_cost, targets in branches:
++        masks = [mask.copy() for mask in base_masks]
++        owned = np.zeros(shape, dtype=bool)
++        for mask in masks:
++            mask &= ~owned
++            owned |= mask
++        assignments: list[SecondaryMarkAssignment] = []
++        for (component, best, second, margin, _), target in zip(mark_options, targets, strict=True):
++            if target is None:
++                assignments.append(
++                    SecondaryMarkAssignment(
++                        component.index,
++                        None,
++                        best,
++                        second,
++                        margin,
++                        "unassigned",
++                    )
++                )
++                continue
++            new_pixels = ~owned[component.ys, component.xs]
++            ys, xs = component.ys[new_pixels], component.xs[new_pixels]
++            masks[target][ys, xs] = True
++            owned[ys, xs] = True
++            assignments.append(
++                SecondaryMarkAssignment(component.index, target, best, second, margin, "assigned")
++            )
++        unassigned = result.clean_mask & ~owned
++        row_region_hypotheses: dict[int, list[RegionHypothesis]] = {}
++        for (row_index, row_partition, _), mask in zip(region_specs, masks, strict=True):
++            ys, xs = np.nonzero(mask)
++            if not len(xs):
++                continue
++            bbox = BBox(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
++            local_mask = mask[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
++            component_indices = tuple(
++                component.index
++                for component in result.components
++                if np.any(mask[component.ys, component.xs])
++            )
++            hypothesis = RegionHypothesis(
++                bbox=bbox,
++                mask=local_mask,
++                component_indices=component_indices,
++                frame=_region_frame(result, row_index),
++                cost=row_partition.cost / max(1, len(row_partition.regions)),
++                confidence=row_partition.confidence,
++                warnings=(),
++                cut_crossing_cost=(
++                    row_partition.cut_crossing_cost / max(1, len(row_partition.regions))
++                ),
++                body_count=sum(index in body_ids for index in component_indices),
++            )
++            row_region_hypotheses.setdefault(row_index, []).append(hypothesis)
++
++        row_hypotheses: list[RowPartitionHypothesis] = []
++        for row_index, partition in enumerate(partitions):
++            current_regions = tuple(row_region_hypotheses.get(row_index, ()))
++            if not current_regions:
++                continue
++            row = result.rows[row_index]
++            row_unassigned = unassigned[row.bbox.y0 : row.bbox.y1]
++            row_foreground = result.clean_mask[row.bbox.y0 : row.bbox.y1]
++            row_assignments = tuple(
++                assignment
++                for assignment in assignments
++                if row_for_component.get(assignment.component_index) == row_index
++            )
++            row_hypotheses.append(
++                RowPartitionHypothesis(
++                    row_index=row_index,
++                    count=len(current_regions),
++                    boundaries=partition.cut_positions,
++                    regions=current_regions,
++                    cost=partition.cost,
++                    unassigned_ink_fraction=float(
++                        row_unassigned.sum() / max(1, row_foreground.sum())
++                    ),
++                    secondary_mark_assignments=row_assignments,
++                    boundary_evidence=partition.partition_boundaries,
++                    cut_crossing_cost=partition.cut_crossing_cost,
++                )
++            )
++        if not row_hypotheses:
++            continue
++        unassigned_fraction = float(unassigned.sum() / max(1, result.clean_mask.sum()))
++        pages.append(
++            PagePartitionHypothesis(
++                row_hypotheses=tuple(row_hypotheses),
++                count=sum(row.count for row in row_hypotheses),
++                cost=sum(row.cost for row in row_hypotheses) + branch_cost + unassigned_fraction,
++                unassigned_ink_fraction=unassigned_fraction,
++                unassigned_mask=unassigned,
++            )
++        )
++    return tuple(pages), branches_truncated
++
++
++def detect_spaced_region_hypotheses(
++    source: str | Path | Image.Image | np.ndarray,
++    *,
++    mode: MaskMode = "auto",
++    expected_count: int | None = None,
++    row_counts: Sequence[int | None] | None = None,
++    min_confidence: float = 0.3,
++    config: DetectionConfig | None = None,
++) -> SpacedSegmentationHypotheses:
++    """Return selected spaced regions with bounded row and page alternatives."""
++    selected_config = config or DetectionConfig()
++    row_options: list[tuple[RowPartition, ...]] = []
++    page_options: list[tuple[RowPartition, ...]] = []
++    truncated_output: list[bool] = []
++    selected = detect_spaced_regions(
++        source,
++        mode=mode,
++        expected_count=expected_count,
++        row_counts=row_counts,
++        min_confidence=min_confidence,
++        config=selected_config,
++        _row_hypotheses_out=row_options,
++        _page_options_out=page_options,
++        _truncated_out=truncated_output,
++    )
++    selected_page = _selected_page_hypothesis(
++        selected,
++        page_options[0] if page_options else None,
++    )
++    page_hypotheses: list[PagePartitionHypothesis] = []
++    if selected_page is not None:
++        page_hypotheses.append(selected_page)
++    truncated = bool(truncated_output and truncated_output[0])
++    if page_options:
++        selected_signature = (
++            _page_hypothesis_signature(selected_page, selected.clean_mask)
++            if selected_page
++            else None
++        )
++        candidates: list[PagePartitionHypothesis] = []
++        seen_signatures = {selected_signature} if selected_signature is not None else set()
++        for partitions in page_options:
++            variants, branch_truncated = _page_hypotheses_for_partitions(
++                selected,
++                partitions,
++                selected_config,
++            )
++            truncated |= branch_truncated
++            for page in variants:
++                signature = _page_hypothesis_signature(page, selected.clean_mask)
++                if signature in seen_signatures:
++                    continue
++                seen_signatures.add(signature)
++                candidates.append(page)
++        candidates.sort(
++            key=lambda page: (
++                page.cost,
++                tuple((row.count, row.boundaries) for row in page.row_hypotheses),
++                _page_hypothesis_signature(page, selected.clean_mask),
++            )
++        )
++        remaining = selected_config.spacing.hypothesis_limit - len(page_hypotheses)
++        if len(candidates) > remaining:
++            truncated = True
++        page_hypotheses.extend(candidates[:remaining])
++    row_hypotheses: list[tuple[RowPartitionHypothesis, ...]] = []
++    selected_rows = selected_page.row_hypotheses if selected_page else ()
++    for row_index, options in enumerate(row_options):
++        row_candidates: list[RowPartitionHypothesis] = []
++        selected_row_by_index = {row.row_index: row for row in selected_rows}
++        if row_index in selected_row_by_index:
++            row_candidates.append(selected_row_by_index[row_index])
++        region_offset = sum(len(row.regions) for row in selected_rows if row.row_index < row_index)
++        for option in sorted(
++            options,
++            key=lambda item: (item.cost, len(item.regions), item.cut_positions),
++        ):
++            candidate = _row_hypothesis_from_partition(selected, row_index, option, region_offset)
++            if not any(
++                existing.boundaries == candidate.boundaries
++                and tuple(region.bbox for region in existing.regions)
++                == tuple(region.bbox for region in candidate.regions)
++                for existing in row_candidates
++            ):
++                row_candidates.append(candidate)
++            if len(row_candidates) >= selected_config.spacing.hypothesis_limit:
++                if len(options) > len(row_candidates):
++                    truncated = True
++                break
++        row_hypotheses.append(tuple(row_candidates))
++    failure_reason = None
++    if expected_count is not None and not page_hypotheses:
++        failure_reason = next(
++            (warning for warning in selected.warnings if "No feasible row allocation" in warning),
++            "No feasible page partition was returned.",
++        )
++    return SpacedSegmentationHypotheses(
++        selected=selected,
++        row_hypotheses=tuple(row_hypotheses),
++        page_hypotheses=tuple(page_hypotheses),
++        truncated=truncated,
++        failure_reason=failure_reason,
++    )
++
++
++def _page_ownership_signature(
++    page: PagePartitionHypothesis | None,
++    shape_mask: np.ndarray,
++) -> tuple[bytes, ...] | None:
++    if page is None:
++        return None
++    signatures = []
++    for region in page.regions:
++        full = np.zeros(shape_mask.shape, dtype=bool)
++        full[region.bbox.y0 : region.bbox.y1, region.bbox.x0 : region.bbox.x1] = region.mask
++        signatures.append(full.tobytes())
++    return tuple(signatures)
++
++
++def _page_hypothesis_signature(
++    page: PagePartitionHypothesis,
++    shape_mask: np.ndarray,
++) -> tuple[
++    tuple[bytes, ...],
++    tuple[tuple[int, tuple[int, ...], tuple[tuple[int, int, str], ...]], ...],
++]:
++    ownership = _page_ownership_signature(page, shape_mask)
++    assert ownership is not None
++    rows = tuple(
++        (
++            row.row_index,
++            row.boundaries,
++            tuple(
++                (
++                    assignment.component_index,
++                    (
++                        -1
++                        if assignment.target_region_index is None
++                        else assignment.target_region_index
++                    ),
++                    assignment.status,
++                )
++                for assignment in row.secondary_mark_assignments
++            ),
++        )
++        for row in page.row_hypotheses
++    )
++    return ownership, rows
+diff --git a/rasterregions/io.py b/rasterregions/io.py
+index cdb8e9d..e274747 100644
+--- a/rasterregions/io.py
++++ b/rasterregions/io.py
+@@ -9,7 +9,13 @@ from pathlib import Path
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+-from .models import DetectionResult
++from .models import (
++    DetectionResult,
++    PagePartitionHypothesis,
++    RegionHypothesis,
++    RowPartitionHypothesis,
++    SpacedSegmentationHypotheses,
++)
+
+
+ def detection_payload(result: DetectionResult) -> dict:
+@@ -100,6 +106,8 @@ def detection_payload(result: DetectionResult) -> dict:
+             "best_second_best_partition_margin": diagnostics.best_second_best_partition_margin,
+             "unassigned_ink_fraction": round(diagnostics.unassigned_ink_fraction, 6),
+             "unassigned_ink_pixels": int(result.unassigned_mask.sum()),
++            "search_truncated": diagnostics.search_truncated,
++            "search_limit": diagnostics.search_limit,
+             "width_prior_deviation": diagnostics.width_prior_deviation,
+             "body_counts_per_region": list(diagnostics.body_counts_per_region),
+             "rows": [
+@@ -156,6 +164,142 @@ def detection_payload(result: DetectionResult) -> dict:
+     return payload
+
+
++def _mask_runs(mask: np.ndarray) -> list[list[int]]:
++    runs: list[list[int]] = []
++    for y, row in enumerate(np.asarray(mask, dtype=bool)):
++        xs = np.flatnonzero(row)
++        if not len(xs):
++            continue
++        start = previous = int(xs[0])
++        for value in xs[1:]:
++            x = int(value)
++            if x != previous + 1:
++                runs.append([y, start, previous + 1])
++                start = x
++            previous = x
++        runs.append([y, start, previous + 1])
++    return runs
++
++
++def _boundary_payload(boundary) -> dict:
++    return {
++        "x": boundary.x,
++        "kind": boundary.kind,
++        "selected": boundary.selected,
++        "projection": round(boundary.projection, 6),
++        "valley_strength": boundary.valley_strength,
++        "crossing_components": boundary.crossing_components,
++        "component_indices": list(boundary.component_indices),
++        "crossing_cost": round(boundary.crossing_cost, 6),
++        "confidence": round(boundary.confidence, 6),
++    }
++
++
++def _assignment_payload(assignment) -> dict:
++    return {
++        "component_index": assignment.component_index,
++        "target_region_index": assignment.target_region_index,
++        "best_score": assignment.best_score,
++        "second_best_score": assignment.second_best_score,
++        "margin": assignment.margin,
++        "status": assignment.status,
++    }
++
++
++def _region_hypothesis_payload(region: RegionHypothesis) -> dict:
++    return {
++        "bbox": list(region.bbox.as_tuple()),
++        "width": region.bbox.width,
++        "height": region.bbox.height,
++        "area": int(region.mask.sum()),
++        "mask_runs": _mask_runs(region.mask),
++        "component_indices": list(region.component_indices),
++        "body_count": region.body_count,
++        "frame": {
++            "row_index": region.frame.row_index,
++            "baseline_y": round(region.frame.baseline_y, 4),
++            "body_height": round(region.frame.body_height, 4),
++            "row_center_y": round(region.frame.row_center_y, 4),
++        },
++        "cost": round(region.cost, 6),
++        "cut_crossing_cost": round(region.cut_crossing_cost, 6),
++        "confidence": round(region.confidence, 6),
++        "warnings": list(region.warnings),
++    }
++
++
++def _row_hypothesis_payload(row: RowPartitionHypothesis) -> dict:
++    return {
++        "row_index": row.row_index,
++        "count": row.count,
++        "boundaries": list(row.boundaries),
++        "boundary_evidence": [_boundary_payload(boundary) for boundary in row.boundary_evidence],
++        "cost": round(row.cost, 6),
++        "cost_components": {
++            "row_partition": round(row.cost, 6),
++            "cut_crossing": round(row.cut_crossing_cost, 6),
++            "unassigned_ink_fraction": round(row.unassigned_ink_fraction, 6),
++        },
++        "unassigned_ink_fraction": round(row.unassigned_ink_fraction, 6),
++        "regions": [_region_hypothesis_payload(region) for region in row.regions],
++        "secondary_mark_assignments": [
++            _assignment_payload(assignment) for assignment in row.secondary_mark_assignments
++        ],
++    }
++
++
++def _page_hypothesis_payload(
++    page: PagePartitionHypothesis,
++    cleaned_foreground_pixels: int,
++) -> dict:
++    unassigned = page.unassigned_mask
++    assert unassigned is not None
++    row_cost = sum(row.cost for row in page.row_hypotheses)
++    return {
++        "count": page.count,
++        "allocation": [row.count for row in page.row_hypotheses],
++        "cost": round(page.cost, 6),
++        "cost_components": {
++            "row_partitions": round(row_cost, 6),
++            "secondary_mark_and_ownership": round(
++                max(0.0, page.cost - row_cost - page.unassigned_ink_fraction), 6
++            ),
++            "unassigned_ink_fraction": round(page.unassigned_ink_fraction, 6),
++        },
++        "unassigned_ink_fraction": round(page.unassigned_ink_fraction, 6),
++        "unassigned_ink_pixels": int(unassigned.sum()),
++        "unassigned_mask_runs": _mask_runs(unassigned),
++        "cleaned_foreground_pixels": cleaned_foreground_pixels,
++        "rows": [_row_hypothesis_payload(row) for row in page.row_hypotheses],
++    }
++
++
++def spaced_hypotheses_payload(
++    result: SpacedSegmentationHypotheses,
++) -> dict:
++    """Return JSON-compatible selected, alternative, and search diagnostics."""
++    selected = result.selected
++    diagnostics = selected.diagnostics
++    payload = {
++        "schema_version": 1,
++        "segmentation": "spaced",
++        "selected": detection_payload(selected),
++        "row_hypotheses": [
++            [_row_hypothesis_payload(row) for row in options] for options in result.row_hypotheses
++        ],
++        "page_hypotheses": [
++            _page_hypothesis_payload(page, int(selected.clean_mask.sum()))
++            for page in result.page_hypotheses
++        ],
++        "search": {
++            "truncated": result.truncated,
++            "limit": diagnostics.search_limit if diagnostics else None,
++            "failure_reason": result.failure_reason,
++        },
++    }
++    return payload
++
++
+ def _atomic_save_image(image: Image.Image, destination: Path) -> None:
+     with tempfile.NamedTemporaryFile(
+         dir=destination.parent,
+@@ -243,3 +387,98 @@ def write_detection(
+     payload = json.dumps(detection_payload(result), ensure_ascii=False, indent=2) + "\n"
+     _atomic_write_text(payload, manifest)
+     return manifest
++
++
++def _save_page_ownership_overlay(
++    image: Image.Image,
++    page: PagePartitionHypothesis,
++    destination: Path,
++) -> None:
++    overlay = image.convert("RGB")
++    draw = ImageDraw.Draw(overlay)
++    colors = ((230, 70, 70), (40, 160, 80), (40, 100, 220), (210, 130, 20))
++    for index, region in enumerate(page.regions):
++        color = colors[index % len(colors)]
++        pixels = [
++            (region.bbox.x0 + int(x), region.bbox.y0 + int(y))
++            for y, x in zip(*np.nonzero(region.mask), strict=True)
++        ]
++        draw.point(pixels, fill=color)
++        draw.rectangle(
++            (
++                region.bbox.x0,
++                region.bbox.y0,
++                region.bbox.x1 - 1,
++                region.bbox.y1 - 1,
++            ),
++            outline=color,
++            width=1,
++        )
++    if page.unassigned_mask is not None:
++        ys, xs = np.nonzero(page.unassigned_mask)
++        draw.point(list(zip(xs.tolist(), ys.tolist(), strict=True)), fill=(245, 150, 20))
++    _atomic_save_image(overlay, destination)
++
++
++def write_spaced_hypotheses(
++    result: SpacedSegmentationHypotheses,
++    output_dir: str | Path,
++) -> Path:
++    """Write hypothesis JSON and selected/alternative ownership overlays."""
++    output = Path(output_dir)
++    output.mkdir(parents=True, exist_ok=True)
++    selected = result.selected
++    clean = Image.fromarray(np.asarray(selected.clean_mask, dtype=np.uint8) * 255)
++    _atomic_save_image(clean, output / "cleaned_mask.png")
++
++    row_overlay = selected.image.convert("RGB")
++    row_draw = ImageDraw.Draw(row_overlay)
++    for row in selected.rows:
++        x0, y0, x1, y1 = row.bbox.as_tuple()
++        row_draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(30, 110, 220), width=1)
++    _atomic_save_image(row_overlay, output / "rows.png")
++
++    boundary_overlay = selected.image.convert("RGB")
++    boundary_draw = ImageDraw.Draw(boundary_overlay)
++    diagnostics = selected.diagnostics
++    for boundary in diagnostics.partition_boundaries if diagnostics else ():
++        row = (
++            next(
++                (
++                    item
++                    for item in diagnostics.row_segmentation
++                    if boundary.x in item.selected_boundaries
++                ),
++                None,
++            )
++            if diagnostics
++            else None
++        )
++        y0, y1 = row.y_range if row else (0, selected.image.height)
++        color = (230, 40, 40) if boundary.selected else (130, 130, 130)
++        boundary_draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
++    _atomic_save_image(boundary_overlay, output / "candidate_cuts.png")
++
++    if result.page_hypotheses:
++        _save_page_ownership_overlay(
++            selected.image,
++            result.page_hypotheses[0],
++            output / "selected_partition.png",
++        )
++        for index, page in enumerate(result.page_hypotheses[1:3], start=2):
++            _save_page_ownership_overlay(
++                selected.image,
++                page,
++                output / f"alternative_partition_{index}.png",
++            )
++        unassigned = result.page_hypotheses[0].unassigned_mask
++    else:
++        unassigned = selected.unassigned_mask
++    if unassigned is not None:
++        unassigned_image = Image.fromarray(np.asarray(unassigned, dtype=np.uint8) * 255)
++        _atomic_save_image(unassigned_image, output / "unassigned_ink.png")
++
++    manifest = output / "hypotheses.json"
++    payload = json.dumps(spaced_hypotheses_payload(result), ensure_ascii=False, indent=2) + "\n"
++    _atomic_write_text(payload, manifest)
++    return manifest
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index 9f3b783..fe6c91c 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -155,12 +155,16 @@ class PartitionBoundary:
+     confidence: float
+     valley_strength: float | None = None
+     component_indices: tuple[int, ...] = ()
++    crossing_cost: float = 0.0
+     selected: bool = True
+     kind: Literal["zero-run", "valley", "local-minimum", "component-midpoint"] = "valley"
+
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+
++        if not isfinite(self.crossing_cost) or self.crossing_cost < 0.0:
++            raise ValueError("boundary crossing_cost must be finite and nonnegative")
++
+
+ @dataclass(frozen=True)
+ class CleanupConfig:
+@@ -399,6 +403,13 @@ class SpacingConfig:
+     mark_assignment_margin: float = 0.15
+     row_assignment_margin: float = 0.15
+
++    hypothesis_limit: int = 5
++    max_candidate_boundaries: int = 256
++    max_count_candidates: int = 24
++    max_partition_states: int = 100_000
++    max_page_states: int = 50_000
++    max_secondary_mark_branches: int = 32
++
+     def __post_init__(self) -> None:
+         values = (
+             self.padding_ratio,
+@@ -428,6 +439,18 @@ class SpacingConfig:
+             or self.max_inferred_count < 1
+         ):
+             raise ValueError("max_inferred_count must be a positive integer")
++        limits = (
++            self.hypothesis_limit,
++            self.max_candidate_boundaries,
++            self.max_count_candidates,
++            self.max_partition_states,
++            self.max_page_states,
++            self.max_secondary_mark_branches,
++        )
++        if any(
++            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 for limit in limits
++        ):
++            raise ValueError("spacing search limits must be positive integers")
+         if self.complexity_penalty < 0.0:
+             raise ValueError("complexity_penalty must be nonnegative")
+         margins = (self.ambiguity_margin, self.mark_assignment_margin, self.row_assignment_margin)
+@@ -474,6 +497,8 @@ class DetectionDiagnostics:
+     width_prior_deviation: float | None = None
+     body_counts_per_region: tuple[int, ...] = ()
+     unassigned_ink_fraction: float = 0.0
++    search_truncated: bool = False
++    search_limit: str | None = None
+
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
+@@ -721,6 +746,201 @@ class DetectionResult:
+                 raise ValueError("diagnostics must agree with canonical result and mask fields")
+
+
++@dataclass(frozen=True)
++class RegionFrame:
++    """Generic row geometry for downstream region normalization."""
++
++    baseline_y: float
++    body_height: float
++    row_center_y: float
++    row_index: int
++
++    def __post_init__(self) -> None:
++        values = (self.baseline_y, self.body_height, self.row_center_y)
++        if not all(isfinite(value) for value in values) or self.body_height <= 0.0:
++            raise ValueError("region frame values must be finite and body_height positive")
++        if (
++            isinstance(self.row_index, bool)
++            or not isinstance(self.row_index, int)
++            or self.row_index < 0
++        ):
++            raise ValueError("row_index must be a nonnegative integer")
++
++
++@dataclass(frozen=True)
++class RegionHypothesis:
++    """One anonymous foreground region within a segmentation hypothesis."""
++
++    bbox: BBox
++    mask: np.ndarray = field(repr=False, compare=False)
++    component_indices: tuple[int, ...]
++    frame: RegionFrame
++    cost: float
++    confidence: float
++    warnings: tuple[str, ...]
++    cut_crossing_cost: float = 0.0
++
++    body_count: int = 0
++
++    def __post_init__(self) -> None:
++        mask = np.asarray(self.mask, dtype=bool)
++        if mask.shape != (self.bbox.height, self.bbox.width):
++            raise ValueError("region hypothesis mask dimensions must match bbox")
++        if not all(
++            isfinite(value) for value in (self.cost, self.confidence, self.cut_crossing_cost)
++        ):
++            raise ValueError("region hypothesis scores must be finite")
++        if (
++            isinstance(self.body_count, bool)
++            or not isinstance(self.body_count, int)
++            or self.body_count < 0
++        ):
++            raise ValueError("body_count must be a nonnegative integer")
++        if self.cost < 0.0 or self.cut_crossing_cost < 0.0 or not 0.0 <= self.confidence <= 1.0:
++            raise ValueError("region hypothesis costs must be nonnegative and confidence in [0, 1]")
++        snapshot = np.array(mask, copy=True)
++        snapshot.setflags(write=False)
++        object.__setattr__(self, "mask", snapshot)
++        object.__setattr__(self, "component_indices", tuple(self.component_indices))
++        object.__setattr__(self, "warnings", tuple(self.warnings))
++
++
++@dataclass(frozen=True)
++class RowPartitionHypothesis:
++    """A bounded row partition candidate and its ownership evidence."""
++
++    row_index: int
++    count: int
++    boundaries: tuple[int, ...]
++    regions: tuple[RegionHypothesis, ...]
++    cost: float
++    unassigned_ink_fraction: float
++    secondary_mark_assignments: tuple[SecondaryMarkAssignment, ...]
++
++    boundary_evidence: tuple[PartitionBoundary, ...] = ()
++    cut_crossing_cost: float = 0.0
++
++    def __post_init__(self) -> None:
++        if (
++            isinstance(self.row_index, bool)
++            or not isinstance(self.row_index, int)
++            or self.row_index < 0
++        ):
++            raise ValueError("row_index must be a nonnegative integer")
++        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
++            raise ValueError("count must be a positive integer")
++        boundaries = tuple(self.boundaries)
++        regions = tuple(self.regions)
++        if (
++            len(regions) != self.count
++            or len(boundaries) != self.count + 1
++            or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
++        ):
++            raise ValueError("row hypothesis count and boundaries must match its regions")
++        if not isfinite(self.cost) or self.cost < 0.0:
++            raise ValueError("row hypothesis cost must be finite and nonnegative")
++        if not isfinite(self.cut_crossing_cost) or self.cut_crossing_cost < 0.0:
++            raise ValueError("cut_crossing_cost must be finite and nonnegative")
++        if (
++            not isfinite(self.unassigned_ink_fraction)
++            or not 0.0 <= self.unassigned_ink_fraction <= 1.0
++        ):
++            raise ValueError("unassigned_ink_fraction must be between zero and one")
++        object.__setattr__(self, "boundaries", boundaries)
++        object.__setattr__(self, "regions", regions)
++        object.__setattr__(
++            self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
++        )
++        object.__setattr__(self, "boundary_evidence", tuple(self.boundary_evidence))
++
++
++@dataclass(frozen=True)
++class PagePartitionHypothesis:
++    """One page allocation assembled from row partition hypotheses."""
++
++    row_hypotheses: tuple[RowPartitionHypothesis, ...]
++    count: int
++    cost: float
++    unassigned_ink_fraction: float
++    unassigned_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
++
++    def __post_init__(self) -> None:
++        rows = tuple(self.row_hypotheses)
++        if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 1:
++            raise ValueError("page hypothesis count must be a positive integer")
++        if sum(row.count for row in rows) != self.count:
++            raise ValueError("page hypothesis row counts must sum to count")
++        if not isfinite(self.cost) or self.cost < 0.0:
++            raise ValueError("page hypothesis cost must be finite and nonnegative")
++        if (
++            not isfinite(self.unassigned_ink_fraction)
++            or not 0.0 <= self.unassigned_ink_fraction <= 1.0
++        ):
++            raise ValueError("unassigned_ink_fraction must be between zero and one")
++        object.__setattr__(self, "row_hypotheses", rows)
++        if self.unassigned_mask is not None:
++            unassigned = np.asarray(self.unassigned_mask, dtype=bool)
++            if unassigned.ndim != 2:
++                raise ValueError("page unassigned_mask must be two-dimensional")
++            unassigned = np.array(unassigned, copy=True)
++            unassigned.setflags(write=False)
++            object.__setattr__(self, "unassigned_mask", unassigned)
++
++    @property
++    def regions(self) -> tuple[RegionHypothesis, ...]:
++        return tuple(region for row in self.row_hypotheses for region in row.regions)
++
++
++@dataclass(frozen=True)
++class SpacedSegmentationHypotheses:
++    """Selected segmentation and bounded row/page alternatives."""
++
++    selected: DetectionResult
++    row_hypotheses: tuple[tuple[RowPartitionHypothesis, ...], ...]
++    page_hypotheses: tuple[PagePartitionHypothesis, ...]
++    truncated: bool
++    failure_reason: str | None = None
++
++    def __post_init__(self) -> None:
++        rows = tuple(tuple(hypotheses) for hypotheses in self.row_hypotheses)
++        pages = tuple(self.page_hypotheses)
++        if self.failure_reason is not None and not self.failure_reason:
++            raise ValueError("failure_reason must be nonempty when supplied")
++        if pages:
++            selected_regions = self.selected.regions
++            hypothesis_regions = pages[0].regions
++            if len(selected_regions) != len(hypothesis_regions) or any(
++                region.bbox != hypothesis.bbox or not np.array_equal(region.mask, hypothesis.mask)
++                for region, hypothesis in zip(selected_regions, hypothesis_regions, strict=True)
++            ):
++                raise ValueError("selected result must match page hypothesis zero")
++            for page in pages:
++                if page.unassigned_mask is None:
++                    raise ValueError("page hypotheses must include an unassigned_mask")
++                unassigned = page.unassigned_mask
++                if unassigned.shape != self.selected.clean_mask.shape:
++                    raise ValueError("page unassigned_mask must match selected foreground shape")
++                ownership = np.zeros_like(self.selected.clean_mask)
++                for region in page.regions:
++                    bbox = region.bbox
++                    if bbox.x1 > ownership.shape[1] or bbox.y1 > ownership.shape[0]:
++                        raise ValueError("page region hypothesis exceeds foreground bounds")
++                    local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
++                    if np.any(local & region.mask):
++                        raise ValueError("page region ownership masks must be pairwise disjoint")
++                    local |= region.mask
++                if np.any(ownership & unassigned) or not np.array_equal(
++                    ownership | unassigned, self.selected.clean_mask
++                ):
++                    raise ValueError("page hypotheses must conserve cleaned foreground ownership")
++        object.__setattr__(self, "row_hypotheses", rows)
++        object.__setattr__(self, "page_hypotheses", pages)
++
++
++class SegmentationSearchLimitError(RuntimeError):
++    """Raised when a configured segmentation search budget prevents a safe result."""
++
++
+ @dataclass(frozen=True)
+ class IsolationCandidate:
+     """A component's disposition and reason in an isolation proposal."""
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index e46d49b..53d5ba5 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -70,3 +70,32 @@ def test_cli_failed_detection_keeps_nonzero_exit_status(tmp_path, capsys) -> Non
+
+     assert status == 2
+     assert "status: failed" in capsys.readouterr().out
++
++
++def test_spaced_cli_writes_hypotheses_and_reports_search(tmp_path, capsys) -> None:
++    image_path = tmp_path / "page.png"
++    _two_row_page().save(image_path)
++    output = tmp_path / "spaced"
++
++    status = main(
++        [
++            "spaced",
++            str(image_path),
++            "--output",
++            str(output),
++            "--expected-count",
++            "4",
++            "--row-counts",
++            "auto,auto",
++            "--mode",
++            "dark",
++            "--json",
++        ]
++    )
++    payload = json.loads(capsys.readouterr().out)
++
++    assert status == 0
++    assert payload["segmentation"] == "spaced"
++    assert payload["page_hypotheses"][0]["count"] == 4
++    assert "search_limit" in payload["selected"]["spacing"]
++    assert (output / "hypotheses.json").is_file()
+diff --git a/tests/test_io.py b/tests/test_io.py
+index 2b2c32d..4989f69 100644
+--- a/tests/test_io.py
++++ b/tests/test_io.py
+@@ -6,8 +6,20 @@ from pathlib import Path
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+-from rasterregions import BBox, crop, detect_regions, detect_spaced_regions, tighten_bbox
+-from rasterregions.io import detection_payload, write_detection
++from rasterregions import (
++    BBox,
++    crop,
++    detect_regions,
++    detect_spaced_region_hypotheses,
++    detect_spaced_regions,
++    tighten_bbox,
++)
++from rasterregions.io import (
++    detection_payload,
++    spaced_hypotheses_payload,
++    write_detection,
++    write_spaced_hypotheses,
++)
+
+
+ def test_tighten_bbox_and_crop_preserve_pixels() -> None:
+@@ -195,3 +207,24 @@ def test_spacing_diagnostics_are_serialized() -> None:
+     assert payload["spacing"]["row_count"] == 1
+     assert payload["spacing"]["unassigned_ink_pixels"] == 0
+     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
++
++
++def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
++    image = Image.new("RGB", (100, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.line((15, 55, 49, 18), fill="black", width=3)
++    draw.line((44, 55, 70, 18), fill="black", width=3)
++    result = detect_spaced_region_hypotheses(image, mode="dark", expected_count=2)
++
++    payload = spaced_hypotheses_payload(result)
++    encoded = json.dumps(payload)
++    manifest = write_spaced_hypotheses(result, tmp_path)
++
++    assert json.loads(encoded)["search"]["truncated"] == result.truncated
++    assert payload["page_hypotheses"][0]["count"] == 2
++    assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
++    assert (tmp_path / "cleaned_mask.png").is_file()
++    assert (tmp_path / "candidate_cuts.png").is_file()
++    assert (tmp_path / "selected_partition.png").is_file()
++    assert (tmp_path / "alternative_partition_2.png").is_file()
++    assert manifest.is_file()
+diff --git a/tests/test_page_expected_count.py b/tests/test_page_expected_count.py
+new file mode 100644
+index 0000000..60ab051
+--- /dev/null
++++ b/tests/test_page_expected_count.py
+@@ -0,0 +1,59 @@
++from __future__ import annotations
++
++import numpy as np
++from PIL import Image, ImageDraw
++
++from rasterregions import detect_spaced_region_hypotheses
++
++
++def _two_row_page() -> Image.Image:
++    image = Image.new("RGB", (180, 140), "white")
++    draw = ImageDraw.Draw(image)
++    for y in (15, 85):
++        for x in (15, 105):
++            draw.rectangle((x, y, x + 25, y + 28), fill="black")
++    return image
++
++
++def test_three_widely_spaced_objects_and_page_artifacts_are_detected() -> None:
++    image = Image.new("RGB", (220, 80), "white")
++    draw = ImageDraw.Draw(image)
++    for x in (15, 80, 150):
++        draw.rectangle((x, 18, x + 25, 48), fill="black")
++    draw.line((0, 62, 219, 62), fill=(180, 180, 180), width=1)
++    draw.point((208, 7), fill="black")
++
++    result = detect_spaced_region_hypotheses(image, mode="dark", expected_count=3)
++
++    assert result.selected.status in {"ok", "ambiguous"}
++    assert len(result.selected.regions) == 3
++    assert result.selected.diagnostics.expected_count_scope == "page"
++    assert result.page_hypotheses[0].count == 3
++    assert result.page_hypotheses[0].row_hypotheses[0].count == 3
++    reasons = [decision.reason for decision in result.selected.component_decisions]
++    assert any(reason and "rule" in reason for reason in reasons)
++    assert any(reason and "tiny" in reason for reason in reasons)
++
++
++def test_page_total_returns_competing_two_row_allocations_deterministically() -> None:
++    image = _two_row_page()
++    first = detect_spaced_region_hypotheses(image, mode="dark", expected_count=3)
++    second = detect_spaced_region_hypotheses(image, mode="dark", expected_count=3)
++
++    allocations = [
++        tuple(row.count for row in page.row_hypotheses) for page in first.page_hypotheses
++    ]
++    second_allocations = [
++        tuple(row.count for row in page.row_hypotheses) for page in second.page_hypotheses
++    ]
++    assert first.selected.status == "ambiguous"
++    assert allocations[:2] == [(2, 1), (1, 2)]
++    assert second_allocations == allocations
++    assert all(page.count == 3 for page in first.page_hypotheses)
++    assert [page.cost for page in first.page_hypotheses] == sorted(
++        page.cost for page in first.page_hypotheses
++    )
++    assert np.array_equal(
++        first.page_hypotheses[0].unassigned_mask,
++        first.selected.unassigned_mask,
++    )
+diff --git a/tests/test_region_frames.py b/tests/test_region_frames.py
+new file mode 100644
+index 0000000..53463e9
+--- /dev/null
++++ b/tests/test_region_frames.py
+@@ -0,0 +1,173 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from rasterregions import (
++    BBox,
++    PagePartitionHypothesis,
++    RegionFrame,
++    RegionHypothesis,
++    RowPartitionHypothesis,
++    SpacingConfig,
++)
++
++
++def _region(x0: int, x1: int, frame: RegionFrame) -> RegionHypothesis:
++    mask = np.ones((3, x1 - x0), dtype=bool)
++    return RegionHypothesis(
++        bbox=BBox(x0, 4, x1, 7),
++        mask=mask,
++        component_indices=(x0,),
++        frame=frame,
++        cost=0.25,
++        confidence=0.8,
++        warnings=(),
++    )
++
++
++def test_region_frame_and_hypothesis_masks_are_immutable_snapshots() -> None:
++    frame = RegionFrame(baseline_y=20.0, body_height=12.0, row_center_y=14.0, row_index=0)
++    source = np.ones((3, 5), dtype=bool)
++    region = RegionHypothesis(
++        bbox=BBox(2, 4, 7, 7),
++        mask=source,
++        component_indices=[1, 2],
++        frame=frame,
++        cost=0.25,
++        confidence=0.8,
++        warnings=["candidate valley"],
++    )
++
++    source[0, 0] = False
++    assert region.mask[0, 0]
++    assert not region.mask.flags.writeable
++    assert region.component_indices == (1, 2)
++    assert region.warnings == ("candidate valley",)
++    with pytest.raises(ValueError, match="body_height"):
++        RegionFrame(baseline_y=20.0, body_height=0.0, row_center_y=14.0, row_index=0)
++
++
++def test_row_and_page_hypotheses_keep_count_and_geometry_evidence() -> None:
++    frame = RegionFrame(baseline_y=20.0, body_height=12.0, row_center_y=14.0, row_index=0)
++    first = _region(0, 4, frame)
++    second = _region(7, 12, frame)
++    row = RowPartitionHypothesis(
++        row_index=0,
++        count=2,
++        boundaries=(0, 5, 12),
++        regions=(first, second),
++        cost=0.5,
++        unassigned_ink_fraction=0.0,
++        secondary_mark_assignments=(),
++    )
++    page = PagePartitionHypothesis(
++        row_hypotheses=(row,),
++        count=2,
++        cost=0.5,
++        unassigned_ink_fraction=0.0,
++    )
++
++    assert page.regions == (first, second)
++    assert row.regions[0].frame == frame
++    with pytest.raises(ValueError, match="sum to count"):
++        PagePartitionHypothesis((row,), 3, 0.5, 0.0)
++
++
++def test_spacing_search_limits_are_positive_integers() -> None:
++    for field in (
++        "hypothesis_limit",
++        "max_candidate_boundaries",
++        "max_count_candidates",
++        "max_partition_states",
++        "max_page_states",
++        "max_secondary_mark_branches",
++    ):
++        with pytest.raises(ValueError, match="positive integers"):
++            SpacingConfig(**{field: 0})
++        with pytest.raises(ValueError, match="positive integers"):
++            SpacingConfig(**{field: True})
++
++
++def test_page_hypotheses_use_expected_total_and_conserve_foreground() -> None:
++    from PIL import Image, ImageDraw
++
++    from rasterregions import detect_spaced_region_hypotheses
++
++    image = Image.new("RGB", (140, 140), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 15, 35, 45), fill="black")
++    draw.rectangle((65, 15, 85, 45), fill="black")
++    draw.rectangle((30, 85, 60, 115), fill="black")
++
++    result = detect_spaced_region_hypotheses(image, mode="dark", expected_count=3)
++
++    assert len(result.selected.rows) == 2
++    assert len(result.selected.regions) == 3
++    assert result.page_hypotheses
++    assert result.page_hypotheses[0].count == 3
++    assert len(result.page_hypotheses[0].regions) == len(result.selected.regions)
++    for page in result.page_hypotheses:
++        owner = np.zeros(result.selected.clean_mask.shape, dtype=bool)
++        for region in page.regions:
++            local = owner[region.bbox.y0 : region.bbox.y1, region.bbox.x0 : region.bbox.x1]
++            assert not np.any(local & region.mask)
++            local |= region.mask
++        assert not np.any(owner & page.unassigned_mask)
++        assert np.array_equal(owner | page.unassigned_mask, result.selected.clean_mask)
++
++
++def test_secondary_mark_hypotheses_include_competing_owners() -> None:
++    from PIL import Image, ImageDraw
++
++    from rasterregions import detect_spaced_region_hypotheses
++    from rasterregions.models import DetectionConfig
++
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 38, 55), fill="black")
++    draw.rectangle((75, 25, 98, 55), fill="black")
++    draw.ellipse((52, 12, 55, 15), fill="black")
++    config = DetectionConfig(
++        spacing=SpacingConfig(mark_assignment_margin=0.99, hypothesis_limit=12)
++    )
++
++    result = detect_spaced_region_hypotheses(
++        image,
++        mode="dark",
++        row_counts=[2],
++        config=config,
++    )
++
++    assignments = [
++        assignment
++        for page in result.page_hypotheses
++        for row in page.row_hypotheses
++        for assignment in row.secondary_mark_assignments
++    ]
++    assert {assignment.target_region_index for assignment in assignments} >= {None, 0, 1}
++
++
++def test_infeasible_expected_page_count_is_reported() -> None:
++    from PIL import Image, ImageDraw
++
++    from rasterregions import detect_spaced_region_hypotheses
++
++    image = Image.new("RGB", (140, 140), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 15, 35, 45), fill="black")
++    draw.rectangle((65, 15, 85, 45), fill="black")
++    draw.rectangle((30, 85, 60, 115), fill="black")
++    draw.rectangle((90, 85, 120, 115), fill="black")
++
++    result = detect_spaced_region_hypotheses(
++        image,
++        mode="dark",
++        row_counts=[2, 2],
++        expected_count=3,
++    )
++
++    assert result.page_hypotheses == ()
++    assert result.failure_reason is not None
++    assert result.selected.status == "failed"
++    assert np.array_equal(result.selected.unassigned_mask, result.selected.clean_mask)
+diff --git a/tests/test_secondary_mark_hypotheses.py b/tests/test_secondary_mark_hypotheses.py
+new file mode 100644
+index 0000000..7481cd9
+--- /dev/null
++++ b/tests/test_secondary_mark_hypotheses.py
+@@ -0,0 +1,40 @@
++from __future__ import annotations
++
++import numpy as np
++from PIL import Image, ImageDraw
++
++from rasterregions import DetectionConfig, SpacingConfig, detect_spaced_region_hypotheses
++
++
++def test_equally_plausible_dot_owners_are_preserved_with_unassigned_branch() -> None:
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 38, 55), fill="black")
++    draw.rectangle((75, 25, 98, 55), fill="black")
++    draw.ellipse((52, 12, 55, 15), fill="black")
++    config = DetectionConfig(
++        spacing=SpacingConfig(mark_assignment_margin=0.99, hypothesis_limit=12)
++    )
++
++    hypotheses = detect_spaced_region_hypotheses(
++        image,
++        mode="dark",
++        row_counts=[2],
++        config=config,
++    )
++
++    assignments = [
++        assignment
++        for page in hypotheses.page_hypotheses
++        for row in page.row_hypotheses
++        for assignment in row.secondary_mark_assignments
++    ]
++    assert hypotheses.selected.diagnostics.secondary_mark_assignments[0].status == "ambiguous"
++    assert {assignment.target_region_index for assignment in assignments} >= {None, 0, 1}
++    for page in hypotheses.page_hypotheses:
++        ownership = np.zeros(hypotheses.selected.clean_mask.shape, dtype=bool)
++        for region in page.regions:
++            local = ownership[region.bbox.y0 : region.bbox.y1, region.bbox.x0 : region.bbox.x1]
++            assert not np.any(local & region.mask)
++            local |= region.mask
++        assert np.array_equal(ownership | page.unassigned_mask, hypotheses.selected.clean_mask)
+diff --git a/tests/test_segmentation_search_limits.py b/tests/test_segmentation_search_limits.py
+new file mode 100644
+index 0000000..e198e34
+--- /dev/null
++++ b/tests/test_segmentation_search_limits.py
+@@ -0,0 +1,51 @@
++from __future__ import annotations
++
++import pytest
++from PIL import Image, ImageDraw
++
++from rasterregions import (
++    DetectionConfig,
++    SpacingConfig,
++    detect_spaced_region_hypotheses,
++)
++
++
++def _two_row_page() -> Image.Image:
++    image = Image.new("RGB", (180, 140), "white")
++    draw = ImageDraw.Draw(image)
++    for y in (15, 85):
++        for x in (15, 105):
++            draw.rectangle((x, y, x + 25, y + 28), fill="black")
++    return image
++
++
++def test_page_state_budget_is_reported_without_fabricating_allocation() -> None:
++    config = DetectionConfig(spacing=SpacingConfig(max_page_states=1))
++
++    result = detect_spaced_region_hypotheses(
++        _two_row_page(),
++        mode="dark",
++        expected_count=3,
++        config=config,
++    )
++
++    assert result.truncated
++    assert result.page_hypotheses == ()
++    assert result.failure_reason is not None
++    assert result.selected.status == "failed"
++    assert result.selected.diagnostics.search_truncated
++    assert result.selected.diagnostics.search_limit == "page-allocation-budget"
++    assert result.selected.diagnostics.expected_count == 3
++
++
++def test_each_search_budget_rejects_nonpositive_values() -> None:
++    for field in (
++        "hypothesis_limit",
++        "max_candidate_boundaries",
++        "max_count_candidates",
++        "max_partition_states",
++        "max_page_states",
++        "max_secondary_mark_branches",
++    ):
++        with pytest.raises(ValueError, match="positive integers"):
++            SpacingConfig(**{field: 0})
+diff --git a/tests/test_spaced_region_hypotheses.py b/tests/test_spaced_region_hypotheses.py
+new file mode 100644
+index 0000000..ff70d41
+--- /dev/null
++++ b/tests/test_spaced_region_hypotheses.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++import numpy as np
++
++from rasterregions import SpacingConfig
++from rasterregions._partition import _partition_row
++from rasterregions.components import components
++from rasterregions.models import PartitionConfig
++
++
++def test_row_partitioner_returns_deterministic_bounded_top_k() -> None:
++    mask = np.zeros((40, 100), dtype=bool)
++    mask[5:35, 10:30] = True
++    mask[5:35, 70:90] = True
++    found = tuple(components(mask))
++    config = SpacingConfig(hypothesis_limit=3)
++
++    first = _partition_row(
++        mask,
++        2,
++        found,
++        x_offset=0,
++        config=PartitionConfig(),
++        spacing_config=config,
++    )
++    second = _partition_row(
++        mask,
++        2,
++        found,
++        x_offset=0,
++        config=PartitionConfig(),
++        spacing_config=config,
++    )
++
++    assert first is not None and second is not None
++    assert first.cut_positions == second.cut_positions
++    assert [item.cut_positions for item in first.alternatives] == [
++        item.cut_positions for item in second.alternatives
++    ]
++    hypotheses = (first, *first.alternatives)
++    assert len(hypotheses) == config.hypothesis_limit
++    assert [item.cost for item in hypotheses] == sorted(item.cost for item in hypotheses)
++    assert first.truncated
++    assert all(len(item.cut_positions) == 3 for item in hypotheses)

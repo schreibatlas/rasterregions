@@ -1,0 +1,43 @@
+schema_version: 1
+object_type: commit_audit_sheet
+versioning:
+  schema_version: 1
+  revision: 1
+release_version: 0.2.1
+git_base_ref: v0.2.0
+git_base_sha: 1b71e8cfecc47983d8241915867abac69afb7af6
+git_head_ref: HEAD
+git_head_sha: b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f
+git_range: 1b71e8cfecc47983d8241915867abac69afb7af6..b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f
+commit_count: 1
+rows:
+- sha: b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f
+  source_ref: git:b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f
+  short_sha: b2e1c84
+  changed_paths:
+  - docs/spaced-segmentation.md
+  - examples/08_spaced_regions.py
+  - rasterregions/__init__.py
+  - rasterregions/_partition.py
+  - rasterregions/cli.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_cli.py
+  - tests/test_io.py
+  - tests/test_page_expected_count.py
+  - tests/test_region_frames.py
+  - tests/test_secondary_mark_hypotheses.py
+  - tests/test_segmentation_search_limits.py
+  - tests/test_spaced_region_hypotheses.py
+  stats:
+    files_changed: 15
+    insertions: 2032
+    deletions: 154
+  inspected: false
+  inspected_paths: []
+  observed_behavior: ''
+  public_impact: unknown
+  decision: needs_review
+  stale: false
+  evidence_subject: 'feat: spaced segemntation'

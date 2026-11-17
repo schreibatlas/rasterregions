@@ -1,0 +1,39 @@
+{
+  "candidate_count": 1,
+  "candidates": [
+    {
+      "additions": 2032,
+      "deletions": 154,
+      "patch_file": "b2e1c84.patch",
+      "patch_sha256": "4c4967d30455b4881747ee5a982aa356c368a864c11ef39ff1fc0acf7ca31748",
+      "paths": [
+        "docs/spaced-segmentation.md",
+        "examples/08_spaced_regions.py",
+        "rasterregions/__init__.py",
+        "rasterregions/_partition.py",
+        "rasterregions/cli.py",
+        "rasterregions/detect.py",
+        "rasterregions/io.py",
+        "rasterregions/models.py",
+        "tests/test_cli.py",
+        "tests/test_io.py",
+        "tests/test_page_expected_count.py",
+        "tests/test_region_frames.py",
+        "tests/test_secondary_mark_hypotheses.py",
+        "tests/test_segmentation_search_limits.py",
+        "tests/test_spaced_region_hypotheses.py"
+      ],
+      "sha": "b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f",
+      "short_sha": "b2e1c84",
+      "source_ref": "git:b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f"
+    }
+  ],
+  "git_base_ref": "1b71e8cfecc47983d8241915867abac69afb7af6",
+  "git_base_sha": "1b71e8cfecc47983d8241915867abac69afb7af6",
+  "git_head_ref": "b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f",
+  "git_head_sha": "b2e1c84d1fbd7ddbc0ce5813ea9842dbf6a3fa8f",
+  "include_merges": "nontrivial",
+  "object_type": "git_evidence_manifest",
+  "release_version": "0.2.1",
+  "schema_version": 1
+}
