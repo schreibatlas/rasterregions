@@ -124,7 +124,6 @@ def test_detection_result_rejects_diagnostic_fact_drift() -> None:
         _detection(diagnostics)
 
 
-
 def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> None:
     config = SpacingConfig(width_prior_ratio=1.25, max_inferred_count=12)
     row = RowSegmentationDiagnostics(

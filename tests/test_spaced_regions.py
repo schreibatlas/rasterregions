@@ -165,7 +165,6 @@ def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
     _assert_exact_ownership(exact)
 
 
-
 def test_failed_partition_keeps_cleaned_ink_in_unassigned_mask() -> None:
     image = Image.new("RGB", (90, 70), "white")
     ImageDraw.Draw(image).rectangle((30, 20, 55, 48), fill="black")

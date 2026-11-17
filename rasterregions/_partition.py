@@ -31,6 +31,7 @@ class PartitionResult:
     width_prior_deviation: float | None = None
     body_counts_per_region: tuple[int, ...] = ()
 
+
 @dataclass(frozen=True)
 class RowPartition:
     regions: tuple[Region, ...]
@@ -74,8 +75,6 @@ def _candidate_cut_positions(projection: np.ndarray, config: PartitionConfig) ->
         ):
             positions.add(x)
     return sorted(positions)
-
-
 
 
 def _spacing_candidate_boundaries(
@@ -130,10 +129,7 @@ def _spacing_candidate_boundaries(
     ):
         midpoint = int(round((left_body.center_x + right_body.center_x) / 2.0))
         local = midpoint - x_offset - left
-        if (
-            0 < local < width
-            and smoothed[local] <= max(valley_level * 1.5, scale * 0.5)
-        ):
+        if 0 < local < width and smoothed[local] <= max(valley_level * 1.5, scale * 0.5):
             candidate_kinds.setdefault(local, "component-midpoint")
 
     candidate_positions = sorted(candidate_kinds)
@@ -170,12 +166,9 @@ def _spacing_candidate_boundaries(
                 1.0,
             )
         )
-        boundary_cost[cut] = (
-            normalized_projection * config.projection_cost
-            + len(crossing)
-            * config.crossing_cost
-            * min(1.0, normalized_projection)
-        )
+        boundary_cost[cut] = normalized_projection * config.projection_cost + len(
+            crossing
+        ) * config.crossing_cost * min(1.0, normalized_projection)
         boundaries.append(
             PartitionBoundary(
                 x=absolute_x,
@@ -189,6 +182,7 @@ def _spacing_candidate_boundaries(
             )
         )
     return [0, *candidate_positions, width], tuple(boundaries), boundary_cost
+
 
 def _partition_row(
     row_mask: np.ndarray,
@@ -209,9 +203,7 @@ def _partition_row(
     spacing_bodies = _spacing_body_components(found) if spacing_config else []
     if spacing_config:
         width_source = spacing_bodies or list(found)
-        row_width_prior = float(
-            np.median([component.width for component in width_source])
-        )
+        row_width_prior = float(np.median([component.width for component in width_source]))
         if spacing_config.width_prior_ratio is not None:
             row_width_prior *= spacing_config.width_prior_ratio
         row_width_prior = max(1.0, row_width_prior)
@@ -264,8 +256,7 @@ def _partition_row(
         for cut in cuts[1:-1]:
             absolute_x = x_offset + left + cut
             crossing[cut] = sum(
-                component.bbox.x0 < absolute_x < component.bbox.x1
-                for component in found
+                component.bbox.x0 < absolute_x < component.bbox.x1 for component in found
             )
         boundary_cost = {
             cut: float(projection[cut] / normalized_scale) * config.projection_cost
@@ -285,8 +276,7 @@ def _partition_row(
         normalized_scale = max(1.0, median_height)
         crossing = {
             cut: sum(
-                component.bbox.x0 < x_offset + left + cut < component.bbox.x1
-                for component in found
+                component.bbox.x0 < x_offset + left + cut < component.bbox.x1 for component in found
             )
             for cut in cuts[1:-1]
         }
@@ -303,9 +293,7 @@ def _partition_row(
         else median_height * config.narrow_width_ratio
     )
     maximum_width = (
-        row_width_prior * spacing_config.max_region_width_ratio
-        if spacing_config
-        else float("inf")
+        row_width_prior * spacing_config.max_region_width_ratio if spacing_config else float("inf")
     )
 
     def segment_body_count(start: int, end: int) -> int:
@@ -314,10 +302,7 @@ def _partition_row(
         if spacing_config and len(body_indices) == 1:
             return sum(
                 component.index in body_indices
-                and np.any(
-                    (component.xs >= absolute_start)
-                    & (component.xs < absolute_end)
-                )
+                and np.any((component.xs >= absolute_start) & (component.xs < absolute_end))
                 for component in found
             )
         if spacing_config:
@@ -339,9 +324,7 @@ def _partition_row(
             return float("inf")
         body_count = segment_body_count(start, end)
         component_cost = (
-            config.body_mismatch_cost
-            * (2.0 if spacing_config else 1.0)
-            * abs(body_count - 1)
+            config.body_mismatch_cost * (2.0 if spacing_config else 1.0) * abs(body_count - 1)
         )
         narrow_cost = (
             max(0.0, minimum_width - width)
@@ -349,9 +332,7 @@ def _partition_row(
             * config.narrow_segment_cost
         )
         wide_cost = (
-            max(0.0, width - maximum_width)
-            / max(1.0, row_width_prior)
-            * config.narrow_segment_cost
+            max(0.0, width - maximum_width) / max(1.0, row_width_prior) * config.narrow_segment_cost
             if spacing_config
             else 0.0
         )
@@ -365,14 +346,7 @@ def _partition_row(
             width_cost = 0.20 * float(width_deviation)
             density = ink / max(1.0, float(row_mask.shape[0] * width))
             density_cost = 0.20 * abs(density - config.density_target)
-            return (
-                component_cost
-                + narrow_cost
-                + wide_cost
-                + width_cost
-                + density_cost
-                + area_cost
-            )
+            return component_cost + narrow_cost + wide_cost + width_cost + density_cost + area_cost
         return component_cost + narrow_cost + area_cost
 
     costs = np.full((expected_count + 1, len(cuts)), np.inf)
@@ -386,11 +360,7 @@ def _partition_row(
                     continue
                 start = cuts[start_index]
                 extra_boundary = boundary_cost.get(start, 0.0) if start_index else 0.0
-                score = (
-                    costs[segments - 1, start_index]
-                    + segment_cost(start, end)
-                    + extra_boundary
-                )
+                score = costs[segments - 1, start_index] + segment_cost(start, end) + extra_boundary
                 if score < costs[segments, end_index]:
                     costs[segments, end_index] = score
                     previous[segments, end_index] = start_index
@@ -413,9 +383,7 @@ def _partition_row(
     selected_boundaries: list[PartitionBoundary] = []
     for boundary in boundaries[1:-1]:
         local_cut = boundary - left
-        candidate = (
-            candidate_by_x.get(x_offset + boundary) if spacing_config else None
-        )
+        candidate = candidate_by_x.get(x_offset + boundary) if spacing_config else None
         if candidate is not None:
             confidence = candidate.confidence
         else:
@@ -458,21 +426,15 @@ def _partition_row(
         body_count = segment_body_count(start - left, end - left)
         body_counts.append(int(body_count))
         body_score = 1.0 if body_count else 0.0
-        density_score = float(
-            np.clip(1.0 - abs(density - config.density_target) / 0.55, 0.0, 1.0)
-        )
+        density_score = float(np.clip(1.0 - abs(density - config.density_target) / 0.55, 0.0, 1.0))
         if spacing_config:
             deviation = abs(np.log(max(1.0, width) / row_width_prior))
             width_deviations.append(float(deviation))
             width_score = float(np.exp(-deviation))
             body_score = float(np.exp(-abs(body_count - 1)))
         else:
-            width_score = float(
-                np.clip(width / max(1.0, median_height * 0.5), 0.0, 1.0)
-            )
-        segment_confidences.append(
-            0.5 * body_score + 0.3 * density_score + 0.2 * width_score
-        )
+            width_score = float(np.clip(width / max(1.0, median_height * 0.5), 0.0, 1.0))
+        segment_confidences.append(0.5 * body_score + 0.3 * density_score + 0.2 * width_score)
 
     if spacing_config:
         selected_boundaries = [
@@ -487,9 +449,7 @@ def _partition_row(
         confidence,
         float(costs[expected_count, final_index]),
         tuple(selected_boundaries),
-        width_prior_deviation=(
-            float(np.mean(width_deviations)) if width_deviations else None
-        ),
+        width_prior_deviation=(float(np.mean(width_deviations)) if width_deviations else None),
         body_counts_per_region=tuple(body_counts),
     )
 
@@ -510,16 +470,12 @@ def _row_partition_regions(
     if spacing_config:
         row_y0, row_y1 = row.bbox.y0, row.bbox.y1
         row_component_ids = set(row.component_indices)
-        row_found = tuple(
-            component for component in found if component.index in row_component_ids
-        )
+        row_found = tuple(component for component in found if component.index in row_component_ids)
         region_mask = np.zeros_like(mask, dtype=bool)
         for component in row_found:
             region_mask[component.ys, component.xs] = True
     else:
-        row_y0, row_y1 = _row_y_bounds(
-            row, found, median_height, mask.shape[0], grouping
-        )
+        row_y0, row_y1 = _row_y_bounds(row, found, median_height, mask.shape[0], grouping)
         row_found = tuple(
             component
             for component in found
@@ -542,9 +498,7 @@ def _row_partition_regions(
     cost = partition.cost
     partition_boundaries = partition.partition_boundaries
     regions: list[Region] = []
-    for column_index, (x0, x1) in enumerate(
-        zip(boundaries[:-1], boundaries[1:], strict=True)
-    ):
+    for column_index, (x0, x1) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True)):
         segment = region_mask[row_y0:row_y1, x0:x1]
         ys, xs = np.nonzero(segment)
         if not len(xs):

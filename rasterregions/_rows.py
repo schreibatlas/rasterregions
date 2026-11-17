@@ -87,7 +87,6 @@ def _row_y_bounds(
     return max(0, top), min(page_height, bottom)
 
 
-
 @dataclass(frozen=True)
 class SpacingRowLayout:
     """Spacing-mode row assignment, with ambiguous and unassigned components explicit."""

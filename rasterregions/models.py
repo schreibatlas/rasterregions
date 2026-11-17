@@ -161,6 +161,7 @@ class PartitionBoundary:
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
 
+
 @dataclass(frozen=True)
 class CleanupConfig:
     """Thresholds controlling border, rule, and tiny-component cleanup."""
@@ -384,7 +385,6 @@ class PartitionConfig:
             raise ValueError("partition costs must be nonnegative")
 
 
-
 @dataclass(frozen=True)
 class SpacingConfig:
     """Scale-relative controls for spacing-based region segmentation."""
@@ -434,6 +434,7 @@ class SpacingConfig:
         if any(not 0.0 <= margin <= 1.0 for margin in margins):
             raise ValueError("spacing confidence margins must be between zero and one")
 
+
 @dataclass(frozen=True)
 class DetectionConfig:
     """Combined immutable configuration for detection stages."""
@@ -473,6 +474,7 @@ class DetectionDiagnostics:
     width_prior_deviation: float | None = None
     body_counts_per_region: tuple[int, ...] = ()
     unassigned_ink_fraction: float = 0.0
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
         object.__setattr__(self, "partition_boundaries", tuple(self.partition_boundaries))
@@ -505,6 +507,7 @@ class DetectionDiagnostics:
             or self.best_second_best_partition_margin < 0.0
         ):
             raise ValueError("partition margin must be finite and nonnegative")
+
 
 @dataclass(frozen=True)
 class RowBand:
@@ -744,6 +747,3 @@ class IsolationResult:
         mask = np.array(mask, copy=True)
         mask.setflags(write=False)
         object.__setattr__(self, "mask", mask)
-
-
-

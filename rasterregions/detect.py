@@ -259,7 +259,6 @@ def detect_regions(
     )
 
 
-
 def detect_spaced_regions(
     source: str | Path | Image.Image | np.ndarray,
     *,
@@ -395,14 +394,17 @@ def detect_spaced_regions(
                 row_warnings.append("Several automatic region counts have similar partition costs.")
             if width_deviation is not None and width_deviation > 0.70:
                 row_warnings.append(
-                    "Region widths deviate strongly from the row width prior; "
-                    "a merge may remain."
+                    "Region widths deviate strongly from the row width prior; a merge may remain."
                 )
-            if requested_count is None and len(row_bodies) == 1 and any(
-                boundary.valley_strength is not None
-                and boundary.valley_strength >= 0.80
-                and not boundary.selected
-                for boundary in row_boundaries
+            if (
+                requested_count is None
+                and len(row_bodies) == 1
+                and any(
+                    boundary.valley_strength is not None
+                    and boundary.valley_strength >= 0.80
+                    and not boundary.selected
+                    for boundary in row_boundaries
+                )
             ):
                 row_warnings.append(
                     "A strong internal valley remains inside one connected body; "
@@ -485,24 +487,25 @@ def detect_spaced_regions(
     row_assigned_marks = tuple(
         component
         for component in cleaned.components
-        if component.index not in body_ids
-        and assignment_by_index.get(component.index) is not None
+        if component.index not in body_ids and assignment_by_index.get(component.index) is not None
     )
-    assigned_decisions, assigned_marks = _assign_spacing_marks(
-        row_assigned_marks,
-        body_groups,
-        body_height,
-        config.spacing,
-    ) if regions else ((), ())
+    assigned_decisions, assigned_marks = (
+        _assign_spacing_marks(
+            row_assigned_marks,
+            body_groups,
+            body_height,
+            config.spacing,
+        )
+        if regions
+        else ((), ())
+    )
     decision_by_component = {decision.component_index: decision for decision in assigned_decisions}
     secondary_assignments = []
     for component in cleaned.components:
         if component.index in body_ids:
             continue
         if component.index in ambiguous_row_ids:
-            decision = SecondaryMarkAssignment(
-                component.index, None, None, None, None, "ambiguous"
-            )
+            decision = SecondaryMarkAssignment(component.index, None, None, None, None, "ambiguous")
         elif component.index in unassigned_row_ids:
             decision = SecondaryMarkAssignment(
                 component.index, None, None, None, None, "unassigned"
@@ -557,8 +560,7 @@ def detect_spaced_regions(
                 padding=max(
                     0,
                     round(
-                        row_diagnostics[region.row_index].body_height
-                        * config.spacing.padding_ratio
+                        row_diagnostics[region.row_index].body_height * config.spacing.padding_ratio
                     ),
                 ),
                 clip=page_bbox,
@@ -611,9 +613,7 @@ def detect_spaced_regions(
         if diagnostic.width_prior_deviation is not None
     ]
     body_counts_per_region = tuple(
-        count
-        for diagnostic in row_diagnostics
-        for count in diagnostic.body_counts_per_region
+        count for diagnostic in row_diagnostics for count in diagnostic.body_counts_per_region
     )
     diagnostics = DetectionDiagnostics(
         image_size=image.size,

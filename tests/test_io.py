@@ -183,7 +183,6 @@ def test_tighten_bbox_empty_mask_returns_original_bbox() -> None:
     assert tighten_bbox(mask, bbox, pad=3) == bbox
 
 
-
 def test_spacing_diagnostics_are_serialized() -> None:
     image = Image.new("RGB", (80, 60), "white")
     ImageDraw.Draw(image).rectangle((25, 15, 49, 44), fill="black")

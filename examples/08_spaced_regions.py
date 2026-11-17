@@ -27,9 +27,7 @@ def main() -> None:
     result = detect_spaced_regions(_synthetic_page(), mode="dark")
     BUILD.mkdir(parents=True, exist_ok=True)
 
-    Image.fromarray(result.mask_result.mask.astype(np.uint8) * 255).save(
-        BUILD / "input_mask.png"
-    )
+    Image.fromarray(result.mask_result.mask.astype(np.uint8) * 255).save(BUILD / "input_mask.png")
 
     row_overlay = result.image.copy()
     draw = ImageDraw.Draw(row_overlay)

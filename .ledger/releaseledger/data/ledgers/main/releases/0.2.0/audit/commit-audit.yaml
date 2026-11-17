@@ -1,0 +1,77 @@
+schema_version: 1
+object_type: commit_audit_sheet
+versioning:
+  schema_version: 1
+  revision: 3
+release_version: 0.2.0
+git_base_ref: v0.1.0
+git_base_sha: 1bd34eb64cdd3f7e38d8f6a40fbdc293ddcb9221
+git_head_ref: HEAD
+git_head_sha: 4a693120aa04bd14237eb9b009f26c40a2e524f3
+git_range: 1bd34eb64cdd3f7e38d8f6a40fbdc293ddcb9221..4a693120aa04bd14237eb9b009f26c40a2e524f3
+commit_count: 1
+rows:
+- sha: 4a693120aa04bd14237eb9b009f26c40a2e524f3
+  source_ref: git:4a693120aa04bd14237eb9b009f26c40a2e524f3
+  short_sha: 4a69312
+  changed_paths:
+  - README.md
+  - docs/api.md
+  - docs/detection.md
+  - docs/diagnostics.md
+  - docs/examples.md
+  - docs/getting-started.md
+  - docs/guide.md
+  - docs/index.md
+  - docs/spaced-segmentation.md
+  - examples/08_spaced_regions.py
+  - examples/README.md
+  - examples/run_all.py
+  - rasterregions/__init__.py
+  - rasterregions/_grouping.py
+  - rasterregions/_partition.py
+  - rasterregions/_rows.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_io.py
+  - tests/test_models.py
+  - tests/test_public_api.py
+  - tests/test_spaced_regions.py
+  stats:
+    files_changed: 23
+    insertions: 1838
+    deletions: 78
+  inspected: true
+  inspected_paths:
+  - README.md
+  - docs/api.md
+  - docs/detection.md
+  - docs/diagnostics.md
+  - docs/examples.md
+  - docs/getting-started.md
+  - docs/guide.md
+  - docs/index.md
+  - docs/spaced-segmentation.md
+  - examples/08_spaced_regions.py
+  - examples/README.md
+  - examples/run_all.py
+  - rasterregions/__init__.py
+  - rasterregions/_grouping.py
+  - rasterregions/_partition.py
+  - rasterregions/_rows.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_io.py
+  - tests/test_models.py
+  - tests/test_public_api.py
+  - tests/test_spaced_regions.py
+  observed_behavior: Added opt-in spaced-region segmentation with per-row count hints,
+    ownership-safe masks, and diagnostics for ambiguous assignments.
+  public_impact: public
+  decision: accepted
+  stale: false
+  evidence_subject: 'feat: better object seperation'
+  target_entry_id: entry-0001
+  notes: ''

@@ -101,7 +101,6 @@ def _satellite_score(
     )
 
 
-
 def _spacing_body_components(
     found: tuple[Component, ...] | list[Component],
 ) -> list[Component]:
@@ -111,9 +110,7 @@ def _spacing_body_components(
     ordered = sorted(found, key=lambda component: component.area, reverse=True)
     upper = ordered[: max(1, (len(ordered) + 1) // 2)]
     area_scale = float(np.median([component.area for component in upper]))
-    extent_scale = float(
-        np.median([max(component.width, component.height) for component in upper])
-    )
+    extent_scale = float(np.median([max(component.width, component.height) for component in upper]))
     bodies = [
         component
         for component in found
@@ -125,10 +122,7 @@ def _spacing_body_components(
             component.area >= area_scale * 0.04
             and max(component.width, component.height) >= extent_scale * 0.65
         )
-        or (
-            component.area >= area_scale * 0.08
-            and component.width >= extent_scale * 0.75
-        )
+        or (component.area >= area_scale * 0.08 and component.width >= extent_scale * 0.75)
     ]
     return bodies or [ordered[0]]
 
@@ -158,22 +152,17 @@ def _spacing_attachment_score(
             continue
         overlap_x = max(
             0,
-            min(target.bbox.x1, component.bbox.x1)
-            - max(target.bbox.x0, component.bbox.x0),
+            min(target.bbox.x1, component.bbox.x1) - max(target.bbox.x0, component.bbox.x0),
         )
         overlap_y = max(
             0,
-            min(target.bbox.y1, component.bbox.y1)
-            - max(target.bbox.y0, component.bbox.y0),
+            min(target.bbox.y1, component.bbox.y1) - max(target.bbox.y0, component.bbox.y0),
         )
         size_ratio = min(component.area, target.area) / max(1.0, target.area)
         alignment_bonus = 0.30 * overlap_x / scale + 0.20 * overlap_y / scale
         size_penalty = 0.15 * max(0.0, size_ratio - 0.45)
         scores.append(
-            horizontal_gap / scale
-            + 0.7 * vertical_gap / scale
-            - alignment_bonus
-            + size_penalty
+            horizontal_gap / scale + 0.7 * vertical_gap / scale - alignment_bonus + size_penalty
         )
     return max(0.0, min(scores)) if scores else None
 
