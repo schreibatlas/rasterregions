@@ -288,7 +288,7 @@ def detect_spaced_regions(
     )
     rows = layout.rows
     if row_counts is None:
-        requested = (None,) * len(rows)
+        requested: tuple[int | None, ...] = (None,) * len(rows)
     else:
         if isinstance(row_counts, (str, bytes)):
             raise ValueError(

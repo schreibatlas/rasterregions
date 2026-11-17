@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 from PIL import Image
 
@@ -129,7 +131,7 @@ def _spacing_body_components(
 
 def _spacing_attachment_score(
     component: Component,
-    targets: tuple[Component, ...] | list[Component],
+    targets: Sequence[Component],
     scale: float,
 ) -> float | None:
     """Return the best scale-normalized geometric score for one mark and target set."""
@@ -169,7 +171,7 @@ def _spacing_attachment_score(
 
 def _assign_spacing_marks(
     marks: tuple[Component, ...] | list[Component],
-    bodies_by_region: tuple[tuple[Component, ...], ...] | list[list[Component]],
+    bodies_by_region: Sequence[Sequence[Component]],
     median_height: float,
     config: SpacingConfig,
     *,

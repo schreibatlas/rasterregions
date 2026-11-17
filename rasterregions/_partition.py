@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 from PIL import Image
@@ -102,7 +103,9 @@ def _spacing_candidate_boundaries(
         return [0, width], (), {}
     normalization = max(1.0, scale)
     valley_level = float(np.percentile(occupied, config.candidate_valley_percentile))
-    candidate_kinds: dict[int, str] = {}
+    candidate_kinds: dict[
+        int, Literal["zero-run", "valley", "local-minimum", "component-midpoint"]
+    ] = {}
 
     zero = projection == 0
     edges = np.diff(np.r_[False, zero, False].astype(np.int8))
@@ -302,7 +305,7 @@ def _partition_row(
         if spacing_config and len(body_indices) == 1:
             return sum(
                 component.index in body_indices
-                and np.any((component.xs >= absolute_start) & (component.xs < absolute_end))
+                and bool(np.any((component.xs >= absolute_start) & (component.xs < absolute_end)))
                 for component in found
             )
         if spacing_config:

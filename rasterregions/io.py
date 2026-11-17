@@ -22,6 +22,7 @@ def detection_payload(result: DetectionResult) -> dict:
     diagnostics = result.diagnostics
     decisions = diagnostics.component_decisions if diagnostics else result.component_decisions
     boundaries = diagnostics.partition_boundaries if diagnostics else ()
+    assert result.unassigned_mask is not None
     width, height = diagnostics.image_size if diagnostics else result.image.size
     payload = {
         "rasterregions_version": __version__,
