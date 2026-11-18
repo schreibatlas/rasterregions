@@ -716,7 +716,7 @@ def detect_spaced_regions(
                 )
                 row_partition_search_limited |= search_limited
                 row_search_limited |= search_limited
-        elif expected_count is None:
+        elif expected_count is None and requested_count is not None:
             anchors = _spacing_body_anchors(cleaned.components, row_body_ids)
             if requested_count == len(anchors):
                 partition = _row_from_body_anchors(
