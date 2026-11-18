@@ -11,8 +11,12 @@ from ._cleanup import clean_page_mask
 from ._grouping import (
     _assign_spacing_marks,
     _automatic_regions,
+    _BodyAnchor,
     _make_region,
+    _merge_spacing_body_anchors,
     _spacing_attachment_score,
+    _spacing_body_anchor_has_strong_valley,
+    _spacing_body_anchors,
     _spacing_body_components,
 )
 from ._image import normalize_image
@@ -47,6 +51,7 @@ from .models import (
     RowPartitionHypothesis,
     RowSegmentationDiagnostics,
     SecondaryMarkAssignment,
+    SegmentationSearchLimitError,
     SpacedSegmentationHypotheses,
 )
 
@@ -308,6 +313,176 @@ def _combine_unconstrained_rows(
     return tuple(rows for _, rows in states), truncated
 
 
+def _row_from_body_anchors(
+    image: Image.Image,
+    found: tuple[Component, ...],
+    component_indices: Sequence[int],
+    page_shape: tuple[int, int],
+    row_index: int,
+    padding: int,
+    anchors: Sequence[_BodyAnchor] | None = None,
+    edit_cost: float = 0.0,
+) -> RowPartition | None:
+    source_anchors = _spacing_body_anchors(found, component_indices)
+    anchors = source_anchors if anchors is None else anchors
+    if not anchors:
+        return None
+    regions = []
+    for column_index, anchor in enumerate(anchors):
+        mask = np.zeros(page_shape, dtype=bool)
+        mask[
+            anchor.bbox.y0 : anchor.bbox.y1,
+            anchor.bbox.x0 : anchor.bbox.x1,
+        ] = anchor.mask
+        regions.append(
+            _make_region(
+                image,
+                mask,
+                anchor.bbox,
+                region_id=f"region-{row_index:03d}-{column_index:03d}",
+                row_index=row_index,
+                column_index=column_index,
+                reading_order=column_index,
+                confidence=1.0,
+                component_indices=anchor.component_indices,
+                padding=padding,
+            )
+        )
+    anchor_positions = {
+        component_index: position
+        for position, anchor in enumerate(source_anchors)
+        for component_index in anchor.component_indices
+    }
+    merged_groups = tuple(
+        tuple(sorted(anchor_positions[index] for index in anchor.component_indices))
+        for anchor in anchors
+        if len(anchor.component_indices) > 1
+    )
+    return RowPartition(
+        regions=tuple(regions),
+        confidence=1.0,
+        cost=edit_cost,
+        partition_boundaries=(),
+        body_counts_per_region=tuple(len(anchor.component_indices) for anchor in anchors),
+        anchor_count=len(source_anchors),
+        segmentation_strategy="hybrid" if merged_groups else "anchors",
+        attempted_counts=(len(regions),) if merged_groups else (),
+        merged_anchor_groups=merged_groups,
+    )
+
+
+def _row_with_local_anchor_repairs(
+    image: Image.Image,
+    mask: np.ndarray,
+    found: tuple[Component, ...],
+    row: RowBand,
+    row_index: int,
+    component_indices: Sequence[int],
+    median_height: float,
+    padding: int,
+    config: DetectionConfig,
+    min_confidence: float,
+    target_count: int | None = None,
+) -> RowPartition | None:
+    anchors = _spacing_body_anchors(found, component_indices)
+    partition = _row_from_body_anchors(
+        image, found, component_indices, mask.shape, row_index, padding, anchors
+    )
+    if partition is None:
+        return None
+    suspicious = [
+        index
+        for index, anchor in enumerate(anchors)
+        if _spacing_body_anchor_has_strong_valley(anchor)
+    ]
+    split_counts: dict[int, int] = {}
+    if target_count is None:
+        split_counts = {index: 2 for index in suspicious}
+    elif target_count > len(anchors):
+        if not suspicious and len(anchors) == 1:
+            suspicious = [0]
+        if suspicious:
+            split_index = max(suspicious, key=lambda index: (anchors[index].width, -index))
+            split_counts[split_index] = target_count - len(anchors) + 1
+    components = {component.index: component for component in found}
+    regions: list[Region] = []
+    boundaries: list[PartitionBoundary] = []
+    body_counts: list[int] = []
+    cost = 0.0
+    confidence = 1.0
+    truncated = False
+    ambiguous_repair = False
+    attempted_counts: list[int] = []
+    truncated_counts: list[int] = []
+    split_anchor_indices: list[int] = []
+    for index, (anchor, original) in enumerate(zip(anchors, partition.regions, strict=True)):
+        split_count = split_counts.get(index)
+        if split_count is None:
+            regions.append(original)
+            body_counts.append(len(anchor.component_indices))
+            continue
+        attempted_counts.append(split_count)
+        component = components[anchor.component_indices[0]]
+        try:
+            repaired = _row_partition_regions(
+                image,
+                mask,
+                (component,),
+                row,
+                row_index,
+                median_height,
+                split_count,
+                padding,
+                config.grouping,
+                config.partition,
+                config.spacing,
+            )
+        except SegmentationSearchLimitError:
+            if target_count is not None:
+                return None
+            repaired = None
+            truncated_counts.append(split_count)
+            truncated = True
+        if repaired is None or len(repaired.regions) != split_count:
+            if target_count is not None:
+                return None
+            regions.append(original)
+            body_counts.append(len(anchor.component_indices))
+            ambiguous_repair = True
+            continue
+        split_anchor_indices.append(index)
+        regions.extend(repaired.regions)
+        boundaries.extend(repaired.partition_boundaries)
+        body_counts.extend(repaired.body_counts_per_region)
+        cost += repaired.cost + config.spacing.complexity_penalty * (split_count - 1)
+        confidence = min(confidence, repaired.confidence)
+        truncated |= repaired.truncated
+        if repaired.truncated:
+            truncated_counts.append(split_count)
+    if target_count is not None and len(regions) != target_count:
+        return None
+    regions = [
+        replace(region, column_index=index, reading_order=index)
+        for index, region in enumerate(regions)
+    ]
+    if ambiguous_repair:
+        confidence = min(confidence, min_confidence * 0.5)
+    return replace(
+        partition,
+        regions=tuple(regions),
+        confidence=confidence,
+        cost=cost,
+        partition_boundaries=tuple(boundaries),
+        body_counts_per_region=tuple(body_counts),
+        truncated=truncated,
+        anchor_count=len(anchors),
+        segmentation_strategy="hybrid" if split_anchor_indices else "anchors",
+        attempted_counts=tuple(attempted_counts),
+        truncated_counts=tuple(truncated_counts),
+        split_anchor_indices=tuple(split_anchor_indices),
+    )
+
+
 def detect_spaced_regions(
     source: str | Path | Image.Image | np.ndarray,
     *,
@@ -382,6 +557,35 @@ def detect_spaced_regions(
     selected_partitions: tuple[RowPartition, ...] | None = None
     page_search_truncated = False
     page_allocation_failure: str | None = None
+    row_partition_search_limited = False
+    attempted_counts_by_row: list[tuple[int, ...]] = [() for _ in rows]
+    truncated_counts_by_row: list[tuple[int, ...]] = [() for _ in rows]
+
+    def try_partition_row(
+        row: RowBand,
+        row_index: int,
+        expected: int | None,
+        row_padding: int,
+        row_components: tuple[Component, ...] | None = None,
+    ) -> tuple[RowPartition | None, bool]:
+        try:
+            partition = _row_partition_regions(
+                image,
+                cleaned.mask,
+                row_components or cleaned.components,
+                row,
+                row_index,
+                cleaned.median_height,
+                expected,
+                row_padding,
+                config.grouping,
+                config.partition,
+                config.spacing,
+            )
+        except SegmentationSearchLimitError:
+            return None, True
+        return partition, False
+
     if expected_count is not None:
         options_by_row: list[tuple[RowPartition, ...]] = []
         count_candidates_truncated = False
@@ -420,26 +624,32 @@ def detect_spaced_regions(
                         candidate_counts.sort()
             count_options: list[RowPartition] = []
             seen_options: set[tuple[int, ...]] = set()
+            attempted_counts: list[int] = []
+            truncated_counts: list[int] = []
             for count in candidate_counts:
-                partition = _row_partition_regions(
-                    image,
-                    cleaned.mask,
-                    cleaned.components,
-                    row,
-                    row_index,
-                    cleaned.median_height,
-                    count,
-                    row_padding,
-                    config.grouping,
-                    config.partition,
-                    config.spacing,
-                )
+                attempted_counts.append(count)
+                partition, search_limited = try_partition_row(row, row_index, count, row_padding)
+                row_partition_search_limited |= search_limited
+                count_candidates_truncated |= search_limited
+                if search_limited or (partition is not None and partition.truncated):
+                    truncated_counts.append(count)
                 if partition is None:
                     continue
                 for option in (partition, *partition.alternatives):
                     if option.cut_positions not in seen_options:
                         seen_options.add(option.cut_positions)
                         count_options.append(option)
+            attempted_counts_by_row[row_index] = tuple(attempted_counts)
+            truncated_counts_by_row[row_index] = tuple(truncated_counts)
+            count_options = [
+                replace(
+                    option,
+                    anchor_count=len(row_body_ids),
+                    attempted_counts=tuple(attempted_counts),
+                    truncated_counts=tuple(truncated_counts),
+                )
+                for option in count_options
+            ]
             options_by_row.append(tuple(count_options))
         page_options, page_search_truncated = _combine_page_partitions(
             options_by_row, expected_count, config.spacing
@@ -480,24 +690,85 @@ def detect_spaced_regions(
             np.median([component.height for component in row_bodies or list(members)])
         )
         row_padding = max(0, round(row_height * config.spacing.padding_ratio))
+        row_search_limited = False
         if page_allocation_failure is not None:
             partition = None
+            row_search_limited = bool(truncated_counts_by_row[row_index])
         elif selected_partitions is not None:
             partition = selected_partitions[row_index]
-        else:
-            partition = _row_partition_regions(
+            row_search_limited = bool(truncated_counts_by_row[row_index])
+        elif requested_count is None and expected_count is None:
+            partition = _row_with_local_anchor_repairs(
                 image,
                 cleaned.mask,
                 cleaned.components,
                 row,
                 row_index,
+                row_body_ids,
                 cleaned.median_height,
-                requested_count,
                 row_padding,
-                config.grouping,
-                config.partition,
-                config.spacing,
+                config,
+                min_confidence,
             )
+            if partition is None:
+                partition, search_limited = try_partition_row(
+                    row, row_index, requested_count, row_padding
+                )
+                row_partition_search_limited |= search_limited
+                row_search_limited |= search_limited
+        elif expected_count is None:
+            anchors = _spacing_body_anchors(cleaned.components, row_body_ids)
+            if requested_count == len(anchors):
+                partition = _row_from_body_anchors(
+                    image,
+                    cleaned.components,
+                    row_body_ids,
+                    cleaned.mask.shape,
+                    row_index,
+                    row_padding,
+                    anchors,
+                )
+            elif requested_count < len(anchors):
+                merged = _merge_spacing_body_anchors(anchors, requested_count)
+                if merged is not None:
+                    partition = _row_from_body_anchors(
+                        image,
+                        cleaned.components,
+                        row_body_ids,
+                        cleaned.mask.shape,
+                        row_index,
+                        row_padding,
+                        merged,
+                        config.spacing.complexity_penalty * (len(anchors) - requested_count),
+                    )
+                else:
+                    partition = None
+            else:
+                partition = _row_with_local_anchor_repairs(
+                    image,
+                    cleaned.mask,
+                    cleaned.components,
+                    row,
+                    row_index,
+                    row_body_ids,
+                    cleaned.median_height,
+                    row_padding,
+                    config,
+                    min_confidence,
+                    requested_count,
+                )
+            if partition is None:
+                partition, search_limited = try_partition_row(
+                    row, row_index, requested_count, row_padding
+                )
+                row_partition_search_limited |= search_limited
+                row_search_limited |= search_limited
+        else:
+            partition, search_limited = try_partition_row(
+                row, row_index, requested_count, row_padding
+            )
+            row_partition_search_limited |= search_limited
+            row_search_limited |= search_limited
         partition_options = (partition, *partition.alternatives) if partition is not None else ()
         row_partition_options.append(partition_options)
         if expected_count is None and _row_hypotheses_out is not None:
@@ -589,6 +860,36 @@ def detect_spaced_regions(
                 body_counts_per_region=body_counts,
                 warnings=tuple(row_warnings),
                 ambiguous_component_indices=layout.ambiguous_component_indices[row_index],
+                anchor_count=(
+                    partition.anchor_count
+                    if partition is not None and partition.anchor_count is not None
+                    else len(row_body_ids)
+                ),
+                segmentation_strategy=(
+                    partition.segmentation_strategy
+                    if partition is not None and partition.segmentation_strategy is not None
+                    else "partition"
+                    if requested_count is not None or expected_count is not None
+                    else "anchors"
+                ),
+                attempted_counts=(
+                    partition.attempted_counts
+                    if partition is not None and partition.attempted_counts
+                    else attempted_counts_by_row[row_index]
+                    or ((requested_count,) if requested_count is not None else ())
+                ),
+                truncated_counts=(
+                    partition.truncated_counts
+                    if partition is not None and partition.truncated_counts
+                    else truncated_counts_by_row[row_index]
+                    or (
+                        (requested_count,)
+                        if row_search_limited and requested_count is not None
+                        else ()
+                    )
+                ),
+                split_anchor_indices=partition.split_anchor_indices if partition else (),
+                merged_anchor_groups=partition.merged_anchor_groups if partition else (),
             )
         )
         for column_index, region in enumerate(row_regions):
@@ -771,12 +1072,12 @@ def detect_spaced_regions(
     row_search_truncated = any(
         option.truncated for options in row_partition_options for option in options
     )
-    search_truncated = page_search_truncated or row_search_truncated
+    search_truncated = page_search_truncated or row_search_truncated or row_partition_search_limited
     search_limit = (
-        "page-allocation-budget"
+        "row-partition-budget"
+        if row_partition_search_limited or row_search_truncated
+        else "page-allocation-budget"
         if page_search_truncated
-        else "row-partition-budget"
-        if row_search_truncated
         else None
     )
     diagnostics = DetectionDiagnostics(

@@ -207,6 +207,9 @@ def test_spacing_diagnostics_are_serialized() -> None:
     assert payload["spacing"]["row_count"] == 1
     assert payload["spacing"]["unassigned_ink_pixels"] == 0
     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
+    assert payload["spacing"]["rows"][0]["anchor_count"] == 1
+    assert payload["spacing"]["rows"][0]["segmentation_strategy"] == "anchors"
+    assert payload["spacing"]["rows"][0]["attempted_counts"] == []
 
 
 def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
@@ -228,3 +231,26 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) 
     assert (tmp_path / "selected_partition.png").is_file()
     assert (tmp_path / "alternative_partition_2.png").is_file()
     assert manifest.is_file()
+
+
+def test_anchor_diagnostics_and_boxes_are_serialized(tmp_path) -> None:
+    image = Image.new("RGB", (120, 70), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((15, 20, 35, 49), fill="black")
+    draw.rectangle((70, 20, 90, 49), fill="black")
+
+    result = detect_spaced_region_hypotheses(image, mode="dark")
+    payload = spaced_hypotheses_payload(result)
+    write_spaced_hypotheses(result, tmp_path)
+
+    row = payload["selected"]["spacing"]["rows"][0]
+    assert row["anchor_count"] == 2
+    assert row["segmentation_strategy"] == "anchors"
+    assert row["split_anchor_indices"] == []
+    region = result.selected.regions[0]
+    with Image.open(tmp_path / "candidate_cuts.png") as overlay:
+        assert overlay.convert("RGB").getpixel((region.bbox.x0, region.bbox.y0)) == (
+            35,
+            110,
+            220,
+        )

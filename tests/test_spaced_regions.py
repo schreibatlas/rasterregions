@@ -143,7 +143,7 @@ def test_disconnected_secondary_stroke_stays_with_its_body() -> None:
     _assert_exact_ownership(result)
 
 
-def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
+def test_touching_forms_split_on_strong_valley_or_exact_count_hint() -> None:
     image = Image.new("RGB", (130, 80), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((15, 25, 49, 55), fill="black")
@@ -153,8 +153,23 @@ def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
     inferred = detect_spaced_regions(image, mode="dark")
     exact = detect_spaced_regions(image, mode="dark", row_counts=[2])
 
-    assert inferred.status == "ambiguous"
-    assert len(inferred.regions) == 1
+    assert inferred.status == "ok"
+    assert len(inferred.regions) == 2
+    assert any(
+        boundary.selected
+        and boundary.valley_strength is not None
+        and boundary.valley_strength >= 0.8
+        for boundary in inferred.diagnostics.partition_boundaries
+    )
+    inferred_row = inferred.diagnostics.row_segmentation[0]
+    assert inferred_row.anchor_count == 1
+    assert inferred_row.segmentation_strategy == "hybrid"
+    assert inferred_row.split_anchor_indices == (0,)
+    assert inferred_row.attempted_counts == (2,)
+    exact_row = exact.diagnostics.row_segmentation[0]
+    assert exact_row.segmentation_strategy == "hybrid"
+    assert exact_row.split_anchor_indices == (0,)
+    assert exact_row.attempted_counts == (2,)
     assert exact.status == "ok"
     assert len(exact.regions) == 2
     assert any(
@@ -163,6 +178,25 @@ def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
     )
     _assert_exact_ownership(inferred)
     _assert_exact_ownership(exact)
+
+
+def test_trusted_count_merges_credible_small_fragment_anchors() -> None:
+    image = Image.new("RGB", (140, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 20, 94, 49), fill="black")
+    draw.rectangle((10, 27, 16, 41), fill="black")
+    draw.rectangle((18, 27, 24, 41), fill="black")
+
+    result = detect_spaced_regions(image, mode="dark", row_counts=[2])
+
+    assert result.status == "ok"
+    assert len(result.regions) == 2
+    assert result.diagnostics.row_segmentation[0].body_counts_per_region == (2, 1)
+    assert result.diagnostics.row_segmentation[0].anchor_count == 3
+    assert result.diagnostics.row_segmentation[0].segmentation_strategy == "hybrid"
+    assert result.diagnostics.row_segmentation[0].merged_anchor_groups == ((0, 1),)
+    assert len(result.regions[0].component_indices) == 2
+    _assert_exact_ownership(result)
 
 
 def test_failed_partition_keeps_cleaned_ink_in_unassigned_mask() -> None:

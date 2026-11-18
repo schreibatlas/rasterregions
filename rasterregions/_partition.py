@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -52,6 +53,12 @@ class RowPartition:
     truncated: bool = False
     cut_positions: tuple[int, ...] = ()
     cut_crossing_cost: float = 0.0
+    anchor_count: int | None = None
+    segmentation_strategy: Literal["anchors", "hybrid", "partition"] | None = None
+    attempted_counts: tuple[int, ...] = ()
+    truncated_counts: tuple[int, ...] = ()
+    split_anchor_indices: tuple[int, ...] = ()
+    merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
 
 
 def _combine_page_partitions(
@@ -316,7 +323,9 @@ def _partition_row(
             if result is not None:
                 result_options = (result, *result.alternatives)
                 for option in result_options:
-                    adjusted_cost = option.cost + spacing_config.complexity_penalty * (count - 1)
+                    adjusted_cost = option.cost + spacing_config.complexity_penalty * abs(
+                        count - len(spacing_bodies)
+                    )
                     count_alternatives.append((adjusted_cost, count, option))
         if not count_alternatives:
             if count_truncated:
@@ -472,6 +481,21 @@ def _partition_row(
 
     top_k = spacing_config.hypothesis_limit if spacing_config else 1
     max_states = spacing_config.max_partition_states if spacing_config else 100_000
+    final_index = len(cuts) - 1
+    valid_starts_by_end: dict[int, tuple[int, ...]] = {}
+    segment_costs: dict[tuple[int, int], float] = {}
+    for end_index in range(1, len(cuts)):
+        end = cuts[end_index]
+        valid_starts = []
+        for start_index in range(end_index):
+            start = cuts[start_index]
+            width = end - start
+            if spacing_config and not minimum_width <= width <= maximum_width:
+                continue
+            valid_starts.append(start_index)
+            segment_costs[start_index, end_index] = segment_cost(start, end)
+        valid_starts_by_end[end_index] = tuple(valid_starts)
+
     paths_by_state: dict[tuple[int, int], list[tuple[float, tuple[int, ...]]]] = {
         (0, 0): [(0.0, (0,))]
     }
@@ -479,16 +503,16 @@ def _partition_row(
     state_budget_exhausted = False
     path_budget_exhausted = False
     for segments in range(1, expected_count + 1):
-        for end_index in range(1, len(cuts)):
-            end = cuts[end_index]
+        remaining_segments = expected_count - segments
+        for end_index in range(segments, final_index - remaining_segments + 1):
             candidates: list[tuple[float, tuple[int, ...]]] = []
-            for start_index in range(end_index):
+            for start_index in valid_starts_by_end[end_index]:
                 prefixes = paths_by_state.get((segments - 1, start_index), ())
                 if not prefixes:
                     continue
                 start = cuts[start_index]
                 extra_boundary = boundary_cost.get(start, 0.0) if start_index else 0.0
-                segment_score = segment_cost(start, end) + extra_boundary
+                segment_score = segment_costs[start_index, end_index] + extra_boundary
                 if not np.isfinite(segment_score):
                     continue
                 for prefix_cost, prefix_path in prefixes:
@@ -496,28 +520,19 @@ def _partition_row(
                         state_budget_exhausted = True
                         break
                     visited_states += 1
-                    candidates.append((prefix_cost + segment_score, (*prefix_path, end_index)))
+                    insort(candidates, (prefix_cost + segment_score, (*prefix_path, end_index)))
+                    if len(candidates) > top_k:
+                        candidates.pop()
+                        if spacing_config is not None:
+                            path_budget_exhausted = True
                 if state_budget_exhausted:
                     break
             if candidates:
-                candidates.sort(key=lambda item: (item[0], item[1]))
-                unique: list[tuple[float, tuple[int, ...]]] = []
-                seen_paths: set[tuple[int, ...]] = set()
-                for candidate in candidates:
-                    if candidate[1] in seen_paths:
-                        continue
-                    seen_paths.add(candidate[1])
-                    unique.append(candidate)
-                    if spacing_config is not None and len(unique) > top_k:
-                        path_budget_exhausted = True
-                    if len(unique) == top_k + 1:
-                        break
-                paths_by_state[(segments, end_index)] = unique
+                paths_by_state[(segments, end_index)] = candidates
             if state_budget_exhausted:
                 break
         if state_budget_exhausted:
             break
-    final_index = len(cuts) - 1
     final_paths = paths_by_state.get((expected_count, final_index), [])
     search_truncated = candidates_truncated or state_budget_exhausted or path_budget_exhausted
     if not final_paths:
@@ -717,6 +732,34 @@ def _row_partition_regions(
                 clip=BBox(x0, row_y0, x1, row_y1),
             )
         )
+    anchor_components = tuple(
+        sorted(
+            _spacing_body_components(row_found),
+            key=lambda component: (component.center_x, component.index),
+        )
+    )
+    anchor_positions = {component.index: index for index, component in enumerate(anchor_components)}
+    split_anchor_indices = tuple(
+        index
+        for index, component in enumerate(anchor_components)
+        if any(
+            boundary.selected and component.bbox.x0 < boundary.x < component.bbox.x1
+            for boundary in partition_boundaries
+        )
+    )
+    merged_anchor_groups = tuple(
+        anchor_group
+        for region in regions
+        if len(
+            anchor_group := tuple(
+                anchor_positions[index]
+                for index in region.component_indices
+                if index in anchor_positions
+            )
+        )
+        > 1
+    )
+    attempted_count = expected_count if expected_count is not None else len(regions)
     result = RowPartition(
         tuple(regions),
         confidence,
@@ -728,6 +771,12 @@ def _row_partition_regions(
         truncated=partition.truncated,
         cut_positions=partition.cut_positions,
         cut_crossing_cost=partition.cut_crossing_cost,
+        anchor_count=len(anchor_components),
+        segmentation_strategy="partition",
+        attempted_counts=(attempted_count,),
+        truncated_counts=(attempted_count,) if partition.truncated else (),
+        split_anchor_indices=split_anchor_indices,
+        merged_anchor_groups=merged_anchor_groups,
     )
     if _collect_alternatives and partition.alternatives:
         alternatives: list[RowPartition] = []

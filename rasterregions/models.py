@@ -566,6 +566,12 @@ class RowSegmentationDiagnostics:
     body_counts_per_region: tuple[int, ...] = ()
     warnings: tuple[str, ...] = ()
     ambiguous_component_indices: tuple[int, ...] = ()
+    anchor_count: int | None = None
+    segmentation_strategy: Literal["anchors", "hybrid", "partition"] | None = None
+    attempted_counts: tuple[int, ...] = ()
+    truncated_counts: tuple[int, ...] = ()
+    split_anchor_indices: tuple[int, ...] = ()
+    merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
@@ -575,6 +581,29 @@ class RowSegmentationDiagnostics:
             self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
         )
         object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
+        object.__setattr__(self, "attempted_counts", tuple(self.attempted_counts))
+        object.__setattr__(self, "truncated_counts", tuple(self.truncated_counts))
+        object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
+        merged_groups = tuple(tuple(group) for group in self.merged_anchor_groups)
+        object.__setattr__(self, "merged_anchor_groups", merged_groups)
+        if self.anchor_count is not None and (
+            isinstance(self.anchor_count, bool)
+            or not isinstance(self.anchor_count, int)
+            or self.anchor_count < 0
+        ):
+            raise ValueError("anchor_count must be a nonnegative integer")
+        if self.segmentation_strategy not in {None, "anchors", "hybrid", "partition"}:
+            raise ValueError("unsupported segmentation strategy")
+        for counts in (self.attempted_counts, self.truncated_counts):
+            if any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 1
+                for count in counts
+            ):
+                raise ValueError("attempted counts must be positive integers")
+        if any(index < 0 for index in self.split_anchor_indices):
+            raise ValueError("split anchor indices must be nonnegative")
+        if any(len(group) < 2 or any(index < 0 for index in group) for group in merged_groups):
+            raise ValueError("merged anchor groups must contain multiple nonnegative indices")
         if any(
             isinstance(count, bool) or not isinstance(count, int) or count < 0
             for count in self.body_counts_per_region
@@ -833,7 +862,7 @@ class RowPartitionHypothesis:
         regions = tuple(self.regions)
         if (
             len(regions) != self.count
-            or len(boundaries) != self.count + 1
+            or (bool(boundaries) and len(boundaries) != self.count + 1)
             or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
         ):
             raise ValueError("row hypothesis count and boundaries must match its regions")

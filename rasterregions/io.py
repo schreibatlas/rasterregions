@@ -121,6 +121,12 @@ def detection_payload(result: DetectionResult) -> dict:
                     "body_height": round(row.body_height, 4),
                     "width_prior_deviation": row.width_prior_deviation,
                     "body_counts_per_region": list(row.body_counts_per_region),
+                    "anchor_count": row.anchor_count,
+                    "segmentation_strategy": row.segmentation_strategy,
+                    "attempted_counts": list(row.attempted_counts),
+                    "truncated_counts": list(row.truncated_counts),
+                    "split_anchor_indices": list(row.split_anchor_indices),
+                    "merged_anchor_groups": [list(group) for group in row.merged_anchor_groups],
                     "inferred_count": row.inferred_count,
                     "requested_count": row.requested_count,
                     "selected_boundaries": list(row.selected_boundaries),
@@ -457,6 +463,24 @@ def write_spaced_hypotheses(
         y0, y1 = row_diagnostic.y_range if row_diagnostic else (0, selected.image.height)
         color = (230, 40, 40) if boundary.selected else (130, 130, 130)
         boundary_draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
+    if diagnostics is not None:
+        anchor_row_indices = {
+            row.row_index
+            for row in diagnostics.row_segmentation
+            if row.segmentation_strategy in {"anchors", "hybrid"}
+        }
+        for region in selected.regions:
+            if region.row_index in anchor_row_indices:
+                boundary_draw.rectangle(
+                    (
+                        region.bbox.x0,
+                        region.bbox.y0,
+                        region.bbox.x1 - 1,
+                        region.bbox.y1 - 1,
+                    ),
+                    outline=(35, 110, 220),
+                    width=1,
+                )
     _atomic_save_image(boundary_overlay, output / "candidate_cuts.png")
 
     if result.page_hypotheses:

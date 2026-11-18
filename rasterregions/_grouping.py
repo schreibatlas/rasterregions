@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
@@ -127,6 +128,118 @@ def _spacing_body_components(
         or (component.area >= area_scale * 0.08 and component.width >= extent_scale * 0.75)
     ]
     return bodies or [ordered[0]]
+
+
+@dataclass(frozen=True)
+class _BodyAnchor:
+    component_indices: tuple[int, ...]
+    mask: np.ndarray
+    bbox: BBox
+    center_x: float
+    width: int
+    height: int
+    area: int
+
+
+def _spacing_body_anchors(
+    found: tuple[Component, ...], component_indices: Sequence[int]
+) -> tuple[_BodyAnchor, ...]:
+    components = {component.index: component for component in found}
+    anchors = []
+    for index in component_indices:
+        component = components[index]
+        bbox = component.bbox
+        mask = np.zeros((bbox.height, bbox.width), dtype=bool)
+        mask[component.ys - bbox.y0, component.xs - bbox.x0] = True
+        anchors.append(
+            _BodyAnchor(
+                component_indices=(component.index,),
+                mask=mask,
+                bbox=bbox,
+                center_x=component.center_x,
+                width=component.width,
+                height=component.height,
+                area=component.area,
+            )
+        )
+    return tuple(
+        sorted(anchors, key=lambda anchor: (anchor.center_x, anchor.bbox.x0, anchor.bbox.y0))
+    )
+
+
+def _merge_body_anchors(left: _BodyAnchor, right: _BodyAnchor) -> _BodyAnchor:
+    bbox = BBox(
+        min(left.bbox.x0, right.bbox.x0),
+        min(left.bbox.y0, right.bbox.y0),
+        max(left.bbox.x1, right.bbox.x1),
+        max(left.bbox.y1, right.bbox.y1),
+    )
+    mask = np.zeros((bbox.height, bbox.width), dtype=bool)
+    for anchor in (left, right):
+        mask[
+            anchor.bbox.y0 - bbox.y0 : anchor.bbox.y1 - bbox.y0,
+            anchor.bbox.x0 - bbox.x0 : anchor.bbox.x1 - bbox.x0,
+        ] |= anchor.mask
+    return _BodyAnchor(
+        component_indices=tuple(sorted((*left.component_indices, *right.component_indices))),
+        mask=mask,
+        bbox=bbox,
+        center_x=bbox.center_x,
+        width=bbox.width,
+        height=bbox.height,
+        area=left.area + right.area,
+    )
+
+
+def _merge_spacing_body_anchors(
+    anchors: Sequence[_BodyAnchor], target_count: int
+) -> tuple[_BodyAnchor, ...] | None:
+    merged = list(anchors)
+    if target_count < 1 or target_count >= len(merged):
+        return None
+    scale_count = max(1, (len(merged) + 1) // 2)
+    median_width = float(np.median(sorted(anchor.width for anchor in merged)[-scale_count:]))
+    median_height = float(np.median(sorted(anchor.height for anchor in merged)[-scale_count:]))
+    median_area = float(np.median(sorted(anchor.area for anchor in merged)[-scale_count:]))
+    while len(merged) > target_count:
+        candidates: list[tuple[float, int]] = []
+        for index, (left, right) in enumerate(zip(merged, merged[1:], strict=False)):
+            gap = right.bbox.x0 - left.bbox.x1
+            vertical_overlap = min(left.bbox.y1, right.bbox.y1) - max(left.bbox.y0, right.bbox.y0)
+            overlap_ratio = vertical_overlap / max(1, min(left.height, right.height))
+            small_areas = left.area <= 0.65 * median_area and right.area <= 0.65 * median_area
+            small_widths = left.width <= 0.65 * median_width and right.width <= 0.65 * median_width
+            combined_width = max(left.bbox.x1, right.bbox.x1) - min(left.bbox.x0, right.bbox.x0)
+            if (
+                gap <= max(1.0, median_height * 0.08)
+                and overlap_ratio >= 0.75
+                and (small_areas or small_widths)
+                and combined_width <= median_width * 1.5
+            ):
+                score = abs(gap) / max(1.0, median_height) + abs(
+                    np.log(max(1.0, combined_width) / max(1.0, median_width))
+                )
+                candidates.append((float(score), index))
+        if not candidates:
+            return None
+        _, index = min(candidates)
+        merged[index : index + 2] = [_merge_body_anchors(merged[index], merged[index + 1])]
+    return tuple(merged)
+
+
+def _spacing_body_anchor_has_strong_valley(anchor: _BodyAnchor) -> bool:
+    projection = anchor.mask.sum(axis=0)
+    if projection.size < 4:
+        return False
+    start = projection.size // 4
+    stop = projection.size - start
+    for index in range(start, stop):
+        valley = int(projection[index])
+        left_peak = int(projection[:index].max())
+        right_peak = int(projection[index + 1 :].max())
+        if valley * 4 < min(left_peak, right_peak) and min(left_peak, right_peak) >= 3:
+            return True
+    return False
 
 
 def _spacing_attachment_score(

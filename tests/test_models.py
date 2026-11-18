@@ -139,6 +139,12 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
         selected_boundaries=[12],
         confidence=0.8,
         cost=0.2,
+        anchor_count=2,
+        segmentation_strategy="hybrid",
+        attempted_counts=[3],
+        truncated_counts=[4],
+        split_anchor_indices=[1],
+        merged_anchor_groups=[[0, 1]],
         alternative_cost_margin=0.3,
         warnings=["one valley is weak"],
     )
@@ -148,6 +154,12 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
     assert row.component_indices == (1, 2)
     assert row.selected_boundaries == (12,)
     assert row.warnings == ("one valley is weak",)
+    assert row.anchor_count == 2
+    assert row.segmentation_strategy == "hybrid"
+    assert row.attempted_counts == (3,)
+    assert row.truncated_counts == (4,)
+    assert row.split_anchor_indices == (1,)
+    assert row.merged_anchor_groups == ((0, 1),)
     assert assignment.status == "ambiguous"
     with pytest.raises(ValueError, match="positive integer"):
         SpacingConfig(max_inferred_count=True)

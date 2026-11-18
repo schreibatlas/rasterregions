@@ -12,7 +12,9 @@ from functools import partial
 from typing import TypeVar
 
 import numpy as np
+from PIL import Image, ImageDraw
 
+from rasterregions import detect_spaced_regions
 from rasterregions._partition import PartitionResult, _candidate_cut_positions, _partition_row
 from rasterregions.components import components
 from rasterregions.models import Component, PartitionConfig
@@ -80,6 +82,29 @@ def _partition_operation(
     return run
 
 
+def _handwritten_sheet() -> Image.Image:
+    row_counts = (12, 8, 6, 11, 11, 5, 10)
+    image = Image.new("RGB", (1081, 1198), "white")
+    draw = ImageDraw.Draw(image)
+    for row_index, count in enumerate(row_counts):
+        spacing = (image.width - 150) / (count - 1)
+        y = 35 + row_index * 155
+        for index in range(count):
+            x = 30 + index * spacing
+            stroke_width = 86 + (index * 7) % 12
+            draw.line(
+                (round(x), y + 55, round(x + stroke_width), y + 5),
+                fill="black",
+                width=4,
+            )
+            if index % 8 == 0:
+                dot_x = round(x + stroke_width - 20)
+                draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
+    draw.point((1065, 15), fill="black")
+    draw.rectangle((1058, 1110, 1059, 1111), fill="black")
+    return image
+
+
 def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
     workloads: list[dict[str, object]] = []
     for name, mask in _component_cases():
@@ -115,6 +140,34 @@ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
                 "median_seconds": statistics.median(samples),
             }
         )
+    sheet = _handwritten_sheet()
+    sheet_result, sheet_samples = _measure(
+        partial(detect_spaced_regions, sheet, mode="dark"),
+        repeat=repeat,
+        warmup=warmup,
+    )
+    row_diagnostics = sheet_result.diagnostics.row_segmentation
+    anchor_only = all(
+        row.segmentation_strategy == "anchors" and not row.attempted_counts
+        for row in row_diagnostics
+    )
+    workloads.append(
+        {
+            "name": "handwritten_sheet_7row",
+            "shape": [sheet.height, sheet.width],
+            "row_anchor_counts": [row.anchor_count for row in row_diagnostics],
+            "body_anchors": sum(row.anchor_count or 0 for row in row_diagnostics),
+            "anchors_requiring_repair": sum(
+                len(row.split_anchor_indices) + len(row.merged_anchor_groups)
+                for row in row_diagnostics
+            ),
+            "partition_states_visited": 0 if anchor_only else None,
+            "truncated_local_searches": sum(len(row.truncated_counts) for row in row_diagnostics),
+            "returned_regions": len(sheet_result.regions),
+            "samples_seconds": sheet_samples,
+            "median_seconds": statistics.median(sheet_samples),
+        }
+    )
 
     return {
         "python": platform.python_version(),

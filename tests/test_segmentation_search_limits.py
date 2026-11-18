@@ -7,6 +7,7 @@ from rasterregions import (
     DetectionConfig,
     SpacingConfig,
     detect_spaced_region_hypotheses,
+    detect_spaced_regions,
 )
 
 
@@ -49,3 +50,62 @@ def test_each_search_budget_rejects_nonpositive_values() -> None:
     ):
         with pytest.raises(ValueError, match="positive integers"):
             SpacingConfig(**{field: 0})
+
+
+def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
+    image = Image.new("RGB", (130, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((15, 25, 49, 55), fill="black")
+    draw.rectangle((52, 25, 90, 55), fill="black")
+    draw.rectangle((49, 39, 52, 41), fill="black")
+    config = DetectionConfig(spacing=SpacingConfig(max_partition_states=1))
+
+    result = detect_spaced_region_hypotheses(image, mode="dark", config=config)
+
+    assert len(result.selected.regions) == 1
+    assert result.selected.diagnostics.search_truncated
+    assert result.selected.diagnostics.search_limit == "row-partition-budget"
+    assert result.row_hypotheses[0][0].count == 1
+    row = result.selected.diagnostics.row_segmentation[0]
+    assert row.anchor_count == 1
+    assert row.segmentation_strategy == "anchors"
+    assert row.attempted_counts == (2,)
+    assert row.truncated_counts == (2,)
+
+
+def test_exact_count_budget_failure_leaves_clean_ink_unassigned() -> None:
+    image = Image.new("RGB", (130, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((15, 25, 49, 55), fill="black")
+    draw.rectangle((52, 25, 90, 55), fill="black")
+    draw.rectangle((49, 39, 52, 41), fill="black")
+    config = DetectionConfig(spacing=SpacingConfig(max_partition_states=1))
+
+    result = detect_spaced_regions(image, mode="dark", row_counts=[2], config=config)
+
+    assert result.status == "failed"
+    assert result.regions == ()
+    assert result.diagnostics.search_truncated
+    assert result.diagnostics.search_limit == "row-partition-budget"
+    assert (result.unassigned_mask == result.clean_mask).all()
+    row = result.diagnostics.row_segmentation[0]
+    assert row.attempted_counts == (2,)
+    assert row.truncated_counts == (2,)
+    assert row.segmentation_strategy == "partition"
+
+
+def test_impossible_exact_count_does_not_fabricate_regions() -> None:
+    image = Image.new("RGB", (100, 80), "white")
+    ImageDraw.Draw(image).rectangle((25, 20, 54, 55), fill="black")
+
+    result = detect_spaced_regions(image, mode="dark", row_counts=[3])
+
+    assert result.status == "failed"
+    assert result.regions == ()
+    assert not result.diagnostics.search_truncated
+    assert (result.unassigned_mask == result.clean_mask).all()
+    row = result.diagnostics.row_segmentation[0]
+    assert row.inferred_count is None
+    assert row.requested_count == 3
+    assert row.anchor_count == 1
+    assert row.attempted_counts == (3,)

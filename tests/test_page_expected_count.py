@@ -10,7 +10,7 @@ def _two_row_page() -> Image.Image:
     image = Image.new("RGB", (180, 140), "white")
     draw = ImageDraw.Draw(image)
     for y in (15, 85):
-        for x in (15, 105):
+        for x in (15, 65):
             draw.rectangle((x, y, x + 25, y + 28), fill="black")
     return image
 

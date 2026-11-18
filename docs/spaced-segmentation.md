@@ -38,6 +38,9 @@ Every `Region.mask` contains only pixels owned by that region. Region masks neve
 
 `DetectionResult.diagnostics` includes row envelopes and component IDs, selected and unselected candidate boundaries, valley strength, component crossings, width-prior deviation, body counts, secondary-mark decisions and margins, the best-versus-second-best partition margin, and unassigned-ink fraction. `detection_payload(result)` serializes these details as JSON.
 
+
+Automatic row inference is anchor-first: each credible primary connected body initially owns its foreground directly. Region boxes may overlap, but their masks stay disjoint. Partition search is reserved for evidence-backed local splits or merges and trusted exact counts, rather than cutting every row across every glyph. Row diagnostics report `anchor_count`, `segmentation_strategy` (`anchors`, `hybrid`, or `partition`), attempted and truncated counts, split-anchor indices, and merged-anchor groups. `candidate_cuts.png` also outlines anchor-owned regions so the selected segmentation remains inspectable without a cut between every neighboring body.
+
 ## Distinguish the stages
 
 - **Connected components** are 8-connected foreground pixel sets.
