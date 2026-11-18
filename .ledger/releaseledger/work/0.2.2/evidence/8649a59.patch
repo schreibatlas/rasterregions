@@ -1,0 +1,1324 @@
+ benchmarks/README.md                     |   1 +
+ benchmarks/benchmark_workloads.py        |  53 +++++
+ docs/benchmarks.md                       |   1 +
+ docs/spaced-segmentation.md              |   3 +
+ rasterregions/_grouping.py               | 113 ++++++++++
+ rasterregions/_partition.py              |  89 ++++++--
+ rasterregions/detect.py                  | 347 +++++++++++++++++++++++++++++--
+ rasterregions/io.py                      |  24 +++
+ rasterregions/models.py                  |  31 ++-
+ tests/test_anchor_first_segmentation.py  | 109 ++++++++++
+ tests/test_io.py                         |  26 +++
+ tests/test_models.py                     |  12 ++
+ tests/test_page_expected_count.py        |   2 +-
+ tests/test_segmentation_search_limits.py |  60 ++++++
+ tests/test_spaced_region_hypotheses.py   |  24 +++
+ tests/test_spaced_regions.py             |  40 +++-
+ 16 files changed, 887 insertions(+), 48 deletions(-)
+
+diff --git a/benchmarks/README.md b/benchmarks/README.md
+index 1a247f6..f244f13 100644
+--- a/benchmarks/README.md
++++ b/benchmarks/README.md
+@@ -13,5 +13,6 @@ The workloads are:
+ - Dense connected components: a fully foreground `512 × 512` Boolean mask.
+ - Sparse connected components: a `512 × 512` mask containing a regular grid of 1,024 separated `3 × 3` components.
+ - Partition rows: deterministic synthetic rows of height 96 and width 2,000 or 4,000, each partitioned into eight segments.
++- Seven-row handwritten sheet: a generated `1081 × 1198` page with 63 slanted body anchors, variable widths, overlapping boxes, detached marks, and tiny noise. The JSON reports segmentation samples and median, per-row and total anchors, repairs, partition states visited, truncated local searches, and returned regions. Anchor-only execution reports zero partition states.
+
+ Warmups are excluded from the reported samples. The benchmark is intentionally absent from CI, and there are no timing thresholds. Synthetic workloads provide repeatable probes, not a substitute for representative application data. Before changing or replacing an algorithm, capture representative workloads, input dimensions, environment details, and before/after timings. Do not infer a performance improvement from a single synthetic case.
+diff --git a/benchmarks/benchmark_workloads.py b/benchmarks/benchmark_workloads.py
+index 0a95729..664dac2 100644
+--- a/benchmarks/benchmark_workloads.py
++++ b/benchmarks/benchmark_workloads.py
+@@ -12,7 +12,9 @@ from functools import partial
+ from typing import TypeVar
+
+ import numpy as np
++from PIL import Image, ImageDraw
+
++from rasterregions import detect_spaced_regions
+ from rasterregions._partition import PartitionResult, _candidate_cut_positions, _partition_row
+ from rasterregions.components import components
+ from rasterregions.models import Component, PartitionConfig
+@@ -80,6 +82,29 @@ def _partition_operation(
+     return run
+
+
++def _handwritten_sheet() -> Image.Image:
++    row_counts = (12, 8, 6, 11, 11, 5, 10)
++    image = Image.new("RGB", (1081, 1198), "white")
++    draw = ImageDraw.Draw(image)
++    for row_index, count in enumerate(row_counts):
++        spacing = (image.width - 150) / (count - 1)
++        y = 35 + row_index * 155
++        for index in range(count):
++            x = 30 + index * spacing
++            stroke_width = 86 + (index * 7) % 12
++            draw.line(
++                (round(x), y + 55, round(x + stroke_width), y + 5),
++                fill="black",
++                width=4,
++            )
++            if index % 8 == 0:
++                dot_x = round(x + stroke_width - 20)
++                draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
++    draw.point((1065, 15), fill="black")
++    draw.rectangle((1058, 1110, 1059, 1111), fill="black")
++    return image
++
++
+ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
+     workloads: list[dict[str, object]] = []
+     for name, mask in _component_cases():
+@@ -115,6 +140,34 @@ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
+                 "median_seconds": statistics.median(samples),
+             }
+         )
++    sheet = _handwritten_sheet()
++    sheet_result, sheet_samples = _measure(
++        partial(detect_spaced_regions, sheet, mode="dark"),
++        repeat=repeat,
++        warmup=warmup,
++    )
++    row_diagnostics = sheet_result.diagnostics.row_segmentation
++    anchor_only = all(
++        row.segmentation_strategy == "anchors" and not row.attempted_counts
++        for row in row_diagnostics
++    )
++    workloads.append(
++        {
++            "name": "handwritten_sheet_7row",
++            "shape": [sheet.height, sheet.width],
++            "row_anchor_counts": [row.anchor_count for row in row_diagnostics],
++            "body_anchors": sum(row.anchor_count or 0 for row in row_diagnostics),
++            "anchors_requiring_repair": sum(
++                len(row.split_anchor_indices) + len(row.merged_anchor_groups)
++                for row in row_diagnostics
++            ),
++            "partition_states_visited": 0 if anchor_only else None,
++            "truncated_local_searches": sum(len(row.truncated_counts) for row in row_diagnostics),
++            "returned_regions": len(sheet_result.regions),
++            "samples_seconds": sheet_samples,
++            "median_seconds": statistics.median(sheet_samples),
++        }
++    )
+
+     return {
+         "python": platform.python_version(),
+diff --git a/docs/benchmarks.md b/docs/benchmarks.md
+index 6d32b98..b45b70f 100644
+--- a/docs/benchmarks.md
++++ b/docs/benchmarks.md
+@@ -13,5 +13,6 @@ The workloads are:
+ - Dense connected components: a fully foreground `512 × 512` boolean mask.
+ - Sparse connected components: a `512 × 512` mask containing a regular grid of 1,024 separated `3 × 3` components.
+ - Partition rows: deterministic synthetic rows of height 96 and width 2,000 or 4,000, each partitioned into eight segments.
++- Seven-row handwritten sheet: a generated `1081 × 1198` page with 63 slanted body anchors, variable widths, overlapping boxes, detached marks, and tiny noise. The JSON reports runtime, per-row and total anchors, repairs, partition states visited, truncated local searches, and returned regions. This anchor-only workload should report zero partition states.
+
+ Warmups are excluded from the reported samples. The benchmark is intentionally absent from CI, and there are no timing thresholds. Synthetic workloads provide repeatable probes, not a substitute for representative application data. Before changing or replacing an algorithm, capture representative workloads, input dimensions, environment details, and before/after timings. Do not infer a performance improvement from a single synthetic case.
+diff --git a/docs/spaced-segmentation.md b/docs/spaced-segmentation.md
+index 3a7509b..06d3a5e 100644
+--- a/docs/spaced-segmentation.md
++++ b/docs/spaced-segmentation.md
+@@ -38,6 +38,9 @@ Every `Region.mask` contains only pixels owned by that region. Region masks neve
+
+ `DetectionResult.diagnostics` includes row envelopes and component IDs, selected and unselected candidate boundaries, valley strength, component crossings, width-prior deviation, body counts, secondary-mark decisions and margins, the best-versus-second-best partition margin, and unassigned-ink fraction. `detection_payload(result)` serializes these details as JSON.
+
++
++Automatic row inference is anchor-first: each credible primary connected body initially owns its foreground directly. Region boxes may overlap, but their masks stay disjoint. Partition search is reserved for evidence-backed local splits or merges and trusted exact counts, rather than cutting every row across every glyph. Row diagnostics report `anchor_count`, `segmentation_strategy` (`anchors`, `hybrid`, or `partition`), attempted and truncated counts, split-anchor indices, and merged-anchor groups. `candidate_cuts.png` also outlines anchor-owned regions so the selected segmentation remains inspectable without a cut between every neighboring body.
++
+ ## Distinguish the stages
+
+ - **Connected components** are 8-connected foreground pixel sets.
+diff --git a/rasterregions/_grouping.py b/rasterregions/_grouping.py
+index f1203f8..e2b9aa1 100644
+--- a/rasterregions/_grouping.py
++++ b/rasterregions/_grouping.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+
+ from collections.abc import Sequence
++from dataclasses import dataclass
+
+ import numpy as np
+ from PIL import Image
+@@ -129,6 +130,118 @@ def _spacing_body_components(
+     return bodies or [ordered[0]]
+
+
++@dataclass(frozen=True)
++class _BodyAnchor:
++    component_indices: tuple[int, ...]
++    mask: np.ndarray
++    bbox: BBox
++    center_x: float
++    width: int
++    height: int
++    area: int
++
++
++def _spacing_body_anchors(
++    found: tuple[Component, ...], component_indices: Sequence[int]
++) -> tuple[_BodyAnchor, ...]:
++    components = {component.index: component for component in found}
++    anchors = []
++    for index in component_indices:
++        component = components[index]
++        bbox = component.bbox
++        mask = np.zeros((bbox.height, bbox.width), dtype=bool)
++        mask[component.ys - bbox.y0, component.xs - bbox.x0] = True
++        anchors.append(
++            _BodyAnchor(
++                component_indices=(component.index,),
++                mask=mask,
++                bbox=bbox,
++                center_x=component.center_x,
++                width=component.width,
++                height=component.height,
++                area=component.area,
++            )
++        )
++    return tuple(
++        sorted(anchors, key=lambda anchor: (anchor.center_x, anchor.bbox.x0, anchor.bbox.y0))
++    )
++
++
++def _merge_body_anchors(left: _BodyAnchor, right: _BodyAnchor) -> _BodyAnchor:
++    bbox = BBox(
++        min(left.bbox.x0, right.bbox.x0),
++        min(left.bbox.y0, right.bbox.y0),
++        max(left.bbox.x1, right.bbox.x1),
++        max(left.bbox.y1, right.bbox.y1),
++    )
++    mask = np.zeros((bbox.height, bbox.width), dtype=bool)
++    for anchor in (left, right):
++        mask[
++            anchor.bbox.y0 - bbox.y0 : anchor.bbox.y1 - bbox.y0,
++            anchor.bbox.x0 - bbox.x0 : anchor.bbox.x1 - bbox.x0,
++        ] |= anchor.mask
++    return _BodyAnchor(
++        component_indices=tuple(sorted((*left.component_indices, *right.component_indices))),
++        mask=mask,
++        bbox=bbox,
++        center_x=bbox.center_x,
++        width=bbox.width,
++        height=bbox.height,
++        area=left.area + right.area,
++    )
++
++
++def _merge_spacing_body_anchors(
++    anchors: Sequence[_BodyAnchor], target_count: int
++) -> tuple[_BodyAnchor, ...] | None:
++    merged = list(anchors)
++    if target_count < 1 or target_count >= len(merged):
++        return None
++    scale_count = max(1, (len(merged) + 1) // 2)
++    median_width = float(np.median(sorted(anchor.width for anchor in merged)[-scale_count:]))
++    median_height = float(np.median(sorted(anchor.height for anchor in merged)[-scale_count:]))
++    median_area = float(np.median(sorted(anchor.area for anchor in merged)[-scale_count:]))
++    while len(merged) > target_count:
++        candidates: list[tuple[float, int]] = []
++        for index, (left, right) in enumerate(zip(merged, merged[1:], strict=False)):
++            gap = right.bbox.x0 - left.bbox.x1
++            vertical_overlap = min(left.bbox.y1, right.bbox.y1) - max(left.bbox.y0, right.bbox.y0)
++            overlap_ratio = vertical_overlap / max(1, min(left.height, right.height))
++            small_areas = left.area <= 0.65 * median_area and right.area <= 0.65 * median_area
++            small_widths = left.width <= 0.65 * median_width and right.width <= 0.65 * median_width
++            combined_width = max(left.bbox.x1, right.bbox.x1) - min(left.bbox.x0, right.bbox.x0)
++            if (
++                gap <= max(1.0, median_height * 0.08)
++                and overlap_ratio >= 0.75
++                and (small_areas or small_widths)
++                and combined_width <= median_width * 1.5
++            ):
++                score = abs(gap) / max(1.0, median_height) + abs(
++                    np.log(max(1.0, combined_width) / max(1.0, median_width))
++                )
++                candidates.append((float(score), index))
++        if not candidates:
++            return None
++        _, index = min(candidates)
++        merged[index : index + 2] = [_merge_body_anchors(merged[index], merged[index + 1])]
++    return tuple(merged)
++
++
++def _spacing_body_anchor_has_strong_valley(anchor: _BodyAnchor) -> bool:
++    projection = anchor.mask.sum(axis=0)
++    if projection.size < 4:
++        return False
++    start = projection.size // 4
++    stop = projection.size - start
++    for index in range(start, stop):
++        valley = int(projection[index])
++        left_peak = int(projection[:index].max())
++        right_peak = int(projection[index + 1 :].max())
++        if valley * 4 < min(left_peak, right_peak) and min(left_peak, right_peak) >= 3:
++            return True
++    return False
++
++
+ def _spacing_attachment_score(
+     component: Component,
+     targets: Sequence[Component],
+diff --git a/rasterregions/_partition.py b/rasterregions/_partition.py
+index 8002eb3..ba1f859 100644
+--- a/rasterregions/_partition.py
++++ b/rasterregions/_partition.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+
++from bisect import insort
+ from collections.abc import Sequence
+ from dataclasses import dataclass, replace
+ from typing import Literal
+@@ -52,6 +53,12 @@ class RowPartition:
+     truncated: bool = False
+     cut_positions: tuple[int, ...] = ()
+     cut_crossing_cost: float = 0.0
++    anchor_count: int | None = None
++    segmentation_strategy: Literal["anchors", "hybrid", "partition"] | None = None
++    attempted_counts: tuple[int, ...] = ()
++    truncated_counts: tuple[int, ...] = ()
++    split_anchor_indices: tuple[int, ...] = ()
++    merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
+
+
+ def _combine_page_partitions(
+@@ -316,7 +323,9 @@ def _partition_row(
+             if result is not None:
+                 result_options = (result, *result.alternatives)
+                 for option in result_options:
+-                    adjusted_cost = option.cost + spacing_config.complexity_penalty * (count - 1)
++                    adjusted_cost = option.cost + spacing_config.complexity_penalty * abs(
++                        count - len(spacing_bodies)
++                    )
+                     count_alternatives.append((adjusted_cost, count, option))
+         if not count_alternatives:
+             if count_truncated:
+@@ -472,6 +481,21 @@ def _partition_row(
+
+     top_k = spacing_config.hypothesis_limit if spacing_config else 1
+     max_states = spacing_config.max_partition_states if spacing_config else 100_000
++    final_index = len(cuts) - 1
++    valid_starts_by_end: dict[int, tuple[int, ...]] = {}
++    segment_costs: dict[tuple[int, int], float] = {}
++    for end_index in range(1, len(cuts)):
++        end = cuts[end_index]
++        valid_starts = []
++        for start_index in range(end_index):
++            start = cuts[start_index]
++            width = end - start
++            if spacing_config and not minimum_width <= width <= maximum_width:
++                continue
++            valid_starts.append(start_index)
++            segment_costs[start_index, end_index] = segment_cost(start, end)
++        valid_starts_by_end[end_index] = tuple(valid_starts)
++
+     paths_by_state: dict[tuple[int, int], list[tuple[float, tuple[int, ...]]]] = {
+         (0, 0): [(0.0, (0,))]
+     }
+@@ -479,16 +503,16 @@ def _partition_row(
+     state_budget_exhausted = False
+     path_budget_exhausted = False
+     for segments in range(1, expected_count + 1):
+-        for end_index in range(1, len(cuts)):
+-            end = cuts[end_index]
++        remaining_segments = expected_count - segments
++        for end_index in range(segments, final_index - remaining_segments + 1):
+             candidates: list[tuple[float, tuple[int, ...]]] = []
+-            for start_index in range(end_index):
++            for start_index in valid_starts_by_end[end_index]:
+                 prefixes = paths_by_state.get((segments - 1, start_index), ())
+                 if not prefixes:
+                     continue
+                 start = cuts[start_index]
+                 extra_boundary = boundary_cost.get(start, 0.0) if start_index else 0.0
+-                segment_score = segment_cost(start, end) + extra_boundary
++                segment_score = segment_costs[start_index, end_index] + extra_boundary
+                 if not np.isfinite(segment_score):
+                     continue
+                 for prefix_cost, prefix_path in prefixes:
+@@ -496,28 +520,19 @@ def _partition_row(
+                         state_budget_exhausted = True
+                         break
+                     visited_states += 1
+-                    candidates.append((prefix_cost + segment_score, (*prefix_path, end_index)))
++                    insort(candidates, (prefix_cost + segment_score, (*prefix_path, end_index)))
++                    if len(candidates) > top_k:
++                        candidates.pop()
++                        if spacing_config is not None:
++                            path_budget_exhausted = True
+                 if state_budget_exhausted:
+                     break
+             if candidates:
+-                candidates.sort(key=lambda item: (item[0], item[1]))
+-                unique: list[tuple[float, tuple[int, ...]]] = []
+-                seen_paths: set[tuple[int, ...]] = set()
+-                for candidate in candidates:
+-                    if candidate[1] in seen_paths:
+-                        continue
+-                    seen_paths.add(candidate[1])
+-                    unique.append(candidate)
+-                    if spacing_config is not None and len(unique) > top_k:
+-                        path_budget_exhausted = True
+-                    if len(unique) == top_k + 1:
+-                        break
+-                paths_by_state[(segments, end_index)] = unique
++                paths_by_state[(segments, end_index)] = candidates
+             if state_budget_exhausted:
+                 break
+         if state_budget_exhausted:
+             break
+-    final_index = len(cuts) - 1
+     final_paths = paths_by_state.get((expected_count, final_index), [])
+     search_truncated = candidates_truncated or state_budget_exhausted or path_budget_exhausted
+     if not final_paths:
+@@ -717,6 +732,34 @@ def _row_partition_regions(
+                 clip=BBox(x0, row_y0, x1, row_y1),
+             )
+         )
++    anchor_components = tuple(
++        sorted(
++            _spacing_body_components(row_found),
++            key=lambda component: (component.center_x, component.index),
++        )
++    )
++    anchor_positions = {component.index: index for index, component in enumerate(anchor_components)}
++    split_anchor_indices = tuple(
++        index
++        for index, component in enumerate(anchor_components)
++        if any(
++            boundary.selected and component.bbox.x0 < boundary.x < component.bbox.x1
++            for boundary in partition_boundaries
++        )
++    )
++    merged_anchor_groups = tuple(
++        anchor_group
++        for region in regions
++        if len(
++            anchor_group := tuple(
++                anchor_positions[index]
++                for index in region.component_indices
++                if index in anchor_positions
++            )
++        )
++        > 1
++    )
++    attempted_count = expected_count if expected_count is not None else len(regions)
+     result = RowPartition(
+         tuple(regions),
+         confidence,
+@@ -728,6 +771,12 @@ def _row_partition_regions(
+         truncated=partition.truncated,
+         cut_positions=partition.cut_positions,
+         cut_crossing_cost=partition.cut_crossing_cost,
++        anchor_count=len(anchor_components),
++        segmentation_strategy="partition",
++        attempted_counts=(attempted_count,),
++        truncated_counts=(attempted_count,) if partition.truncated else (),
++        split_anchor_indices=split_anchor_indices,
++        merged_anchor_groups=merged_anchor_groups,
+     )
+     if _collect_alternatives and partition.alternatives:
+         alternatives: list[RowPartition] = []
+diff --git a/rasterregions/detect.py b/rasterregions/detect.py
+index 6694829..ab9fa85 100644
+--- a/rasterregions/detect.py
++++ b/rasterregions/detect.py
+@@ -11,8 +11,12 @@ from ._cleanup import clean_page_mask
+ from ._grouping import (
+     _assign_spacing_marks,
+     _automatic_regions,
++    _BodyAnchor,
+     _make_region,
++    _merge_spacing_body_anchors,
+     _spacing_attachment_score,
++    _spacing_body_anchor_has_strong_valley,
++    _spacing_body_anchors,
+     _spacing_body_components,
+ )
+ from ._image import normalize_image
+@@ -47,6 +51,7 @@ from .models import (
+     RowPartitionHypothesis,
+     RowSegmentationDiagnostics,
+     SecondaryMarkAssignment,
++    SegmentationSearchLimitError,
+     SpacedSegmentationHypotheses,
+ )
+
+@@ -308,6 +313,176 @@ def _combine_unconstrained_rows(
+     return tuple(rows for _, rows in states), truncated
+
+
++def _row_from_body_anchors(
++    image: Image.Image,
++    found: tuple[Component, ...],
++    component_indices: Sequence[int],
++    page_shape: tuple[int, int],
++    row_index: int,
++    padding: int,
++    anchors: Sequence[_BodyAnchor] | None = None,
++    edit_cost: float = 0.0,
++) -> RowPartition | None:
++    source_anchors = _spacing_body_anchors(found, component_indices)
++    anchors = source_anchors if anchors is None else anchors
++    if not anchors:
++        return None
++    regions = []
++    for column_index, anchor in enumerate(anchors):
++        mask = np.zeros(page_shape, dtype=bool)
++        mask[
++            anchor.bbox.y0 : anchor.bbox.y1,
++            anchor.bbox.x0 : anchor.bbox.x1,
++        ] = anchor.mask
++        regions.append(
++            _make_region(
++                image,
++                mask,
++                anchor.bbox,
++                region_id=f"region-{row_index:03d}-{column_index:03d}",
++                row_index=row_index,
++                column_index=column_index,
++                reading_order=column_index,
++                confidence=1.0,
++                component_indices=anchor.component_indices,
++                padding=padding,
++            )
++        )
++    anchor_positions = {
++        component_index: position
++        for position, anchor in enumerate(source_anchors)
++        for component_index in anchor.component_indices
++    }
++    merged_groups = tuple(
++        tuple(sorted(anchor_positions[index] for index in anchor.component_indices))
++        for anchor in anchors
++        if len(anchor.component_indices) > 1
++    )
++    return RowPartition(
++        regions=tuple(regions),
++        confidence=1.0,
++        cost=edit_cost,
++        partition_boundaries=(),
++        body_counts_per_region=tuple(len(anchor.component_indices) for anchor in anchors),
++        anchor_count=len(source_anchors),
++        segmentation_strategy="hybrid" if merged_groups else "anchors",
++        attempted_counts=(len(regions),) if merged_groups else (),
++        merged_anchor_groups=merged_groups,
++    )
++
++
++def _row_with_local_anchor_repairs(
++    image: Image.Image,
++    mask: np.ndarray,
++    found: tuple[Component, ...],
++    row: RowBand,
++    row_index: int,
++    component_indices: Sequence[int],
++    median_height: float,
++    padding: int,
++    config: DetectionConfig,
++    min_confidence: float,
++    target_count: int | None = None,
++) -> RowPartition | None:
++    anchors = _spacing_body_anchors(found, component_indices)
++    partition = _row_from_body_anchors(
++        image, found, component_indices, mask.shape, row_index, padding, anchors
++    )
++    if partition is None:
++        return None
++    suspicious = [
++        index
++        for index, anchor in enumerate(anchors)
++        if _spacing_body_anchor_has_strong_valley(anchor)
++    ]
++    split_counts: dict[int, int] = {}
++    if target_count is None:
++        split_counts = {index: 2 for index in suspicious}
++    elif target_count > len(anchors):
++        if not suspicious and len(anchors) == 1:
++            suspicious = [0]
++        if suspicious:
++            split_index = max(suspicious, key=lambda index: (anchors[index].width, -index))
++            split_counts[split_index] = target_count - len(anchors) + 1
++    components = {component.index: component for component in found}
++    regions: list[Region] = []
++    boundaries: list[PartitionBoundary] = []
++    body_counts: list[int] = []
++    cost = 0.0
++    confidence = 1.0
++    truncated = False
++    ambiguous_repair = False
++    attempted_counts: list[int] = []
++    truncated_counts: list[int] = []
++    split_anchor_indices: list[int] = []
++    for index, (anchor, original) in enumerate(zip(anchors, partition.regions, strict=True)):
++        split_count = split_counts.get(index)
++        if split_count is None:
++            regions.append(original)
++            body_counts.append(len(anchor.component_indices))
++            continue
++        attempted_counts.append(split_count)
++        component = components[anchor.component_indices[0]]
++        try:
++            repaired = _row_partition_regions(
++                image,
++                mask,
++                (component,),
++                row,
++                row_index,
++                median_height,
++                split_count,
++                padding,
++                config.grouping,
++                config.partition,
++                config.spacing,
++            )
++        except SegmentationSearchLimitError:
++            if target_count is not None:
++                return None
++            repaired = None
++            truncated_counts.append(split_count)
++            truncated = True
++        if repaired is None or len(repaired.regions) != split_count:
++            if target_count is not None:
++                return None
++            regions.append(original)
++            body_counts.append(len(anchor.component_indices))
++            ambiguous_repair = True
++            continue
++        split_anchor_indices.append(index)
++        regions.extend(repaired.regions)
++        boundaries.extend(repaired.partition_boundaries)
++        body_counts.extend(repaired.body_counts_per_region)
++        cost += repaired.cost + config.spacing.complexity_penalty * (split_count - 1)
++        confidence = min(confidence, repaired.confidence)
++        truncated |= repaired.truncated
++        if repaired.truncated:
++            truncated_counts.append(split_count)
++    if target_count is not None and len(regions) != target_count:
++        return None
++    regions = [
++        replace(region, column_index=index, reading_order=index)
++        for index, region in enumerate(regions)
++    ]
++    if ambiguous_repair:
++        confidence = min(confidence, min_confidence * 0.5)
++    return replace(
++        partition,
++        regions=tuple(regions),
++        confidence=confidence,
++        cost=cost,
++        partition_boundaries=tuple(boundaries),
++        body_counts_per_region=tuple(body_counts),
++        truncated=truncated,
++        anchor_count=len(anchors),
++        segmentation_strategy="hybrid" if split_anchor_indices else "anchors",
++        attempted_counts=tuple(attempted_counts),
++        truncated_counts=tuple(truncated_counts),
++        split_anchor_indices=tuple(split_anchor_indices),
++    )
++
++
+ def detect_spaced_regions(
+     source: str | Path | Image.Image | np.ndarray,
+     *,
+@@ -382,6 +557,35 @@ def detect_spaced_regions(
+     selected_partitions: tuple[RowPartition, ...] | None = None
+     page_search_truncated = False
+     page_allocation_failure: str | None = None
++    row_partition_search_limited = False
++    attempted_counts_by_row: list[tuple[int, ...]] = [() for _ in rows]
++    truncated_counts_by_row: list[tuple[int, ...]] = [() for _ in rows]
++
++    def try_partition_row(
++        row: RowBand,
++        row_index: int,
++        expected: int | None,
++        row_padding: int,
++        row_components: tuple[Component, ...] | None = None,
++    ) -> tuple[RowPartition | None, bool]:
++        try:
++            partition = _row_partition_regions(
++                image,
++                cleaned.mask,
++                row_components or cleaned.components,
++                row,
++                row_index,
++                cleaned.median_height,
++                expected,
++                row_padding,
++                config.grouping,
++                config.partition,
++                config.spacing,
++            )
++        except SegmentationSearchLimitError:
++            return None, True
++        return partition, False
++
+     if expected_count is not None:
+         options_by_row: list[tuple[RowPartition, ...]] = []
+         count_candidates_truncated = False
+@@ -420,26 +624,32 @@ def detect_spaced_regions(
+                         candidate_counts.sort()
+             count_options: list[RowPartition] = []
+             seen_options: set[tuple[int, ...]] = set()
++            attempted_counts: list[int] = []
++            truncated_counts: list[int] = []
+             for count in candidate_counts:
+-                partition = _row_partition_regions(
+-                    image,
+-                    cleaned.mask,
+-                    cleaned.components,
+-                    row,
+-                    row_index,
+-                    cleaned.median_height,
+-                    count,
+-                    row_padding,
+-                    config.grouping,
+-                    config.partition,
+-                    config.spacing,
+-                )
++                attempted_counts.append(count)
++                partition, search_limited = try_partition_row(row, row_index, count, row_padding)
++                row_partition_search_limited |= search_limited
++                count_candidates_truncated |= search_limited
++                if search_limited or (partition is not None and partition.truncated):
++                    truncated_counts.append(count)
+                 if partition is None:
+                     continue
+                 for option in (partition, *partition.alternatives):
+                     if option.cut_positions not in seen_options:
+                         seen_options.add(option.cut_positions)
+                         count_options.append(option)
++            attempted_counts_by_row[row_index] = tuple(attempted_counts)
++            truncated_counts_by_row[row_index] = tuple(truncated_counts)
++            count_options = [
++                replace(
++                    option,
++                    anchor_count=len(row_body_ids),
++                    attempted_counts=tuple(attempted_counts),
++                    truncated_counts=tuple(truncated_counts),
++                )
++                for option in count_options
++            ]
+             options_by_row.append(tuple(count_options))
+         page_options, page_search_truncated = _combine_page_partitions(
+             options_by_row, expected_count, config.spacing
+@@ -480,24 +690,85 @@ def detect_spaced_regions(
+             np.median([component.height for component in row_bodies or list(members)])
+         )
+         row_padding = max(0, round(row_height * config.spacing.padding_ratio))
++        row_search_limited = False
+         if page_allocation_failure is not None:
+             partition = None
++            row_search_limited = bool(truncated_counts_by_row[row_index])
+         elif selected_partitions is not None:
+             partition = selected_partitions[row_index]
+-        else:
+-            partition = _row_partition_regions(
++            row_search_limited = bool(truncated_counts_by_row[row_index])
++        elif requested_count is None and expected_count is None:
++            partition = _row_with_local_anchor_repairs(
+                 image,
+                 cleaned.mask,
+                 cleaned.components,
+                 row,
+                 row_index,
++                row_body_ids,
+                 cleaned.median_height,
+-                requested_count,
+                 row_padding,
+-                config.grouping,
+-                config.partition,
+-                config.spacing,
++                config,
++                min_confidence,
+             )
++            if partition is None:
++                partition, search_limited = try_partition_row(
++                    row, row_index, requested_count, row_padding
++                )
++                row_partition_search_limited |= search_limited
++                row_search_limited |= search_limited
++        elif expected_count is None:
++            anchors = _spacing_body_anchors(cleaned.components, row_body_ids)
++            if requested_count == len(anchors):
++                partition = _row_from_body_anchors(
++                    image,
++                    cleaned.components,
++                    row_body_ids,
++                    cleaned.mask.shape,
++                    row_index,
++                    row_padding,
++                    anchors,
++                )
++            elif requested_count < len(anchors):
++                merged = _merge_spacing_body_anchors(anchors, requested_count)
++                if merged is not None:
++                    partition = _row_from_body_anchors(
++                        image,
++                        cleaned.components,
++                        row_body_ids,
++                        cleaned.mask.shape,
++                        row_index,
++                        row_padding,
++                        merged,
++                        config.spacing.complexity_penalty * (len(anchors) - requested_count),
++                    )
++                else:
++                    partition = None
++            else:
++                partition = _row_with_local_anchor_repairs(
++                    image,
++                    cleaned.mask,
++                    cleaned.components,
++                    row,
++                    row_index,
++                    row_body_ids,
++                    cleaned.median_height,
++                    row_padding,
++                    config,
++                    min_confidence,
++                    requested_count,
++                )
++            if partition is None:
++                partition, search_limited = try_partition_row(
++                    row, row_index, requested_count, row_padding
++                )
++                row_partition_search_limited |= search_limited
++                row_search_limited |= search_limited
++        else:
++            partition, search_limited = try_partition_row(
++                row, row_index, requested_count, row_padding
++            )
++            row_partition_search_limited |= search_limited
++            row_search_limited |= search_limited
+         partition_options = (partition, *partition.alternatives) if partition is not None else ()
+         row_partition_options.append(partition_options)
+         if expected_count is None and _row_hypotheses_out is not None:
+@@ -589,6 +860,36 @@ def detect_spaced_regions(
+                 body_counts_per_region=body_counts,
+                 warnings=tuple(row_warnings),
+                 ambiguous_component_indices=layout.ambiguous_component_indices[row_index],
++                anchor_count=(
++                    partition.anchor_count
++                    if partition is not None and partition.anchor_count is not None
++                    else len(row_body_ids)
++                ),
++                segmentation_strategy=(
++                    partition.segmentation_strategy
++                    if partition is not None and partition.segmentation_strategy is not None
++                    else "partition"
++                    if requested_count is not None or expected_count is not None
++                    else "anchors"
++                ),
++                attempted_counts=(
++                    partition.attempted_counts
++                    if partition is not None and partition.attempted_counts
++                    else attempted_counts_by_row[row_index]
++                    or ((requested_count,) if requested_count is not None else ())
++                ),
++                truncated_counts=(
++                    partition.truncated_counts
++                    if partition is not None and partition.truncated_counts
++                    else truncated_counts_by_row[row_index]
++                    or (
++                        (requested_count,)
++                        if row_search_limited and requested_count is not None
++                        else ()
++                    )
++                ),
++                split_anchor_indices=partition.split_anchor_indices if partition else (),
++                merged_anchor_groups=partition.merged_anchor_groups if partition else (),
+             )
+         )
+         for column_index, region in enumerate(row_regions):
+@@ -771,12 +1072,12 @@ def detect_spaced_regions(
+     row_search_truncated = any(
+         option.truncated for options in row_partition_options for option in options
+     )
+-    search_truncated = page_search_truncated or row_search_truncated
++    search_truncated = page_search_truncated or row_search_truncated or row_partition_search_limited
+     search_limit = (
+-        "page-allocation-budget"
++        "row-partition-budget"
++        if row_partition_search_limited or row_search_truncated
++        else "page-allocation-budget"
+         if page_search_truncated
+-        else "row-partition-budget"
+-        if row_search_truncated
+         else None
+     )
+     diagnostics = DetectionDiagnostics(
+diff --git a/rasterregions/io.py b/rasterregions/io.py
+index c9a2b1b..fd4643a 100644
+--- a/rasterregions/io.py
++++ b/rasterregions/io.py
+@@ -121,6 +121,12 @@ def detection_payload(result: DetectionResult) -> dict:
+                     "body_height": round(row.body_height, 4),
+                     "width_prior_deviation": row.width_prior_deviation,
+                     "body_counts_per_region": list(row.body_counts_per_region),
++                    "anchor_count": row.anchor_count,
++                    "segmentation_strategy": row.segmentation_strategy,
++                    "attempted_counts": list(row.attempted_counts),
++                    "truncated_counts": list(row.truncated_counts),
++                    "split_anchor_indices": list(row.split_anchor_indices),
++                    "merged_anchor_groups": [list(group) for group in row.merged_anchor_groups],
+                     "inferred_count": row.inferred_count,
+                     "requested_count": row.requested_count,
+                     "selected_boundaries": list(row.selected_boundaries),
+@@ -457,6 +463,24 @@ def write_spaced_hypotheses(
+         y0, y1 = row_diagnostic.y_range if row_diagnostic else (0, selected.image.height)
+         color = (230, 40, 40) if boundary.selected else (130, 130, 130)
+         boundary_draw.line((boundary.x, y0, boundary.x, y1), fill=color, width=1)
++    if diagnostics is not None:
++        anchor_row_indices = {
++            row.row_index
++            for row in diagnostics.row_segmentation
++            if row.segmentation_strategy in {"anchors", "hybrid"}
++        }
++        for region in selected.regions:
++            if region.row_index in anchor_row_indices:
++                boundary_draw.rectangle(
++                    (
++                        region.bbox.x0,
++                        region.bbox.y0,
++                        region.bbox.x1 - 1,
++                        region.bbox.y1 - 1,
++                    ),
++                    outline=(35, 110, 220),
++                    width=1,
++                )
+     _atomic_save_image(boundary_overlay, output / "candidate_cuts.png")
+
+     if result.page_hypotheses:
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index fe6c91c..dab821e 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -566,6 +566,12 @@ class RowSegmentationDiagnostics:
+     body_counts_per_region: tuple[int, ...] = ()
+     warnings: tuple[str, ...] = ()
+     ambiguous_component_indices: tuple[int, ...] = ()
++    anchor_count: int | None = None
++    segmentation_strategy: Literal["anchors", "hybrid", "partition"] | None = None
++    attempted_counts: tuple[int, ...] = ()
++    truncated_counts: tuple[int, ...] = ()
++    split_anchor_indices: tuple[int, ...] = ()
++    merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
+
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+@@ -575,6 +581,29 @@ class RowSegmentationDiagnostics:
+             self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
+         )
+         object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
++        object.__setattr__(self, "attempted_counts", tuple(self.attempted_counts))
++        object.__setattr__(self, "truncated_counts", tuple(self.truncated_counts))
++        object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
++        merged_groups = tuple(tuple(group) for group in self.merged_anchor_groups)
++        object.__setattr__(self, "merged_anchor_groups", merged_groups)
++        if self.anchor_count is not None and (
++            isinstance(self.anchor_count, bool)
++            or not isinstance(self.anchor_count, int)
++            or self.anchor_count < 0
++        ):
++            raise ValueError("anchor_count must be a nonnegative integer")
++        if self.segmentation_strategy not in {None, "anchors", "hybrid", "partition"}:
++            raise ValueError("unsupported segmentation strategy")
++        for counts in (self.attempted_counts, self.truncated_counts):
++            if any(
++                isinstance(count, bool) or not isinstance(count, int) or count < 1
++                for count in counts
++            ):
++                raise ValueError("attempted counts must be positive integers")
++        if any(index < 0 for index in self.split_anchor_indices):
++            raise ValueError("split anchor indices must be nonnegative")
++        if any(len(group) < 2 or any(index < 0 for index in group) for group in merged_groups):
++            raise ValueError("merged anchor groups must contain multiple nonnegative indices")
+         if any(
+             isinstance(count, bool) or not isinstance(count, int) or count < 0
+             for count in self.body_counts_per_region
+@@ -833,7 +862,7 @@ class RowPartitionHypothesis:
+         regions = tuple(self.regions)
+         if (
+             len(regions) != self.count
+-            or len(boundaries) != self.count + 1
++            or (bool(boundaries) and len(boundaries) != self.count + 1)
+             or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
+         ):
+             raise ValueError("row hypothesis count and boundaries must match its regions")
+diff --git a/tests/test_anchor_first_segmentation.py b/tests/test_anchor_first_segmentation.py
+new file mode 100644
+index 0000000..5a855bf
+--- /dev/null
++++ b/tests/test_anchor_first_segmentation.py
+@@ -0,0 +1,109 @@
++from __future__ import annotations
++
++import numpy as np
++from PIL import Image, ImageDraw
++
++from rasterregions import detect_spaced_region_hypotheses, detect_spaced_regions
++from rasterregions.io import spaced_hypotheses_payload
++
++ALPHABET_ROW_COUNTS = (12, 8, 6, 11, 11, 5, 10)
++
++
++def _draw_slanted_row(draw: ImageDraw.ImageDraw, count: int, y: int, width: int) -> None:
++    spacing = (width - 150) / max(1, count - 1)
++    for index in range(count):
++        x = 30 + index * spacing
++        stroke_width = 86 + (index * 7) % 12
++        draw.line(
++            (round(x), y + 55, round(x + stroke_width), y + 5),
++            fill="black",
++            width=4,
++        )
++        if index % 8 == 0:
++            dot_x = round(x + stroke_width - 20)
++            draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
++
++
++def _alphabet_page() -> Image.Image:
++    image = Image.new("RGB", (1081, 1198), "white")
++    draw = ImageDraw.Draw(image)
++    for row_index, count in enumerate(ALPHABET_ROW_COUNTS):
++        _draw_slanted_row(draw, count, 35 + row_index * 155, image.width)
++    draw.point((1065, 15), fill="black")
++    draw.rectangle((1058, 1110, 1059, 1111), fill="black")
++    return image
++
++
++def _assert_exact_ownership(result) -> None:
++    owner = np.zeros(result.clean_mask.shape, dtype=bool)
++    for region in result.regions:
++        region_mask = np.zeros(result.clean_mask.shape, dtype=bool)
++        region_mask[
++            region.bbox.y0 : region.bbox.y1,
++            region.bbox.x0 : region.bbox.x1,
++        ] = region.mask
++        assert not np.any(owner & region_mask)
++        assert not np.any(region_mask & ~result.clean_mask)
++        owner |= region_mask
++    assert result.unassigned_mask is not None
++    assert not np.any(owner & result.unassigned_mask)
++    assert np.array_equal(owner | result.unassigned_mask, result.clean_mask)
++
++
++def _region_signature(result) -> tuple[tuple[object, ...], ...]:
++    return tuple(
++        (
++            region.bbox,
++            region.row_index,
++            region.column_index,
++            region.component_indices,
++            region.mask.tobytes(),
++        )
++        for region in result.regions
++    )
++
++
++def test_wide_spaced_row_uses_twelve_component_anchors() -> None:
++    image = Image.new("RGB", (1081, 130), "white")
++    _draw_slanted_row(ImageDraw.Draw(image), 12, 35, image.width)
++
++    result = detect_spaced_regions(image, mode="dark")
++
++    assert result.status == "ok"
++    assert len(result.regions) == 12
++    row = result.diagnostics.row_segmentation[0]
++    assert row.inferred_count == 12
++    assert row.anchor_count == 12
++    assert row.segmentation_strategy == "anchors"
++    assert not result.diagnostics.search_truncated
++    assert any(
++        left.bbox.x1 > right.bbox.x0
++        for left, right in zip(result.regions, result.regions[1:], strict=False)
++    )
++    _assert_exact_ownership(result)
++
++
++def test_generated_seven_row_page_has_sixty_three_anchors() -> None:
++    result = detect_spaced_regions(_alphabet_page(), mode="dark")
++
++    assert [row.inferred_count for row in result.diagnostics.row_segmentation] == list(
++        ALPHABET_ROW_COUNTS
++    )
++    assert [row.anchor_count for row in result.diagnostics.row_segmentation] == list(
++        ALPHABET_ROW_COUNTS
++    )
++    assert len(result.regions) == 63
++    assert not result.diagnostics.search_truncated
++    _assert_exact_ownership(result)
++
++
++def test_generated_alphabet_hypotheses_and_diagnostics_are_deterministic() -> None:
++    image = _alphabet_page()
++    first = detect_spaced_region_hypotheses(image, mode="dark")
++    second = detect_spaced_region_hypotheses(image, mode="dark")
++
++    assert _region_signature(first.selected) == _region_signature(second.selected)
++    assert spaced_hypotheses_payload(first) == spaced_hypotheses_payload(second)
++    assert [row.inferred_count for row in first.selected.diagnostics.row_segmentation] == list(
++        ALPHABET_ROW_COUNTS
++    )
+diff --git a/tests/test_io.py b/tests/test_io.py
+index 4989f69..eb54e93 100644
+--- a/tests/test_io.py
++++ b/tests/test_io.py
+@@ -207,6 +207,9 @@ def test_spacing_diagnostics_are_serialized() -> None:
+     assert payload["spacing"]["row_count"] == 1
+     assert payload["spacing"]["unassigned_ink_pixels"] == 0
+     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
++    assert payload["spacing"]["rows"][0]["anchor_count"] == 1
++    assert payload["spacing"]["rows"][0]["segmentation_strategy"] == "anchors"
++    assert payload["spacing"]["rows"][0]["attempted_counts"] == []
+
+
+ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
+@@ -228,3 +231,26 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path)
+     assert (tmp_path / "selected_partition.png").is_file()
+     assert (tmp_path / "alternative_partition_2.png").is_file()
+     assert manifest.is_file()
++
++
++def test_anchor_diagnostics_and_boxes_are_serialized(tmp_path) -> None:
++    image = Image.new("RGB", (120, 70), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 20, 35, 49), fill="black")
++    draw.rectangle((70, 20, 90, 49), fill="black")
++
++    result = detect_spaced_region_hypotheses(image, mode="dark")
++    payload = spaced_hypotheses_payload(result)
++    write_spaced_hypotheses(result, tmp_path)
++
++    row = payload["selected"]["spacing"]["rows"][0]
++    assert row["anchor_count"] == 2
++    assert row["segmentation_strategy"] == "anchors"
++    assert row["split_anchor_indices"] == []
++    region = result.selected.regions[0]
++    with Image.open(tmp_path / "candidate_cuts.png") as overlay:
++        assert overlay.convert("RGB").getpixel((region.bbox.x0, region.bbox.y0)) == (
++            35,
++            110,
++            220,
++        )
+diff --git a/tests/test_models.py b/tests/test_models.py
+index c25ec93..dcbd158 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -139,6 +139,12 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
+         selected_boundaries=[12],
+         confidence=0.8,
+         cost=0.2,
++        anchor_count=2,
++        segmentation_strategy="hybrid",
++        attempted_counts=[3],
++        truncated_counts=[4],
++        split_anchor_indices=[1],
++        merged_anchor_groups=[[0, 1]],
+         alternative_cost_margin=0.3,
+         warnings=["one valley is weak"],
+     )
+@@ -148,6 +154,12 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
+     assert row.component_indices == (1, 2)
+     assert row.selected_boundaries == (12,)
+     assert row.warnings == ("one valley is weak",)
++    assert row.anchor_count == 2
++    assert row.segmentation_strategy == "hybrid"
++    assert row.attempted_counts == (3,)
++    assert row.truncated_counts == (4,)
++    assert row.split_anchor_indices == (1,)
++    assert row.merged_anchor_groups == ((0, 1),)
+     assert assignment.status == "ambiguous"
+     with pytest.raises(ValueError, match="positive integer"):
+         SpacingConfig(max_inferred_count=True)
+diff --git a/tests/test_page_expected_count.py b/tests/test_page_expected_count.py
+index 60ab051..0a4104e 100644
+--- a/tests/test_page_expected_count.py
++++ b/tests/test_page_expected_count.py
+@@ -10,7 +10,7 @@ def _two_row_page() -> Image.Image:
+     image = Image.new("RGB", (180, 140), "white")
+     draw = ImageDraw.Draw(image)
+     for y in (15, 85):
+-        for x in (15, 105):
++        for x in (15, 65):
+             draw.rectangle((x, y, x + 25, y + 28), fill="black")
+     return image
+
+diff --git a/tests/test_segmentation_search_limits.py b/tests/test_segmentation_search_limits.py
+index e198e34..1478827 100644
+--- a/tests/test_segmentation_search_limits.py
++++ b/tests/test_segmentation_search_limits.py
+@@ -7,6 +7,7 @@ from rasterregions import (
+     DetectionConfig,
+     SpacingConfig,
+     detect_spaced_region_hypotheses,
++    detect_spaced_regions,
+ )
+
+
+@@ -49,3 +50,62 @@ def test_each_search_budget_rejects_nonpositive_values() -> None:
+     ):
+         with pytest.raises(ValueError, match="positive integers"):
+             SpacingConfig(**{field: 0})
++
++
++def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 49, 55), fill="black")
++    draw.rectangle((52, 25, 90, 55), fill="black")
++    draw.rectangle((49, 39, 52, 41), fill="black")
++    config = DetectionConfig(spacing=SpacingConfig(max_partition_states=1))
++
++    result = detect_spaced_region_hypotheses(image, mode="dark", config=config)
++
++    assert len(result.selected.regions) == 1
++    assert result.selected.diagnostics.search_truncated
++    assert result.selected.diagnostics.search_limit == "row-partition-budget"
++    assert result.row_hypotheses[0][0].count == 1
++    row = result.selected.diagnostics.row_segmentation[0]
++    assert row.anchor_count == 1
++    assert row.segmentation_strategy == "anchors"
++    assert row.attempted_counts == (2,)
++    assert row.truncated_counts == (2,)
++
++
++def test_exact_count_budget_failure_leaves_clean_ink_unassigned() -> None:
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 49, 55), fill="black")
++    draw.rectangle((52, 25, 90, 55), fill="black")
++    draw.rectangle((49, 39, 52, 41), fill="black")
++    config = DetectionConfig(spacing=SpacingConfig(max_partition_states=1))
++
++    result = detect_spaced_regions(image, mode="dark", row_counts=[2], config=config)
++
++    assert result.status == "failed"
++    assert result.regions == ()
++    assert result.diagnostics.search_truncated
++    assert result.diagnostics.search_limit == "row-partition-budget"
++    assert (result.unassigned_mask == result.clean_mask).all()
++    row = result.diagnostics.row_segmentation[0]
++    assert row.attempted_counts == (2,)
++    assert row.truncated_counts == (2,)
++    assert row.segmentation_strategy == "partition"
++
++
++def test_impossible_exact_count_does_not_fabricate_regions() -> None:
++    image = Image.new("RGB", (100, 80), "white")
++    ImageDraw.Draw(image).rectangle((25, 20, 54, 55), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark", row_counts=[3])
++
++    assert result.status == "failed"
++    assert result.regions == ()
++    assert not result.diagnostics.search_truncated
++    assert (result.unassigned_mask == result.clean_mask).all()
++    row = result.diagnostics.row_segmentation[0]
++    assert row.inferred_count is None
++    assert row.requested_count == 3
++    assert row.anchor_count == 1
++    assert row.attempted_counts == (3,)
+diff --git a/tests/test_spaced_region_hypotheses.py b/tests/test_spaced_region_hypotheses.py
+index ff70d41..764c329 100644
+--- a/tests/test_spaced_region_hypotheses.py
++++ b/tests/test_spaced_region_hypotheses.py
+@@ -42,3 +42,27 @@ def test_row_partitioner_returns_deterministic_bounded_top_k() -> None:
+     assert [item.cost for item in hypotheses] == sorted(item.cost for item in hypotheses)
+     assert first.truncated
+     assert all(len(item.cut_positions) == 3 for item in hypotheses)
++
++
++def test_auto_count_penalty_is_symmetric_around_body_anchor_count() -> None:
++    mask = np.zeros((40, 100), dtype=bool)
++    mask[5:35, 10:30] = True
++    mask[5:35, 70:90] = True
++    found = tuple(components(mask))
++    penalty = 8.0
++
++    result = _partition_row(
++        mask,
++        None,
++        found,
++        x_offset=0,
++        config=PartitionConfig(),
++        spacing_config=SpacingConfig(complexity_penalty=penalty, max_region_width_ratio=5.0),
++    )
++
++    assert result is not None
++    options = (result, *result.alternatives)
++    one_region = next(item for item in options if len(item.cut_positions) == 2)
++    assert len(result.cut_positions) == 3
++    assert one_region.cost >= penalty
++    assert result.cost < one_region.cost
+diff --git a/tests/test_spaced_regions.py b/tests/test_spaced_regions.py
+index 7ed715e..dd7c71d 100644
+--- a/tests/test_spaced_regions.py
++++ b/tests/test_spaced_regions.py
+@@ -143,7 +143,7 @@ def test_disconnected_secondary_stroke_stays_with_its_body() -> None:
+     _assert_exact_ownership(result)
+
+
+-def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
++def test_touching_forms_split_on_strong_valley_or_exact_count_hint() -> None:
+     image = Image.new("RGB", (130, 80), "white")
+     draw = ImageDraw.Draw(image)
+     draw.rectangle((15, 25, 49, 55), fill="black")
+@@ -153,8 +153,23 @@ def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
+     inferred = detect_spaced_regions(image, mode="dark")
+     exact = detect_spaced_regions(image, mode="dark", row_counts=[2])
+
+-    assert inferred.status == "ambiguous"
+-    assert len(inferred.regions) == 1
++    assert inferred.status == "ok"
++    assert len(inferred.regions) == 2
++    assert any(
++        boundary.selected
++        and boundary.valley_strength is not None
++        and boundary.valley_strength >= 0.8
++        for boundary in inferred.diagnostics.partition_boundaries
++    )
++    inferred_row = inferred.diagnostics.row_segmentation[0]
++    assert inferred_row.anchor_count == 1
++    assert inferred_row.segmentation_strategy == "hybrid"
++    assert inferred_row.split_anchor_indices == (0,)
++    assert inferred_row.attempted_counts == (2,)
++    exact_row = exact.diagnostics.row_segmentation[0]
++    assert exact_row.segmentation_strategy == "hybrid"
++    assert exact_row.split_anchor_indices == (0,)
++    assert exact_row.attempted_counts == (2,)
+     assert exact.status == "ok"
+     assert len(exact.regions) == 2
+     assert any(
+@@ -165,6 +180,25 @@ def test_touching_forms_use_count_hint_or_report_ambiguity() -> None:
+     _assert_exact_ownership(exact)
+
+
++def test_trusted_count_merges_credible_small_fragment_anchors() -> None:
++    image = Image.new("RGB", (140, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((80, 20, 94, 49), fill="black")
++    draw.rectangle((10, 27, 16, 41), fill="black")
++    draw.rectangle((18, 27, 24, 41), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark", row_counts=[2])
++
++    assert result.status == "ok"
++    assert len(result.regions) == 2
++    assert result.diagnostics.row_segmentation[0].body_counts_per_region == (2, 1)
++    assert result.diagnostics.row_segmentation[0].anchor_count == 3
++    assert result.diagnostics.row_segmentation[0].segmentation_strategy == "hybrid"
++    assert result.diagnostics.row_segmentation[0].merged_anchor_groups == ((0, 1),)
++    assert len(result.regions[0].component_indices) == 2
++    _assert_exact_ownership(result)
++
++
+ def test_failed_partition_keeps_cleaned_ink_in_unassigned_mask() -> None:
+     image = Image.new("RGB", (90, 70), "white")
+     ImageDraw.Draw(image).rectangle((30, 20, 55, 48), fill="black")
