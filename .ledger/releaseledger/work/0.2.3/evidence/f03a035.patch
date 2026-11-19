@@ -1,0 +1,858 @@
+ benchmarks/benchmark_workloads.py |  51 +++++++++-
+ docs/benchmarks.md                |  14 ++-
+ docs/foreground-evidence.md       |  71 +++++++++++++
+ docs/index.md                     |   1 +
+ rasterregions/__init__.py         |   5 +-
+ rasterregions/mask.py             | 208 ++++++++++++++++++++++++++++++--------
+ rasterregions/models.py           |  39 +++++++
+ tests/test_foreground_evidence.py | 188 ++++++++++++++++++++++++++++++++++
+ tests/test_models.py              |  44 ++++++++
+ tests/test_public_api.py          |   1 +
+ 10 files changed, 574 insertions(+), 48 deletions(-)
+
+diff --git a/benchmarks/benchmark_workloads.py b/benchmarks/benchmark_workloads.py
+index 664dac2..bf8f395 100644
+--- a/benchmarks/benchmark_workloads.py
++++ b/benchmarks/benchmark_workloads.py
+@@ -14,7 +14,7 @@ from typing import TypeVar
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+-from rasterregions import detect_spaced_regions
++from rasterregions import detect_spaced_regions, foreground_evidence, foreground_mask
+ from rasterregions._partition import PartitionResult, _candidate_cut_positions, _partition_row
+ from rasterregions.components import components
+ from rasterregions.models import Component, PartitionConfig
+@@ -105,6 +105,27 @@ def _handwritten_sheet() -> Image.Image:
+     return image
+
+
++def _foreground_cases() -> list[tuple[str, np.ndarray]]:
++    page = Image.new("L", (1650, 2200), 255)
++    draw = ImageDraw.Draw(page)
++    for row_index, y in enumerate(range(70, 2120, 55)):
++        x = 60
++        mark_index = 0
++        while x < 1590:
++            width = 8 + (row_index * 13 + mark_index * 7) % 32
++            draw.line((x, y, x + width, y + 4), fill=0, width=3)
++            x += width + 12 + (mark_index * 5) % 17
++            mark_index += 1
++    draw.line((780, 980, 820, 915), fill=0, width=8)
++    draw.ellipse((810, 920, 838, 948), fill=0)
++    pixels = np.asarray(page)
++    glyph_crop = np.array(pixels[880:1008, 760:888], copy=True)
++    return [
++        ("foreground_full_page", np.array(pixels, copy=True)),
++        ("foreground_cropped_glyph", glyph_crop),
++    ]
++
++
+ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
+     workloads: list[dict[str, object]] = []
+     for name, mask in _component_cases():
+@@ -169,6 +190,34 @@ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
+         }
+     )
+
++    for name, image in _foreground_cases():
++        operations = (
++            ("mask_only", partial(foreground_mask, image, mode="auto")),
++            ("evidence", partial(foreground_evidence, image, mode="auto")),
++        )
++        for api, operation in operations:
++            result, samples = _measure(operation, repeat=repeat, warmup=warmup)
++            decision_field = getattr(result, "decision_field", None)
++            if api == "mask_only" and decision_field is not None:
++                raise RuntimeError("foreground_mask unexpectedly returned a decision field")
++            workloads.append(
++                {
++                    "name": f"{name}_{api}",
++                    "shape": list(image.shape),
++                    "pixels": int(image.size),
++                    "input_bytes": int(image.nbytes),
++                    "mode": "auto",
++                    "foreground_fraction": float(result.mask.mean()),
++                    "mask_bytes": int(result.mask.nbytes),
++                    "decision_field_allocated": decision_field is not None,
++                    "decision_field_bytes": (
++                        0 if decision_field is None else int(decision_field.nbytes)
++                    ),
++                    "samples_seconds": samples,
++                    "median_seconds": statistics.median(samples),
++                }
++            )
++
+     return {
+         "python": platform.python_version(),
+         "numpy": np.__version__,
+diff --git a/docs/benchmarks.md b/docs/benchmarks.md
+index b45b70f..1a73350 100644
+--- a/docs/benchmarks.md
++++ b/docs/benchmarks.md
+@@ -6,13 +6,23 @@ Run the deterministic benchmark workloads from the repository root:
+ python -m benchmarks.benchmark_workloads --repeat 5 --warmup 1
+ ```
+
+-The command prints JSON containing Python and NumPy versions, workload dimensions, foreground fraction, component or cut counts, individual samples, and the median time. Fixture construction is deterministic. Timings depend on the machine and should be compared only under controlled conditions.
++The command prints JSON with Python and NumPy versions, workload dimensions, foreground fraction, component or cut counts, individual samples, and median times. Foreground extraction workloads report mask bytes and decision-field bytes. Mask-only workloads report `decision_field_allocated: false` and zero decision-field bytes. Fixture construction is deterministic. Timings depend on the machine and should be compared only under controlled conditions.
+
+ The workloads are:
+-
+ - Dense connected components: a fully foreground `512 × 512` boolean mask.
+ - Sparse connected components: a `512 × 512` mask containing a regular grid of 1,024 separated `3 × 3` components.
+ - Partition rows: deterministic synthetic rows of height 96 and width 2,000 or 4,000, each partitioned into eight segments.
+ - Seven-row handwritten sheet: a generated `1081 × 1198` page with 63 slanted body anchors, variable widths, overlapping boxes, detached marks, and tiny noise. The JSON reports runtime, per-row and total anchors, repairs, partition states visited, truncated local searches, and returned regions. This anchor-only workload should report zero partition states.
++- Foreground mask and evidence: both APIs in `auto` mode on a deterministic `2200 × 1650` full-page raster and a `128 × 128` glyph crop. Each result reports sample times, median time, mask bytes, decision-field bytes, and whether a field is present. Mask-only output reports zero field bytes; a float32 evidence field reports four bytes per pixel.
++
++
++A representative recorded run with Python 3.13.17 and NumPy 2.5.4 (`--repeat 3 --warmup 1`) produced:
++
++| Input | Mask-only median | Evidence median | Decision-field bytes |
++| --- | ---: | ---: | ---: |
++| Full page, `2200 × 1650` | 0.246 s | 0.254 s | 14,520,000 |
++| Glyph crop, `128 × 128` | 1.19 ms | 1.16 ms | 65,536 |
++
++The mask-only output reported no decision field. These timings are one machine-specific sample, not performance guarantees.
+
+ Warmups are excluded from the reported samples. The benchmark is intentionally absent from CI, and there are no timing thresholds. Synthetic workloads provide repeatable probes, not a substitute for representative application data. Before changing or replacing an algorithm, capture representative workloads, input dimensions, environment details, and before/after timings. Do not infer a performance improvement from a single synthetic case.
+diff --git a/docs/foreground-evidence.md b/docs/foreground-evidence.md
+new file mode 100644
+index 0000000..3b0f42b
+--- /dev/null
++++ b/docs/foreground-evidence.md
+@@ -0,0 +1,71 @@
++# Continuous foreground evidence
++
++`foreground_mask` remains the ordinary segmentation API. It returns a `MaskResult` with a boolean foreground mask and the existing extraction metadata. Call `foreground_evidence` when a downstream geometric algorithm also needs the continuous evidence that produced that classification:
++
++```python
++from rasterregions import foreground_evidence
++
++evidence = foreground_evidence("page.png", mode="auto")
++mask = evidence.mask
++field = evidence.decision_field
++```
++
++`ForegroundEvidence` is an immutable snapshot. Its mask is a read-only Boolean array, and its decision field is a read-only `float32` array with the same two-dimensional shape. `foreground_mask` does not allocate a decision field.
++
++## Decision-field contract
++
++The field is a signed implicit representation of the same classification, not a probability or coverage map:
++
++- Positive values mean foreground.
++- Negative values mean background.
++- Zero is the classification boundary and belongs to foreground, so `evidence.mask` equals `evidence.decision_field >= 0`.
++- The field is finite and sampled at the pixel centers.
++- Magnitude is evidence strength. It is neither calibrated probability nor Euclidean distance.
++
++For grayscale and dark modes, the field is based on the original floating-point luminance and the selected scalar threshold. Adaptive mode uses its actual per-pixel threshold map. Color mode takes the minimum of normalized saturation and value margins. Hybrid mode takes the maximum of color and neutral-dark evidence, matching its union classification. Auto mode returns the field for the method selected by the existing scoring and tie-breaking rules.
++
++The deterministic color margin scales are derived from `MaskConfig`: saturation uses `max(saturation_threshold, 1 - saturation_threshold)`, and channel value uses `max(color_max_value, 255 - color_max_value)`. Intensity margins use the relevant configured transition scale, with a minimum scale of one intensity level. These choices normalize magnitudes without changing the zero crossing. Values whose sign conflicts with the historical mask decision are moved to the nearest representable `float32` value on the matching side of zero.
++
++## Pixel coordinates
++
++For array index `[row, column]`, the continuous coordinates are `x = column` and `y = row`. An integer coordinate identifies the center of that pixel. RasterRegions adds no half-pixel offset. A zero crossing between neighboring pixel centers can therefore be localized at a fractional coordinate, such as `x = 23.87`, by bilinearly interpolating the field.
++
++## Visualize a fractional crossing
++
++This example writes a grayscale visualization of the signed field and marks an interpolated crossing on a horizontal scanline. It needs only the package's existing Pillow dependency:
++
++```python
++import numpy as np
++from PIL import Image, ImageDraw
++
++from rasterregions import foreground_evidence
++
++image = np.full((32, 32), 255, dtype=np.uint8)
++image[8:24, 8:24] = 0
++evidence = foreground_evidence(image, mode="dark")
++
++row = 16
++field = evidence.decision_field
++crossings = np.flatnonzero((field[row, :-1] >= 0) & (field[row, 1:] < 0))
++left = int(crossings[-1])  # right edge of the dark rectangle
++v0, v1 = field[row, left], field[row, left + 1]
++x_boundary = left + float(v0 / (v0 - v1))
++print(f"Interpolated crossing: x={x_boundary:.2f}, y={row}")
++
++scale = 8
++display = np.clip(127.5 + field * (127.5 / 8.0), 0, 255).astype(np.uint8)
++preview = Image.fromarray(display).convert("RGB").resize(
++    (display.shape[1] * scale, display.shape[0] * scale), Image.Resampling.NEAREST
++)
++marker_x = round((x_boundary + 0.5) * scale)
++ImageDraw.Draw(preview).line(
++    (marker_x, 0, marker_x, preview.height - 1), fill=(255, 0, 0), width=1
++)
++preview.save("foreground-evidence.png")
++```
++
++The visualization clips only its display values. The returned decision field itself is not blurred or clipped near zero, so interpolation continues to use the segmentation decision.
++
++## Release note
++
++> RasterRegions can now expose the signed continuous decision field underlying foreground segmentation. Existing boolean-mask APIs are unchanged. The new field is intended for consumers that need subpixel boundary localization.
+diff --git a/docs/index.md b/docs/index.md
+index 74f4609..defce95 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -9,6 +9,7 @@
+ getting-started
+ guide
+ masking
++foreground-evidence
+ detection
+ spaced-segmentation
+ components
+diff --git a/rasterregions/__init__.py b/rasterregions/__init__.py
+index b7dcab9..f9bca23 100644
+--- a/rasterregions/__init__.py
++++ b/rasterregions/__init__.py
+@@ -16,7 +16,7 @@ from .detect import (
+     detect_spaced_region_hypotheses,
+     detect_spaced_regions,
+ )
+-from .mask import foreground_mask
++from .mask import foreground_evidence, foreground_mask
+ from .models import (
+     BBox,
+     CleanupConfig,
+@@ -27,6 +27,7 @@ from .models import (
+     DetectionResult,
+     DetectionStatus,
+     ExpectedCountScope,
++    ForegroundEvidence,
+     GroupingConfig,
+     IsolationCandidate,
+     IsolationReason,
+@@ -68,6 +69,7 @@ __all__ = [
+     "DetectionDiagnostics",
+     "DetectionResult",
+     "DetectionStatus",
++    "ForegroundEvidence",
+     "ExpectedCountScope",
+     "GroupingConfig",
+     "IsolationReason",
+@@ -97,6 +99,7 @@ __all__ = [
+     "detect_spaced_regions",
+     "detect_spaced_region_hypotheses",
+     "detect_rows",
++    "foreground_evidence",
+     "foreground_mask",
+     "isolate_component",
+     "tighten_bbox",
+diff --git a/rasterregions/mask.py b/rasterregions/mask.py
+index d13f12d..c0f7a54 100644
+--- a/rasterregions/mask.py
++++ b/rasterregions/mask.py
+@@ -1,13 +1,21 @@
+ from __future__ import annotations
+
+-from dataclasses import replace
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+
+ import numpy as np
+ from PIL import Image
+
+ from ._image import NormalizedImage, normalize_image
+-from .models import MaskConfig, MaskMethod, MaskMode, MaskResult
++from .models import ForegroundEvidence, MaskConfig, MaskMethod, MaskMode, MaskResult
++
++
++@dataclass(frozen=True)
++class _MaskCandidate:
++    method: MaskMethod
++    mask: np.ndarray
++    threshold: float | None
++    decision_field: np.ndarray | None = field(default=None, repr=False)
+
+
+ def _luminance(rgb: np.ndarray) -> np.ndarray:
+@@ -71,7 +79,7 @@ def _neutral_dark_mask(
+     return mask, threshold
+
+
+-def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
++def _adaptive_threshold_map(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
+     window_size = config.adaptive_window_size
+     offset = config.adaptive_offset
+     height, width = luminance.shape
+@@ -93,8 +101,11 @@ def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
+         config.adaptive_global_ceiling_max,
+         float(np.percentile(luminance, config.paper_percentile)) - config.adaptive_global_delta,
+     )
+-    threshold = np.minimum(local_mean - offset, global_ceiling)
+-    return luminance <= threshold
++    return np.minimum(local_mean - offset, global_ceiling)
++
++
++def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
++    return luminance <= _adaptive_threshold_map(luminance, config)
+
+
+ def _candidate_score(
+@@ -152,13 +163,15 @@ def _select_method(
+     saturation: np.ndarray,
+     colored: np.ndarray,
+     config: MaskConfig,
+-) -> tuple[MaskMethod, np.ndarray, float | None]:
++) -> _MaskCandidate:
+     luminance_u8 = _quantize_luminance(luminance)
+     grayscale_threshold = _otsu_threshold_u8(luminance_u8)
+     dark, dark_threshold = _dark_mask(luminance, config)
+-    candidates: dict[MaskMethod, tuple[np.ndarray, float | None]] = {
+-        "grayscale": (luminance_u8 <= grayscale_threshold, float(grayscale_threshold)),
+-        "dark": (dark, dark_threshold),
++    candidates: dict[MaskMethod, _MaskCandidate] = {
++        "grayscale": _MaskCandidate(
++            "grayscale", luminance_u8 <= grayscale_threshold, float(grayscale_threshold)
++        ),
++        "dark": _MaskCandidate("dark", dark, dark_threshold),
+     }
+
+     minimum_pixels = max(
+@@ -167,28 +180,74 @@ def _select_method(
+     )
+     colored_count = int(colored.sum())
+     if colored_count >= minimum_pixels:
+-        candidates["color"] = (colored, None)
++        candidates["color"] = _MaskCandidate("color", colored, None)
+         neutral, neutral_threshold = _neutral_dark_mask(luminance, saturation, config)
+         neutral_fraction = float(neutral.mean())
+         if int(neutral.sum()) >= minimum_pixels:
+-            candidates["hybrid"] = (colored | neutral, neutral_threshold)
++            candidates["hybrid"] = _MaskCandidate("hybrid", colored | neutral, neutral_threshold)
+     else:
+         neutral_fraction = 0.0
+
+     scored = {
+         method: _candidate_score(
+-            mask,
++            candidate.mask,
+             luminance,
+             saturation,
+             config,
+             neutral_fraction=neutral_fraction if method == "hybrid" else 0.0,
+         )
+-        for method, (mask, _) in candidates.items()
++        for method, candidate in candidates.items()
+     }
+     priority = {"hybrid": 3, "color": 2, "grayscale": 1, "dark": 0}
+     selected = max(candidates, key=lambda method: (scored[method], priority[method]))
+-    mask, threshold = candidates[selected]
+-    return selected, mask, threshold
++    return candidates[selected]
++
++
++def _match_decision_sign(decision: np.ndarray, mask: np.ndarray) -> np.ndarray:
++    field = np.asarray(decision, dtype=np.float32)
++    mismatched = (field >= 0.0) != mask
++    if np.any(mismatched):
++        field = np.array(field, dtype=np.float32, copy=True)
++        positive_epsilon = np.nextafter(np.float32(0.0), np.float32(1.0))
++        negative_epsilon = np.nextafter(np.float32(0.0), np.float32(-1.0))
++        field[mismatched & mask] = positive_epsilon
++        field[mismatched & ~mask] = negative_epsilon
++    return field
++
++
++def _decision_field(
++    candidate: _MaskCandidate,
++    rgb: np.ndarray,
++    luminance: np.ndarray,
++    saturation: np.ndarray,
++    config: MaskConfig,
++    *,
++    adaptive_threshold_map: np.ndarray | None = None,
++) -> np.ndarray:
++    if candidate.method == "grayscale" or candidate.method == "dark":
++        assert candidate.threshold is not None
++        decision = (candidate.threshold - luminance) / max(config.dark_delta, 1.0)
++    elif candidate.method == "adaptive":
++        assert adaptive_threshold_map is not None
++        decision = (adaptive_threshold_map - luminance) / max(config.adaptive_offset, 1.0)
++    else:
++        maximum = rgb.max(axis=2)
++        saturation_scale = max(config.saturation_threshold, 1.0 - config.saturation_threshold)
++        value_scale = max(config.color_max_value, 255.0 - config.color_max_value)
++        color_decision = np.minimum(
++            (saturation - config.saturation_threshold) / saturation_scale,
++            (config.color_max_value - maximum) / value_scale,
++        )
++        if candidate.method == "color":
++            decision = color_decision
++        else:
++            assert candidate.threshold is not None
++            neutral_decision = np.minimum(
++                (config.saturation_threshold - saturation) / saturation_scale,
++                (candidate.threshold - luminance) / max(config.neutral_dark_delta, 1.0),
++            )
++            decision = np.maximum(color_decision, neutral_decision)
++    return _match_decision_sign(decision, candidate.mask)
+
+
+ def _quality(
+@@ -229,20 +288,15 @@ def _warnings(mask: np.ndarray, confidence: float, config: MaskConfig) -> tuple[
+     return tuple(warnings)
+
+
+-def foreground_mask(
++def _extract_candidate(
+     image: str | Path | Image.Image | np.ndarray | NormalizedImage,
+-    mode: MaskMode = "auto",
++    mode: MaskMode,
+     *,
+-    adaptive_window_size: int | None = None,
+-    adaptive_offset: float | None = None,
+-    config: MaskConfig | None = None,
+-) -> MaskResult:
+-    """Extract a boolean foreground mask using a deterministic thresholding mode.
+-
+-    ``auto`` evaluates grayscale, dark-relative, color, and hybrid candidates.
+-    ``color`` remains color-only. ``adaptive`` uses a local mean threshold for
+-    images with uneven illumination.
+-    """
++    adaptive_window_size: int | None,
++    adaptive_offset: float | None,
++    config: MaskConfig | None,
++    include_decision_field: bool,
++) -> tuple[_MaskCandidate, float, tuple[str, ...]]:
+     if mode not in {"auto", "grayscale", "dark", "color", "hybrid", "adaptive"}:
+         raise ValueError("mode must be auto, grayscale, dark, color, hybrid, or adaptive")
+     mask_config = config or MaskConfig()
+@@ -261,35 +315,101 @@ def foreground_mask(
+     rgb = image.rgb if isinstance(image, NormalizedImage) else normalize_image(image).rgb
+     luminance = _luminance(rgb)
+     saturation, colored = _chroma(rgb, mask_config)
+-    threshold: float | None = None
++    adaptive_threshold_map = None
+
+     if mode == "auto":
+-        selected, mask, threshold = _select_method(rgb, luminance, saturation, colored, mask_config)
++        candidate = _select_method(rgb, luminance, saturation, colored, mask_config)
+     elif mode == "grayscale":
+         luminance_u8 = _quantize_luminance(luminance)
+         threshold = float(_otsu_threshold_u8(luminance_u8))
+-        selected = "grayscale"
+-        mask = luminance_u8 <= threshold
++        candidate = _MaskCandidate("grayscale", luminance_u8 <= threshold, threshold)
+     elif mode == "dark":
+-        selected = "dark"
+         mask, threshold = _dark_mask(luminance, mask_config)
++        candidate = _MaskCandidate("dark", mask, threshold)
+     elif mode == "color":
+-        selected = "color"
+-        mask = colored
++        candidate = _MaskCandidate("color", colored, None)
+     elif mode == "hybrid":
+-        selected = "hybrid"
+         neutral, threshold = _neutral_dark_mask(luminance, saturation, mask_config)
+-        mask = colored | neutral
++        candidate = _MaskCandidate("hybrid", colored | neutral, threshold)
+     else:
+-        selected = "adaptive"
+-        mask = _adaptive_mask(luminance, mask_config)
++        adaptive_threshold_map = _adaptive_threshold_map(luminance, mask_config)
++        candidate = _MaskCandidate("adaptive", luminance <= adaptive_threshold_map, None)
++
++    if include_decision_field:
++        candidate = replace(
++            candidate,
++            decision_field=_decision_field(
++                candidate,
++                rgb,
++                luminance,
++                saturation,
++                mask_config,
++                adaptive_threshold_map=adaptive_threshold_map,
++            ),
++        )
++    confidence = _quality(candidate.mask, luminance, saturation, candidate.method, mask_config)
++    warnings = _warnings(candidate.mask, confidence, mask_config)
++    return candidate, confidence, warnings
++
+
+-    mask = np.asarray(mask, dtype=bool)
+-    confidence = _quality(mask, luminance, saturation, selected, mask_config)
++def foreground_mask(
++    image: str | Path | Image.Image | np.ndarray | NormalizedImage,
++    mode: MaskMode = "auto",
++    *,
++    adaptive_window_size: int | None = None,
++    adaptive_offset: float | None = None,
++    config: MaskConfig | None = None,
++) -> MaskResult:
++    """Extract a boolean foreground mask using a deterministic thresholding mode.
++
++    ``auto`` evaluates grayscale, dark-relative, color, and hybrid candidates.
++    ``color`` remains color-only. ``adaptive`` uses a local mean threshold for
++    images with uneven illumination.
++    """
++    candidate, confidence, warnings = _extract_candidate(
++        image,
++        mode,
++        adaptive_window_size=adaptive_window_size,
++        adaptive_offset=adaptive_offset,
++        config=config,
++        include_decision_field=False,
++    )
+     return MaskResult(
+-        mask,
++        candidate.mask,
++        confidence,
++        candidate.method,
++        warnings,
++        threshold=candidate.threshold,
++    )
++
++
++def foreground_evidence(
++    image: str | Path | Image.Image | np.ndarray | NormalizedImage,
++    mode: MaskMode = "auto",
++    *,
++    adaptive_window_size: int | None = None,
++    adaptive_offset: float | None = None,
++    config: MaskConfig | None = None,
++) -> ForegroundEvidence:
++    """Extract a foreground mask and its signed continuous decision field.
++
++    Positive field values denote foreground, negative values denote background,
++    and zero denotes the inclusive foreground classification boundary.
++    """
++    candidate, confidence, warnings = _extract_candidate(
++        image,
++        mode,
++        adaptive_window_size=adaptive_window_size,
++        adaptive_offset=adaptive_offset,
++        config=config,
++        include_decision_field=True,
++    )
++    assert candidate.decision_field is not None
++    return ForegroundEvidence(
++        candidate.mask,
++        candidate.decision_field,
+         confidence,
+-        selected,
+-        _warnings(mask, confidence, mask_config),
+-        threshold=threshold,
++        candidate.method,
++        warnings,
++        threshold=candidate.threshold,
+     )
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index dab821e..dc1c00e 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -76,6 +76,45 @@ class MaskResult:
+         mask.setflags(write=False)
+         object.__setattr__(self, "mask", mask)
+         object.__setattr__(self, "confidence", float(self.confidence))
++
++
++@dataclass(frozen=True)
++class ForegroundEvidence:
++    """A boolean foreground mask and its signed continuous decision field.
++
++    The field is sampled at pixel centers. Nonnegative values denote foreground,
++    including the zero-valued classification boundary.
++    """
++
++    mask: np.ndarray
++    decision_field: np.ndarray = field(repr=False, compare=False)
++    confidence: float
++    method: MaskMethod
++    warnings: tuple[str, ...] = ()
++    threshold: float | None = None
++
++    def __post_init__(self) -> None:
++        mask = np.asarray(self.mask, dtype=bool)
++        decision_field = np.asarray(self.decision_field, dtype=np.float32)
++        if mask.ndim != 2 or decision_field.ndim != 2:
++            raise ValueError("mask and decision_field must be 2D arrays")
++        if mask.shape != decision_field.shape:
++            raise ValueError("mask and decision_field must have the same shape")
++        if not np.isfinite(decision_field).all():
++            raise ValueError("decision_field values must be finite")
++        if not np.array_equal(mask, decision_field >= 0.0):
++            raise ValueError("mask must equal decision_field >= 0")
++        if not np.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
++            raise ValueError("foreground evidence confidence must be between zero and one")
++
++        mask = np.array(mask, dtype=bool, copy=True)
++        decision_field = np.array(decision_field, dtype=np.float32, copy=True)
++        mask.setflags(write=False)
++        decision_field.setflags(write=False)
++        object.__setattr__(self, "mask", mask)
++        object.__setattr__(self, "decision_field", decision_field)
++        object.__setattr__(self, "confidence", float(self.confidence))
++        object.__setattr__(self, "warnings", tuple(self.warnings))
+         object.__setattr__(self, "warnings", tuple(self.warnings))
+
+
+diff --git a/tests/test_foreground_evidence.py b/tests/test_foreground_evidence.py
+new file mode 100644
+index 0000000..c31a28b
+--- /dev/null
++++ b/tests/test_foreground_evidence.py
+@@ -0,0 +1,188 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from PIL import Image, ImageDraw
++
++import rasterregions.mask as mask_module
++from rasterregions import foreground_evidence, foreground_mask
++
++
++def _mode_image(mode: str) -> np.ndarray:
++    if mode == "dark":
++        image = np.full((48, 48), 180, dtype=np.uint8)
++        image[12:36, 22:26] = 20
++        return image
++    if mode == "adaptive":
++        image = np.tile(np.linspace(220, 255, 64, dtype=np.uint8), (48, 1))
++        image[12:36, 30:34] = 30
++        return image
++
++    image = np.full((48, 48, 3), 255, dtype=np.uint8)
++    if mode in {"grayscale", "hybrid", "auto"}:
++        image[10:38, 12:16] = 0
++    if mode in {"color", "hybrid", "auto"}:
++        image[10:38, 30:34] = (20, 70, 220)
++    return image
++
++
++@pytest.mark.parametrize("mode", ["grayscale", "dark", "adaptive", "color", "hybrid", "auto"])
++def test_evidence_field_matches_mask_api_and_metadata(mode: str) -> None:
++    image = _mode_image(mode)
++    options = {"adaptive_window_size": 15} if mode == "adaptive" else {}
++
++    mask_result = foreground_mask(image, mode=mode, **options)
++    evidence = foreground_evidence(image, mode=mode, **options)
++
++    assert np.array_equal(evidence.mask, mask_result.mask)
++    assert evidence.method == mask_result.method
++    assert evidence.threshold == mask_result.threshold
++    assert evidence.confidence == mask_result.confidence
++    assert evidence.warnings == mask_result.warnings
++    assert evidence.decision_field.shape == evidence.mask.shape
++    assert evidence.decision_field.dtype == np.float32
++    assert np.isfinite(evidence.decision_field).all()
++    assert not evidence.mask.flags.writeable
++    assert not evidence.decision_field.flags.writeable
++    assert np.array_equal(evidence.mask, evidence.decision_field >= 0.0)
++    assert not hasattr(mask_result, "decision_field")
++
++
++def test_grayscale_evidence_uses_unquantized_luminance_and_zero_is_foreground() -> None:
++    image = np.full((40, 40), 255, dtype=np.uint8)
++    image[10:30, 18:22] = 0
++
++    evidence = foreground_evidence(image, mode="grayscale")
++
++    assert evidence.threshold == 0.0
++    assert evidence.decision_field[10, 18] == 0.0
++    assert evidence.mask[10, 18]
++
++
++def test_color_field_respects_saturation_and_exclusive_value_constraints() -> None:
++    image = np.full((4, 4, 3), 255, dtype=np.uint8)
++    image[0, 0] = (0, 0, 220)
++    image[0, 1] = (0, 0, 250)
++    image[0, 2] = (160, 200, 160)
++
++    evidence = foreground_evidence(image, mode="color")
++
++    assert evidence.mask[0, 0]
++    assert evidence.decision_field[0, 0] > 0.0
++    assert not evidence.mask[0, 1]
++    assert evidence.decision_field[0, 1] < 0.0
++    assert evidence.mask[0, 2]
++    assert evidence.decision_field[0, 2] >= 0.0
++
++
++def test_mask_only_api_does_not_construct_a_decision_field(monkeypatch) -> None:
++    image = Image.new("RGB", (32, 32), "white")
++    ImageDraw.Draw(image).rectangle((12, 12, 19, 19), fill="black")
++
++    def fail_if_called(*args, **kwargs):
++        pytest.fail("foreground_mask must not construct a decision field")
++
++    monkeypatch.setattr(mask_module, "_decision_field", fail_if_called)
++
++    result = foreground_mask(image, mode="dark")
++
++    assert result.mask.any()
++
++
++def _bilinear_sample(field: np.ndarray, x: float, y: float) -> float:
++    x0 = int(np.floor(x))
++    y0 = int(np.floor(y))
++    dx = x - x0
++    dy = y - y0
++    return float(
++        field[y0, x0] * (1.0 - dx) * (1.0 - dy)
++        + field[y0, x0 + 1] * dx * (1.0 - dy)
++        + field[y0 + 1, x0] * (1.0 - dx) * dy
++        + field[y0 + 1, x0 + 1] * dx * dy
++    )
++
++
++def _crossing_distance(values: np.ndarray, distances: np.ndarray) -> float:
++    crossings = np.flatnonzero((values[:-1] >= 0.0) & (values[1:] < 0.0))
++    assert crossings.size
++    index = int(crossings[0])
++    fraction = values[index] / (values[index] - values[index + 1])
++    return float(distances[index] + fraction * (distances[index + 1] - distances[index]))
++
++
++def test_antialiased_grayscale_edges_localize_fractional_threshold_crossings(monkeypatch) -> None:
++    monkeypatch.setattr(mask_module, "_otsu_threshold_u8", lambda _: 127)
++    height = width = 96
++    xx, yy = np.meshgrid(np.arange(width), np.arange(height))
++    cases = [(0.0, 8.25, 48.0), (0.0, 8.75, 48.0)]
++    for angle in (17.0, 43.0, 71.0):
++        radians = np.deg2rad(angle)
++        normal_x = float(np.cos(radians))
++        normal_y = float(np.sin(radians))
++        cases.extend(
++            (angle, 48.25 + offset * normal_x, 48.25 + offset * normal_y)
++            for offset in np.arange(0.0, 1.0, 0.1)
++        )
++
++    distances = np.linspace(-0.75, 0.75, 121)
++    expected = (127.0 - 127.5) / 255.0
++    field_errors = []
++    boolean_errors = []
++    for angle, center_x, center_y in cases:
++        radians = np.deg2rad(angle)
++        normal_x = float(np.cos(radians))
++        normal_y = float(np.sin(radians))
++        signed_distance = (xx - center_x) * normal_x + (yy - center_y) * normal_y
++        image = np.clip(127.5 + 255.0 * signed_distance, 0.0, 255.0).astype(np.float32)
++        evidence = foreground_evidence(image, mode="grayscale")
++        sample_x = center_x + distances * normal_x
++        sample_y = center_y + distances * normal_y
++        continuous_values = np.array(
++            [
++                _bilinear_sample(evidence.decision_field, x, y)
++                for x, y in zip(sample_x, sample_y, strict=True)
++            ]
++        )
++        boolean_field = np.where(evidence.mask, 1.0, -1.0)
++        boolean_values = np.array(
++            [_bilinear_sample(boolean_field, x, y) for x, y in zip(sample_x, sample_y, strict=True)]
++        )
++        field_errors.append(abs(_crossing_distance(continuous_values, distances) - expected))
++        boolean_errors.append(abs(_crossing_distance(boolean_values, distances) - expected))
++
++    assert np.median(field_errors) <= 0.10
++    assert np.percentile(field_errors, 95) <= 0.20
++    assert np.median(field_errors) < np.median(boolean_errors) * 0.5
++
++
++def test_adaptive_field_tracks_smooth_local_thresholds() -> None:
++    width = 100
++    background = np.tile(np.linspace(180.0, 240.0, width, dtype=np.float32), (64, 1))
++    background[20:44, 18:22] = 150.0
++    background[20:44, 76:80] = 150.0
++
++    evidence = foreground_evidence(
++        background, mode="adaptive", adaptive_window_size=31, adaptive_offset=10.0
++    )
++
++    assert evidence.mask[30, 19]
++    assert evidence.mask[30, 77]
++    assert not evidence.mask[5, 10]
++    assert evidence.decision_field[30, 77] > evidence.decision_field[30, 19]
++    assert np.any(evidence.decision_field != np.rint(evidence.decision_field))
++    assert np.array_equal(evidence.mask, evidence.decision_field >= 0.0)
++
++
++def test_hybrid_field_unions_colored_and_neutral_dark_evidence() -> None:
++    image = np.full((48, 64, 3), 255, dtype=np.uint8)
++    image[12:36, 12:16] = 100
++    image[12:36, 40:44] = (20, 70, 220)
++
++    evidence = foreground_evidence(image, mode="hybrid")
++
++    assert evidence.mask[20, 13]
++    assert evidence.mask[20, 41]
++    assert not evidence.mask[0, 0]
++    assert evidence.decision_field[20, 13] >= 0.0
++    assert evidence.decision_field[20, 41] >= 0.0
++    assert evidence.decision_field[0, 0] < 0.0
+diff --git a/tests/test_models.py b/tests/test_models.py
+index dcbd158..6f74e58 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -8,6 +8,7 @@ from rasterregions.models import (
+     ComponentDecision,
+     DetectionDiagnostics,
+     DetectionResult,
++    ForegroundEvidence,
+     IsolationCandidate,
+     IsolationResult,
+     MaskResult,
+@@ -193,3 +194,46 @@ def test_detection_result_unassigned_mask_is_a_read_only_snapshot() -> None:
+     assert not result.unassigned_mask.flags.writeable
+     unassigned[7, 8] = False
+     assert result.unassigned_mask[7, 8]
++
++
++def test_foreground_evidence_owns_immutable_consistent_snapshots() -> None:
++    mask = np.array([[True, False], [False, True]])
++    decision = np.array([[0.2, -0.3], [-0.1, 0.4]], dtype=np.float64)
++    evidence = ForegroundEvidence(mask, decision, 0.75, "dark")
++
++    assert evidence.mask.dtype == np.bool_
++    assert evidence.decision_field.dtype == np.float32
++    assert np.array_equal(evidence.mask, evidence.decision_field >= 0.0)
++    assert not evidence.mask.flags.writeable
++    assert not evidence.decision_field.flags.writeable
++    mask[0, 0] = False
++    decision[0, 0] = -1.0
++    assert evidence.mask[0, 0]
++    assert evidence.decision_field[0, 0] == np.float32(0.2)
++    with pytest.raises(ValueError):
++        evidence.mask[0, 0] = False
++    with pytest.raises(ValueError):
++        evidence.decision_field[0, 0] = -1.0
++
++
++def test_foreground_evidence_rejects_invalid_shapes_values_and_signs() -> None:
++    mask = np.array([[True, False]])
++    decision = np.array([[1.0, -1.0]])
++
++    with pytest.raises(ValueError, match="same shape"):
++        ForegroundEvidence(mask, np.zeros((2, 1)), 0.5, "dark")
++    with pytest.raises(ValueError, match="finite"):
++        ForegroundEvidence(mask, np.array([[np.inf, -1.0]]), 0.5, "dark")
++    with pytest.raises(ValueError, match="decision_field >= 0"):
++        ForegroundEvidence(mask, np.array([[-1.0, -1.0]]), 0.5, "dark")
++    with pytest.raises(ValueError, match="confidence"):
++        ForegroundEvidence(mask, decision, 1.1, "dark")
++
++
++def test_foreground_evidence_zero_is_foreground() -> None:
++    evidence = ForegroundEvidence(
++        np.array([[True, False]]), np.array([[0.0, -0.5]]), 1.0, "grayscale"
++    )
++
++    assert evidence.mask[0, 0]
++    assert evidence.decision_field[0, 0] == 0.0
+diff --git a/tests/test_public_api.py b/tests/test_public_api.py
+index dbbcc1a..b44172f 100644
+--- a/tests/test_public_api.py
++++ b/tests/test_public_api.py
+@@ -7,6 +7,7 @@ def test_public_api_and_version_exist() -> None:
+     assert callable(rasterregions.detect_regions)
+     assert callable(rasterregions.foreground_mask)
+     assert isinstance(rasterregions.__version__, str)
++    assert rasterregions.ForegroundEvidence
+     assert rasterregions.DetectionConfig().cleanup == rasterregions.CleanupConfig()
+     assert rasterregions.DetectionDiagnostics
+     assert rasterregions.ComponentDecision

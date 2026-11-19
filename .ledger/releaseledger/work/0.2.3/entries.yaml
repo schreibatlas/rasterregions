@@ -1,0 +1,33 @@
+schema: releaseledger.entry-batch.v1
+operation: create
+schema_version: 1
+object_type: release_entry_batch
+release_version: 0.2.3
+git_base_ref: 6644c0218ccd37599ea531bb2e6bdbdaa9a5880b
+git_base_sha: 6644c0218ccd37599ea531bb2e6bdbdaa9a5880b
+git_head_ref: f03a03553ca32b6add80b3b43767c629be34ea1e
+git_head_sha: f03a03553ca32b6add80b3b43767c629be34ea1e
+include_merges: nontrivial
+entries:
+- kind: added
+  summary: Added an opt-in API for signed foreground evidence fields that support subpixel boundary localization
+  status: accepted
+  source_refs:
+  - git:f03a03553ca32b6add80b3b43767c629be34ea1e
+  paths:
+  - benchmarks/benchmark_workloads.py
+  - docs/benchmarks.md
+  - docs/foreground-evidence.md
+  - docs/index.md
+  - rasterregions/__init__.py
+  - rasterregions/mask.py
+  - rasterregions/models.py
+  - tests/test_foreground_evidence.py
+  - tests/test_models.py
+  - tests/test_public_api.py
+  sources:
+  - git:f03a03553ca32b6add80b3b43767c629be34ea1e
+  prs: []
+  issues: []
+  contributors:
+  - '@holgern'
