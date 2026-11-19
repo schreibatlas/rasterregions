@@ -14,7 +14,7 @@ from typing import TypeVar
 import numpy as np
 from PIL import Image, ImageDraw
 
-from rasterregions import detect_spaced_regions
+from rasterregions import detect_spaced_regions, foreground_evidence, foreground_mask
 from rasterregions._partition import PartitionResult, _candidate_cut_positions, _partition_row
 from rasterregions.components import components
 from rasterregions.models import Component, PartitionConfig
@@ -105,6 +105,27 @@ def _handwritten_sheet() -> Image.Image:
     return image
 
 
+def _foreground_cases() -> list[tuple[str, np.ndarray]]:
+    page = Image.new("L", (1650, 2200), 255)
+    draw = ImageDraw.Draw(page)
+    for row_index, y in enumerate(range(70, 2120, 55)):
+        x = 60
+        mark_index = 0
+        while x < 1590:
+            width = 8 + (row_index * 13 + mark_index * 7) % 32
+            draw.line((x, y, x + width, y + 4), fill=0, width=3)
+            x += width + 12 + (mark_index * 5) % 17
+            mark_index += 1
+    draw.line((780, 980, 820, 915), fill=0, width=8)
+    draw.ellipse((810, 920, 838, 948), fill=0)
+    pixels = np.asarray(page)
+    glyph_crop = np.array(pixels[880:1008, 760:888], copy=True)
+    return [
+        ("foreground_full_page", np.array(pixels, copy=True)),
+        ("foreground_cropped_glyph", glyph_crop),
+    ]
+
+
 def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
     workloads: list[dict[str, object]] = []
     for name, mask in _component_cases():
@@ -168,6 +189,34 @@ def run_benchmarks(*, repeat: int, warmup: int) -> dict[str, object]:
             "median_seconds": statistics.median(sheet_samples),
         }
     )
+
+    for name, image in _foreground_cases():
+        operations = (
+            ("mask_only", partial(foreground_mask, image, mode="auto")),
+            ("evidence", partial(foreground_evidence, image, mode="auto")),
+        )
+        for api, operation in operations:
+            result, samples = _measure(operation, repeat=repeat, warmup=warmup)
+            decision_field = getattr(result, "decision_field", None)
+            if api == "mask_only" and decision_field is not None:
+                raise RuntimeError("foreground_mask unexpectedly returned a decision field")
+            workloads.append(
+                {
+                    "name": f"{name}_{api}",
+                    "shape": list(image.shape),
+                    "pixels": int(image.size),
+                    "input_bytes": int(image.nbytes),
+                    "mode": "auto",
+                    "foreground_fraction": float(result.mask.mean()),
+                    "mask_bytes": int(result.mask.nbytes),
+                    "decision_field_allocated": decision_field is not None,
+                    "decision_field_bytes": (
+                        0 if decision_field is None else int(decision_field.nbytes)
+                    ),
+                    "samples_seconds": samples,
+                    "median_seconds": statistics.median(samples),
+                }
+            )
 
     return {
         "python": platform.python_version(),

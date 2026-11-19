@@ -76,6 +76,45 @@ class MaskResult:
         mask.setflags(write=False)
         object.__setattr__(self, "mask", mask)
         object.__setattr__(self, "confidence", float(self.confidence))
+
+
+@dataclass(frozen=True)
+class ForegroundEvidence:
+    """A boolean foreground mask and its signed continuous decision field.
+
+    The field is sampled at pixel centers. Nonnegative values denote foreground,
+    including the zero-valued classification boundary.
+    """
+
+    mask: np.ndarray
+    decision_field: np.ndarray = field(repr=False, compare=False)
+    confidence: float
+    method: MaskMethod
+    warnings: tuple[str, ...] = ()
+    threshold: float | None = None
+
+    def __post_init__(self) -> None:
+        mask = np.asarray(self.mask, dtype=bool)
+        decision_field = np.asarray(self.decision_field, dtype=np.float32)
+        if mask.ndim != 2 or decision_field.ndim != 2:
+            raise ValueError("mask and decision_field must be 2D arrays")
+        if mask.shape != decision_field.shape:
+            raise ValueError("mask and decision_field must have the same shape")
+        if not np.isfinite(decision_field).all():
+            raise ValueError("decision_field values must be finite")
+        if not np.array_equal(mask, decision_field >= 0.0):
+            raise ValueError("mask must equal decision_field >= 0")
+        if not np.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("foreground evidence confidence must be between zero and one")
+
+        mask = np.array(mask, dtype=bool, copy=True)
+        decision_field = np.array(decision_field, dtype=np.float32, copy=True)
+        mask.setflags(write=False)
+        decision_field.setflags(write=False)
+        object.__setattr__(self, "mask", mask)
+        object.__setattr__(self, "decision_field", decision_field)
+        object.__setattr__(self, "confidence", float(self.confidence))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "warnings", tuple(self.warnings))
 
 

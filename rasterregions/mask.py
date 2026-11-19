@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from ._image import NormalizedImage, normalize_image
-from .models import MaskConfig, MaskMethod, MaskMode, MaskResult
+from .models import ForegroundEvidence, MaskConfig, MaskMethod, MaskMode, MaskResult
+
+
+@dataclass(frozen=True)
+class _MaskCandidate:
+    method: MaskMethod
+    mask: np.ndarray
+    threshold: float | None
+    decision_field: np.ndarray | None = field(default=None, repr=False)
 
 
 def _luminance(rgb: np.ndarray) -> np.ndarray:
@@ -71,7 +79,7 @@ def _neutral_dark_mask(
     return mask, threshold
 
 
-def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
+def _adaptive_threshold_map(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
     window_size = config.adaptive_window_size
     offset = config.adaptive_offset
     height, width = luminance.shape
@@ -93,8 +101,11 @@ def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
         config.adaptive_global_ceiling_max,
         float(np.percentile(luminance, config.paper_percentile)) - config.adaptive_global_delta,
     )
-    threshold = np.minimum(local_mean - offset, global_ceiling)
-    return luminance <= threshold
+    return np.minimum(local_mean - offset, global_ceiling)
+
+
+def _adaptive_mask(luminance: np.ndarray, config: MaskConfig) -> np.ndarray:
+    return luminance <= _adaptive_threshold_map(luminance, config)
 
 
 def _candidate_score(
@@ -152,13 +163,15 @@ def _select_method(
     saturation: np.ndarray,
     colored: np.ndarray,
     config: MaskConfig,
-) -> tuple[MaskMethod, np.ndarray, float | None]:
+) -> _MaskCandidate:
     luminance_u8 = _quantize_luminance(luminance)
     grayscale_threshold = _otsu_threshold_u8(luminance_u8)
     dark, dark_threshold = _dark_mask(luminance, config)
-    candidates: dict[MaskMethod, tuple[np.ndarray, float | None]] = {
-        "grayscale": (luminance_u8 <= grayscale_threshold, float(grayscale_threshold)),
-        "dark": (dark, dark_threshold),
+    candidates: dict[MaskMethod, _MaskCandidate] = {
+        "grayscale": _MaskCandidate(
+            "grayscale", luminance_u8 <= grayscale_threshold, float(grayscale_threshold)
+        ),
+        "dark": _MaskCandidate("dark", dark, dark_threshold),
     }
 
     minimum_pixels = max(
@@ -167,28 +180,74 @@ def _select_method(
     )
     colored_count = int(colored.sum())
     if colored_count >= minimum_pixels:
-        candidates["color"] = (colored, None)
+        candidates["color"] = _MaskCandidate("color", colored, None)
         neutral, neutral_threshold = _neutral_dark_mask(luminance, saturation, config)
         neutral_fraction = float(neutral.mean())
         if int(neutral.sum()) >= minimum_pixels:
-            candidates["hybrid"] = (colored | neutral, neutral_threshold)
+            candidates["hybrid"] = _MaskCandidate("hybrid", colored | neutral, neutral_threshold)
     else:
         neutral_fraction = 0.0
 
     scored = {
         method: _candidate_score(
-            mask,
+            candidate.mask,
             luminance,
             saturation,
             config,
             neutral_fraction=neutral_fraction if method == "hybrid" else 0.0,
         )
-        for method, (mask, _) in candidates.items()
+        for method, candidate in candidates.items()
     }
     priority = {"hybrid": 3, "color": 2, "grayscale": 1, "dark": 0}
     selected = max(candidates, key=lambda method: (scored[method], priority[method]))
-    mask, threshold = candidates[selected]
-    return selected, mask, threshold
+    return candidates[selected]
+
+
+def _match_decision_sign(decision: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    field = np.asarray(decision, dtype=np.float32)
+    mismatched = (field >= 0.0) != mask
+    if np.any(mismatched):
+        field = np.array(field, dtype=np.float32, copy=True)
+        positive_epsilon = np.nextafter(np.float32(0.0), np.float32(1.0))
+        negative_epsilon = np.nextafter(np.float32(0.0), np.float32(-1.0))
+        field[mismatched & mask] = positive_epsilon
+        field[mismatched & ~mask] = negative_epsilon
+    return field
+
+
+def _decision_field(
+    candidate: _MaskCandidate,
+    rgb: np.ndarray,
+    luminance: np.ndarray,
+    saturation: np.ndarray,
+    config: MaskConfig,
+    *,
+    adaptive_threshold_map: np.ndarray | None = None,
+) -> np.ndarray:
+    if candidate.method == "grayscale" or candidate.method == "dark":
+        assert candidate.threshold is not None
+        decision = (candidate.threshold - luminance) / max(config.dark_delta, 1.0)
+    elif candidate.method == "adaptive":
+        assert adaptive_threshold_map is not None
+        decision = (adaptive_threshold_map - luminance) / max(config.adaptive_offset, 1.0)
+    else:
+        maximum = rgb.max(axis=2)
+        saturation_scale = max(config.saturation_threshold, 1.0 - config.saturation_threshold)
+        value_scale = max(config.color_max_value, 255.0 - config.color_max_value)
+        color_decision = np.minimum(
+            (saturation - config.saturation_threshold) / saturation_scale,
+            (config.color_max_value - maximum) / value_scale,
+        )
+        if candidate.method == "color":
+            decision = color_decision
+        else:
+            assert candidate.threshold is not None
+            neutral_decision = np.minimum(
+                (config.saturation_threshold - saturation) / saturation_scale,
+                (candidate.threshold - luminance) / max(config.neutral_dark_delta, 1.0),
+            )
+            decision = np.maximum(color_decision, neutral_decision)
+    return _match_decision_sign(decision, candidate.mask)
 
 
 def _quality(
@@ -229,20 +288,15 @@ def _warnings(mask: np.ndarray, confidence: float, config: MaskConfig) -> tuple[
     return tuple(warnings)
 
 
-def foreground_mask(
+def _extract_candidate(
     image: str | Path | Image.Image | np.ndarray | NormalizedImage,
-    mode: MaskMode = "auto",
+    mode: MaskMode,
     *,
-    adaptive_window_size: int | None = None,
-    adaptive_offset: float | None = None,
-    config: MaskConfig | None = None,
-) -> MaskResult:
-    """Extract a boolean foreground mask using a deterministic thresholding mode.
-
-    ``auto`` evaluates grayscale, dark-relative, color, and hybrid candidates.
-    ``color`` remains color-only. ``adaptive`` uses a local mean threshold for
-    images with uneven illumination.
-    """
+    adaptive_window_size: int | None,
+    adaptive_offset: float | None,
+    config: MaskConfig | None,
+    include_decision_field: bool,
+) -> tuple[_MaskCandidate, float, tuple[str, ...]]:
     if mode not in {"auto", "grayscale", "dark", "color", "hybrid", "adaptive"}:
         raise ValueError("mode must be auto, grayscale, dark, color, hybrid, or adaptive")
     mask_config = config or MaskConfig()
@@ -261,35 +315,101 @@ def foreground_mask(
     rgb = image.rgb if isinstance(image, NormalizedImage) else normalize_image(image).rgb
     luminance = _luminance(rgb)
     saturation, colored = _chroma(rgb, mask_config)
-    threshold: float | None = None
+    adaptive_threshold_map = None
 
     if mode == "auto":
-        selected, mask, threshold = _select_method(rgb, luminance, saturation, colored, mask_config)
+        candidate = _select_method(rgb, luminance, saturation, colored, mask_config)
     elif mode == "grayscale":
         luminance_u8 = _quantize_luminance(luminance)
         threshold = float(_otsu_threshold_u8(luminance_u8))
-        selected = "grayscale"
-        mask = luminance_u8 <= threshold
+        candidate = _MaskCandidate("grayscale", luminance_u8 <= threshold, threshold)
     elif mode == "dark":
-        selected = "dark"
         mask, threshold = _dark_mask(luminance, mask_config)
+        candidate = _MaskCandidate("dark", mask, threshold)
     elif mode == "color":
-        selected = "color"
-        mask = colored
+        candidate = _MaskCandidate("color", colored, None)
     elif mode == "hybrid":
-        selected = "hybrid"
         neutral, threshold = _neutral_dark_mask(luminance, saturation, mask_config)
-        mask = colored | neutral
+        candidate = _MaskCandidate("hybrid", colored | neutral, threshold)
     else:
-        selected = "adaptive"
-        mask = _adaptive_mask(luminance, mask_config)
+        adaptive_threshold_map = _adaptive_threshold_map(luminance, mask_config)
+        candidate = _MaskCandidate("adaptive", luminance <= adaptive_threshold_map, None)
 
-    mask = np.asarray(mask, dtype=bool)
-    confidence = _quality(mask, luminance, saturation, selected, mask_config)
+    if include_decision_field:
+        candidate = replace(
+            candidate,
+            decision_field=_decision_field(
+                candidate,
+                rgb,
+                luminance,
+                saturation,
+                mask_config,
+                adaptive_threshold_map=adaptive_threshold_map,
+            ),
+        )
+    confidence = _quality(candidate.mask, luminance, saturation, candidate.method, mask_config)
+    warnings = _warnings(candidate.mask, confidence, mask_config)
+    return candidate, confidence, warnings
+
+
+def foreground_mask(
+    image: str | Path | Image.Image | np.ndarray | NormalizedImage,
+    mode: MaskMode = "auto",
+    *,
+    adaptive_window_size: int | None = None,
+    adaptive_offset: float | None = None,
+    config: MaskConfig | None = None,
+) -> MaskResult:
+    """Extract a boolean foreground mask using a deterministic thresholding mode.
+
+    ``auto`` evaluates grayscale, dark-relative, color, and hybrid candidates.
+    ``color`` remains color-only. ``adaptive`` uses a local mean threshold for
+    images with uneven illumination.
+    """
+    candidate, confidence, warnings = _extract_candidate(
+        image,
+        mode,
+        adaptive_window_size=adaptive_window_size,
+        adaptive_offset=adaptive_offset,
+        config=config,
+        include_decision_field=False,
+    )
     return MaskResult(
-        mask,
+        candidate.mask,
         confidence,
-        selected,
-        _warnings(mask, confidence, mask_config),
-        threshold=threshold,
+        candidate.method,
+        warnings,
+        threshold=candidate.threshold,
+    )
+
+
+def foreground_evidence(
+    image: str | Path | Image.Image | np.ndarray | NormalizedImage,
+    mode: MaskMode = "auto",
+    *,
+    adaptive_window_size: int | None = None,
+    adaptive_offset: float | None = None,
+    config: MaskConfig | None = None,
+) -> ForegroundEvidence:
+    """Extract a foreground mask and its signed continuous decision field.
+
+    Positive field values denote foreground, negative values denote background,
+    and zero denotes the inclusive foreground classification boundary.
+    """
+    candidate, confidence, warnings = _extract_candidate(
+        image,
+        mode,
+        adaptive_window_size=adaptive_window_size,
+        adaptive_offset=adaptive_offset,
+        config=config,
+        include_decision_field=True,
+    )
+    assert candidate.decision_field is not None
+    return ForegroundEvidence(
+        candidate.mask,
+        candidate.decision_field,
+        confidence,
+        candidate.method,
+        warnings,
+        threshold=candidate.threshold,
     )

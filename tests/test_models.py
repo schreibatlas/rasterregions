@@ -8,6 +8,7 @@ from rasterregions.models import (
     ComponentDecision,
     DetectionDiagnostics,
     DetectionResult,
+    ForegroundEvidence,
     IsolationCandidate,
     IsolationResult,
     MaskResult,
@@ -193,3 +194,46 @@ def test_detection_result_unassigned_mask_is_a_read_only_snapshot() -> None:
     assert not result.unassigned_mask.flags.writeable
     unassigned[7, 8] = False
     assert result.unassigned_mask[7, 8]
+
+
+def test_foreground_evidence_owns_immutable_consistent_snapshots() -> None:
+    mask = np.array([[True, False], [False, True]])
+    decision = np.array([[0.2, -0.3], [-0.1, 0.4]], dtype=np.float64)
+    evidence = ForegroundEvidence(mask, decision, 0.75, "dark")
+
+    assert evidence.mask.dtype == np.bool_
+    assert evidence.decision_field.dtype == np.float32
+    assert np.array_equal(evidence.mask, evidence.decision_field >= 0.0)
+    assert not evidence.mask.flags.writeable
+    assert not evidence.decision_field.flags.writeable
+    mask[0, 0] = False
+    decision[0, 0] = -1.0
+    assert evidence.mask[0, 0]
+    assert evidence.decision_field[0, 0] == np.float32(0.2)
+    with pytest.raises(ValueError):
+        evidence.mask[0, 0] = False
+    with pytest.raises(ValueError):
+        evidence.decision_field[0, 0] = -1.0
+
+
+def test_foreground_evidence_rejects_invalid_shapes_values_and_signs() -> None:
+    mask = np.array([[True, False]])
+    decision = np.array([[1.0, -1.0]])
+
+    with pytest.raises(ValueError, match="same shape"):
+        ForegroundEvidence(mask, np.zeros((2, 1)), 0.5, "dark")
+    with pytest.raises(ValueError, match="finite"):
+        ForegroundEvidence(mask, np.array([[np.inf, -1.0]]), 0.5, "dark")
+    with pytest.raises(ValueError, match="decision_field >= 0"):
+        ForegroundEvidence(mask, np.array([[-1.0, -1.0]]), 0.5, "dark")
+    with pytest.raises(ValueError, match="confidence"):
+        ForegroundEvidence(mask, decision, 1.1, "dark")
+
+
+def test_foreground_evidence_zero_is_foreground() -> None:
+    evidence = ForegroundEvidence(
+        np.array([[True, False]]), np.array([[0.0, -0.5]]), 1.0, "grayscale"
+    )
+
+    assert evidence.mask[0, 0]
+    assert evidence.decision_field[0, 0] == 0.0

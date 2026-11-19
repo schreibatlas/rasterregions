@@ -16,7 +16,7 @@ from .detect import (
     detect_spaced_region_hypotheses,
     detect_spaced_regions,
 )
-from .mask import foreground_mask
+from .mask import foreground_evidence, foreground_mask
 from .models import (
     BBox,
     CleanupConfig,
@@ -27,6 +27,7 @@ from .models import (
     DetectionResult,
     DetectionStatus,
     ExpectedCountScope,
+    ForegroundEvidence,
     GroupingConfig,
     IsolationCandidate,
     IsolationReason,
@@ -68,6 +69,7 @@ __all__ = [
     "DetectionDiagnostics",
     "DetectionResult",
     "DetectionStatus",
+    "ForegroundEvidence",
     "ExpectedCountScope",
     "GroupingConfig",
     "IsolationReason",
@@ -97,6 +99,7 @@ __all__ = [
     "detect_spaced_regions",
     "detect_spaced_region_hypotheses",
     "detect_rows",
+    "foreground_evidence",
     "foreground_mask",
     "isolate_component",
     "tighten_bbox",

@@ -9,6 +9,7 @@
 getting-started
 guide
 masking
+foreground-evidence
 detection
 spaced-segmentation
 components
