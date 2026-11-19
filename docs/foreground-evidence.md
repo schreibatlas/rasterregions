@@ -54,13 +54,13 @@ print(f"Interpolated crossing: x={x_boundary:.2f}, y={row}")
 
 scale = 8
 display = np.clip(127.5 + field * (127.5 / 8.0), 0, 255).astype(np.uint8)
-preview = Image.fromarray(display).convert("RGB").resize(
-    (display.shape[1] * scale, display.shape[0] * scale), Image.Resampling.NEAREST
+preview = (
+    Image.fromarray(display)
+    .convert("RGB")
+    .resize((display.shape[1] * scale, display.shape[0] * scale), Image.Resampling.NEAREST)
 )
 marker_x = round((x_boundary + 0.5) * scale)
-ImageDraw.Draw(preview).line(
-    (marker_x, 0, marker_x, preview.height - 1), fill=(255, 0, 0), width=1
-)
+ImageDraw.Draw(preview).line((marker_x, 0, marker_x, preview.height - 1), fill=(255, 0, 0), width=1)
 preview.save("foreground-evidence.png")
 ```
 
