@@ -1,0 +1,1208 @@
+ examples/08_spaced_regions.py       |  10 ++
+ rasterregions/__init__.py           |   2 +
+ rasterregions/_cleanup.py           |  40 ++++--
+ rasterregions/_grouping.py          |  34 ++++-
+ rasterregions/_rows.py              |  39 +++++-
+ rasterregions/detect.py             | 264 ++++++++++++++++++++++++++++++++----
+ rasterregions/io.py                 |   9 ++
+ rasterregions/models.py             |  42 +++++-
+ tests/test_context_aware_cleanup.py | 176 ++++++++++++++++++++++++
+ tests/test_io.py                    |  23 ++++
+ tests/test_models.py                |   9 +-
+ tests/test_region_frames.py         |  16 +++
+ 12 files changed, 622 insertions(+), 42 deletions(-)
+
+diff --git a/examples/08_spaced_regions.py b/examples/08_spaced_regions.py
+index 8d865a4..85d2106 100644
+--- a/examples/08_spaced_regions.py
++++ b/examples/08_spaced_regions.py
+@@ -28,6 +28,16 @@ def main() -> None:
+     print("status:", hypotheses.selected.status)
+     print("selected regions:", len(hypotheses.selected.regions))
+     print("page hypotheses:", len(hypotheses.page_hypotheses))
++    for region in hypotheses.selected.regions:
++        print(
++            region.region_id,
++            "primary:",
++            region.primary_component_indices,
++            "secondary:",
++            region.secondary_component_indices,
++            "ambiguous:",
++            region.ambiguous_component_indices,
++        )
+     print("search truncated:", hypotheses.truncated)
+     print("artifacts:", BUILD)
+
+diff --git a/rasterregions/__init__.py b/rasterregions/__init__.py
+index f9bca23..34eec74 100644
+--- a/rasterregions/__init__.py
++++ b/rasterregions/__init__.py
+@@ -22,6 +22,7 @@ from .models import (
+     CleanupConfig,
+     Component,
+     ComponentDecision,
++    ComponentRole,
+     DetectionConfig,
+     DetectionDiagnostics,
+     DetectionResult,
+@@ -65,6 +66,7 @@ __all__ = [
+     "CleanupConfig",
+     "Component",
+     "ComponentDecision",
++    "ComponentRole",
+     "DetectionConfig",
+     "DetectionDiagnostics",
+     "DetectionResult",
+diff --git a/rasterregions/_cleanup.py b/rasterregions/_cleanup.py
+index d63ca72..23a14b2 100644
+--- a/rasterregions/_cleanup.py
++++ b/rasterregions/_cleanup.py
+@@ -11,6 +11,8 @@ from .models import CleanupConfig, Component, ComponentDecision
+
+ @dataclass(frozen=True)
+ class CleanedPage:
++    """Retained mask after hard artifact removal and before contextual disposition."""
++
+     mask: np.ndarray
+     components: tuple[Component, ...]
+     primary_area: float
+@@ -18,6 +20,8 @@ class CleanedPage:
+     warnings: tuple[str, ...]
+     component_decisions: tuple[ComponentDecision, ...]
+
++    provisional_component_indices: tuple[int, ...] = ()
++
+
+ def _is_page_artifact(
+     component: Component,
+@@ -74,11 +78,24 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+             ("No foreground components were detected.",),
+             (),
+         )
++
+     artifacts = {
+         component.index: _is_page_artifact(component, width, height, config) for component in found
+     }
+     non_artifacts = [component for component in found if not artifacts[component.index]]
+-    primary_area, _ = _size_scale(non_artifacts)
++    provisional_scale, _ = _size_scale(non_artifacts)
++    provisional_threshold = provisional_scale * config.tiny_area_ratio
++    provisional = tuple(
++        component for component in non_artifacts if component.area < provisional_threshold
++    )
++    provisional_ids = {component.index for component in provisional}
++    primary_candidates = [
++        component for component in non_artifacts if component.index not in provisional_ids
++    ]
++    if not primary_candidates and non_artifacts:
++        primary_candidates = [max(non_artifacts, key=lambda component: component.area)]
++    primary_area, median_height = _size_scale(primary_candidates)
++
+     cleaned = np.array(mask, dtype=bool, copy=True)
+     warnings: list[str] = []
+     decisions: list[ComponentDecision] = []
+@@ -87,11 +104,11 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+         reason = None
+         if artifacts[component.index]:
+             reason = "page border, rule, or oversized artifact"
+-        elif primary_area and component.area < primary_area * config.tiny_area_ratio:
+-            reason = "tiny isolated noise"
+-        if reason:
+             cleaned[component.ys, component.xs] = False
+             warnings.append(f"Removed component {component.index}: {reason}.")
++        elif component.index in provisional_ids:
++            reason = "provisional small component retained for contextual assignment"
++            kept_components.append(component)
+         else:
+             kept_components.append(component)
+         decisions.append(
+@@ -99,17 +116,24 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+                 component.index,
+                 component.bbox,
+                 component.area,
+-                "removed" if reason else "kept",
++                "removed" if artifacts[component.index] else "kept",
+                 reason,
++                role=(
++                    "artifact"
++                    if artifacts[component.index]
++                    else "secondary-candidate"
++                    if component.index in provisional_ids
++                    else "primary"
++                ),
+             )
+         )
+-    kept = tuple(kept_components)
+-    primary_area, median_height = _size_scale(kept)
++
+     return CleanedPage(
+         cleaned,
+-        kept,
++        tuple(kept_components),
+         primary_area,
+         median_height,
+         tuple(warnings),
+         tuple(decisions),
++        tuple(component.index for component in provisional),
+     )
+diff --git a/rasterregions/_grouping.py b/rasterregions/_grouping.py
+index e2b9aa1..9490793 100644
+--- a/rasterregions/_grouping.py
++++ b/rasterregions/_grouping.py
+@@ -282,6 +282,17 @@ def _spacing_attachment_score(
+     return max(0.0, min(scores)) if scores else None
+
+
++def _is_suspicious_lateral_speck(mark: Component, targets: Sequence[Component]) -> bool:
++    return any(
++        mark.area <= 4
++        and target.bbox.y0 + target.height * 0.25
++        < mark.center_y
++        < target.bbox.y1 - target.height * 0.25
++        and (mark.bbox.x1 <= target.bbox.x0 or mark.bbox.x0 >= target.bbox.x1)
++        for target in targets
++    )
++
++
+ def _assign_spacing_marks(
+     marks: tuple[Component, ...] | list[Component],
+     bodies_by_region: Sequence[Sequence[Component]],
+@@ -289,18 +300,31 @@ def _assign_spacing_marks(
+     config: SpacingConfig,
+     *,
+     region_indices: tuple[int, ...] | None = None,
++    region_scales: tuple[float, ...] | None = None,
+ ) -> tuple[tuple[SecondaryMarkAssignment, ...], tuple[tuple[Component, ...], ...]]:
+     """Assign each secondary component to at most one region, preserving close ties."""
+     indices = region_indices or tuple(range(len(bodies_by_region)))
+     assigned: list[list[Component]] = [[] for _ in bodies_by_region]
+     decisions: list[SecondaryMarkAssignment] = []
+     for mark in sorted(marks, key=lambda component: component.index):
++        if any(_is_suspicious_lateral_speck(mark, bodies) for bodies in bodies_by_region):
++            decisions.append(
++                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
++            )
++            continue
+         scores = [
+             (score, region_index, local_index)
+             for local_index, (region_index, bodies) in enumerate(
+                 zip(indices, bodies_by_region, strict=True)
+             )
+-            if (score := _spacing_attachment_score(mark, bodies, median_height)) is not None
++            if (
++                score := _spacing_attachment_score(
++                    mark,
++                    bodies,
++                    region_scales[local_index] if region_scales is not None else median_height,
++                )
++            )
++            is not None
+         ]
+         scores.sort()
+         if not scores or scores[0][0] > 2.5:
+@@ -318,7 +342,13 @@ def _assign_spacing_marks(
+         if margin is not None and margin < config.mark_assignment_margin:
+             decisions.append(
+                 SecondaryMarkAssignment(
+-                    mark.index, None, best_score, second_score, margin, "ambiguous"
++                    mark.index,
++                    None,
++                    best_score,
++                    second_score,
++                    margin,
++                    "ambiguous",
++                    candidate_region_indices=tuple(target for _, target, _ in scores[:2]),
+                 )
+             )
+             continue
+diff --git a/rasterregions/_rows.py b/rasterregions/_rows.py
+index 0605686..a030d99 100644
+--- a/rasterregions/_rows.py
++++ b/rasterregions/_rows.py
+@@ -103,11 +103,15 @@ def _spacing_rows_from_components(
+     grouping: GroupingConfig,
+     spacing: SpacingConfig,
+     page_shape: tuple[int, int],
++    primary_components: tuple[Component, ...] | None = None,
+ ) -> SpacingRowLayout:
+     """Cluster primary-body centers, then assign satellites once or retain ambiguity."""
+     if not found:
+         return SpacingRowLayout((), (), (), (), ())
+-    bodies = _spacing_body_components(found)
++    body_candidates = primary_components if primary_components is not None else found
++    bodies = _spacing_body_components(body_candidates)
++    if not bodies:
++        bodies = _spacing_body_components(found)
+     ordered = sorted(bodies, key=lambda component: (component.center_y, component.index))
+     body_scale = float(np.median([component.height for component in ordered]))
+     rows_of_bodies: list[list[Component]] = []
+@@ -128,6 +132,10 @@ def _spacing_rows_from_components(
+         else:
+             rows_of_bodies[-1].append(component)
+
++    row_scales = [
++        float(np.median([component.height for component in row])) or body_scale
++        for row in rows_of_bodies
++    ]
+     body_ids = {component.index for component in bodies}
+     row_members = [list(row) for row in rows_of_bodies]
+     ambiguous: list[list[int]] = [[] for _ in rows_of_bodies]
+@@ -140,10 +148,37 @@ def _spacing_rows_from_components(
+     for component in found:
+         if component.index in body_ids:
+             continue
++        if component.area <= 4:
++            nearby_bodies = [
++                (score, body)
++                for row_index, row in enumerate(rows_of_bodies)
++                for body in row
++                if (
++                    score := _spacing_attachment_score(
++                        component, (body,), row_scales[row_index] or body_scale
++                    )
++                )
++                is not None
++                and score <= 2.5
++            ]
++            if len(nearby_bodies) == 1:
++                target = nearby_bodies[0][1]
++                diagonal = (
++                    component.bbox.x1 <= target.bbox.x0 or component.bbox.x0 >= target.bbox.x1
++                ) and (component.bbox.y1 <= target.bbox.y0 or component.bbox.y0 >= target.bbox.y1)
++                if diagonal:
++                    unassigned.append(component.index)
++                    component_rows[component.index] = None
++                    continue
+         scores = [
+             (score, row_index)
+             for row_index, row in enumerate(rows_of_bodies)
+-            if (score := _spacing_attachment_score(component, row, body_scale)) is not None
++            if (
++                score := _spacing_attachment_score(
++                    component, row, row_scales[row_index] or body_scale
++                )
++            )
++            is not None
+         ]
+         scores.sort()
+         if not scores or scores[0][0] > 2.5:
+diff --git a/rasterregions/detect.py b/rasterregions/detect.py
+index e3c4a12..be677da 100644
+--- a/rasterregions/detect.py
++++ b/rasterregions/detect.py
+@@ -7,7 +7,7 @@ from pathlib import Path
+ import numpy as np
+ from PIL import Image
+
+-from ._cleanup import clean_page_mask
++from ._cleanup import CleanedPage, clean_page_mask
+ from ._grouping import (
+     _assign_spacing_marks,
+     _automatic_regions,
+@@ -27,6 +27,7 @@ from ._partition import (
+     _row_partition_regions,
+ )
+ from ._rows import (
++    SpacingRowLayout,
+     _rows_from_components,
+     _spacing_rows_from_components,
+     detect_rows,
+@@ -137,6 +138,50 @@ def _translate_roi_result(
+     )
+
+
++def _remove_unassigned_provisional_components(
++    cleaned: CleanedPage,
++    layout: SpacingRowLayout,
++) -> CleanedPage:
++    noise_indices = set(layout.unassigned_component_indices) & set(
++        cleaned.provisional_component_indices
++    )
++    if not noise_indices:
++        return cleaned
++
++    clean_mask = cleaned.mask.copy()
++    retained_components: list[Component] = []
++    for component in cleaned.components:
++        if component.index in noise_indices:
++            clean_mask[component.ys, component.xs] = False
++        else:
++            retained_components.append(component)
++    decisions = tuple(
++        replace(
++            decision,
++            action="removed",
++            reason="tiny component with no plausible body target",
++            role="noise",
++        )
++        if decision.component_index in noise_indices
++        else decision
++        for decision in cleaned.component_decisions
++    )
++    warnings = (
++        *cleaned.warnings,
++        *(f"Removed component {index}: tiny isolated noise." for index in sorted(noise_indices)),
++    )
++    return replace(
++        cleaned,
++        mask=clean_mask,
++        components=tuple(retained_components),
++        warnings=warnings,
++        component_decisions=decisions,
++        provisional_component_indices=tuple(
++            index for index in cleaned.provisional_component_indices if index not in noise_indices
++        ),
++    )
++
++
+ def detect_regions(
+     source: str | Path | Image.Image | np.ndarray,
+     *,
+@@ -509,12 +554,22 @@ def detect_spaced_regions(
+     image = normalized.image
+     mask_result = foreground_mask(normalized, mode=mode, config=config.mask)
+     cleaned = clean_page_mask(mask_result.mask, config.cleanup)
++    provisional_ids = set(cleaned.provisional_component_indices)
++    primary_components = tuple(
++        component for component in cleaned.components if component.index not in provisional_ids
++    )
+     layout = _spacing_rows_from_components(
+         cleaned.components,
+         config.grouping,
+         config.spacing,
+         cleaned.mask.shape,
++        primary_components=primary_components,
+     )
++    row_assignment_by_index = {
++        component.index: layout.component_row_assignments[index]
++        for index, component in enumerate(cleaned.components)
++    }
++    cleaned = _remove_unassigned_provisional_components(cleaned, layout)
+     rows = layout.rows
+     if row_counts is None:
+         requested: tuple[int | None, ...] = (None,) * len(rows)
+@@ -533,13 +588,14 @@ def detect_spaced_regions(
+         ):
+             raise ValueError("row counts must be positive integers or None")
+
+-    body_components = _spacing_body_components(cleaned.components)
+-    body_ids = {component.index for component in body_components}
+     component_by_index = {component.index: component for component in cleaned.components}
+-    assignment_by_index = {
+-        component.index: layout.component_row_assignments[index]
+-        for index, component in enumerate(cleaned.components)
++    body_ids = {
++        component_index
++        for row_component_indices in layout.body_component_indices
++        for component_index in row_component_indices
+     }
++    body_components = [component_by_index[index] for index in sorted(body_ids)]
++    assignment_by_index = row_assignment_by_index
+     ambiguous_row_ids = {
+         component_index
+         for indices in layout.ambiguous_component_indices
+@@ -572,7 +628,11 @@ def detect_spaced_regions(
+             partition = _row_partition_regions(
+                 image,
+                 cleaned.mask,
+-                row_components or cleaned.components,
++                tuple(
++                    component
++                    for component in cleaned.components
++                    if component.index in layout.body_component_indices[row_index]
++                ),
+                 row,
+                 row_index,
+                 cleaned.median_height,
+@@ -949,6 +1009,9 @@ def detect_spaced_regions(
+             body_groups,
+             body_height,
+             config.spacing,
++            region_scales=tuple(
++                row_diagnostics[region.row_index].body_height for region in regions
++            ),
+         )
+         if regions
+         else ((), ())
+@@ -959,7 +1022,31 @@ def detect_spaced_regions(
+         if component.index in body_ids:
+             continue
+         if component.index in ambiguous_row_ids:
+-            decision = SecondaryMarkAssignment(component.index, None, None, None, None, "ambiguous")
++            candidate_scores = [
++                (score, region_index)
++                for region_index, bodies in enumerate(body_groups)
++                if (
++                    score := _spacing_attachment_score(
++                        component,
++                        bodies,
++                        row_diagnostics[regions[region_index].row_index].body_height,
++                    )
++                )
++                is not None
++                and score <= 2.5
++            ]
++            candidate_scores.sort()
++            decision = SecondaryMarkAssignment(
++                component.index,
++                None,
++                None,
++                None,
++                None,
++                "ambiguous",
++                candidate_region_indices=tuple(
++                    region_index for _, region_index in candidate_scores[:2]
++                ),
++            )
+         elif component.index in unassigned_row_ids:
+             decision = SecondaryMarkAssignment(
+                 component.index, None, None, None, None, "unassigned"
+@@ -971,6 +1058,40 @@ def detect_spaced_regions(
+             )
+         secondary_assignments.append(decision)
+     secondary_assignments.sort(key=lambda item: item.component_index)
++    role_by_index = {component_index: "primary" for component_index in body_ids}
++    role_by_index.update(
++        {
++            assignment.component_index: (
++                "secondary"
++                if assignment.status == "assigned"
++                else "ambiguous"
++                if assignment.status == "ambiguous"
++                else "secondary-candidate"
++            )
++            for assignment in secondary_assignments
++        }
++    )
++    cleaned = replace(
++        cleaned,
++        component_decisions=tuple(
++            replace(
++                decision,
++                role=role_by_index.get(decision.component_index, decision.role),
++            )
++            for decision in cleaned.component_decisions
++        ),
++    )
++    ambiguous_components_by_region = {
++        region_index: tuple(
++            sorted(
++                assignment.component_index
++                for assignment in secondary_assignments
++                if assignment.status == "ambiguous"
++                and region_index in assignment.candidate_region_indices
++            )
++        )
++        for region_index in range(len(regions))
++    }
+
+     region_masks: list[np.ndarray] = []
+     for region in regions:
+@@ -1022,6 +1143,24 @@ def detect_spaced_regions(
+         )
+         owned_mask |= full_mask
+
++    region_index_by_id = {region.region_id: index for index, region in enumerate(regions)}
++    owned_regions = [
++        replace(
++            region,
++            primary_component_indices=tuple(
++                index for index in region.component_indices if role_by_index.get(index) == "primary"
++            ),
++            secondary_component_indices=tuple(
++                index
++                for index in region.component_indices
++                if role_by_index.get(index) == "secondary"
++            ),
++            ambiguous_component_indices=ambiguous_components_by_region[
++                region_index_by_id[region.region_id]
++            ],
++        )
++        for region in owned_regions
++    ]
+     unassigned_mask = cleaned.mask & ~owned_mask
+     unassigned_fraction = float(unassigned_mask.sum() / max(1, cleaned.mask.sum()))
+     ambiguous_marks = {
+@@ -1204,6 +1343,9 @@ def _selected_page_hypothesis(
+                 bbox=region.bbox,
+                 mask=region.mask,
+                 component_indices=region.component_indices,
++                primary_component_indices=region.primary_component_indices,
++                secondary_component_indices=region.secondary_component_indices,
++                ambiguous_component_indices=region.ambiguous_component_indices,
+                 frame=frame,
+                 cost=row_diagnostic.cost if row_diagnostic else 0.0,
+                 confidence=region.confidence,
+@@ -1276,7 +1418,11 @@ def _row_hypothesis_from_partition(
+     region_offset: int,
+ ) -> RowPartitionHypothesis:
+     frame = _region_frame(result, row_index)
+-    body_ids = {component.index for component in _spacing_body_components(result.components)}
++    body_ids = {
++        decision.component_index
++        for decision in result.component_decisions
++        if decision.role == "primary"
++    }
+     regions = tuple(
+         RegionHypothesis(
+             bbox=region.bbox,
+@@ -1288,6 +1434,12 @@ def _row_hypothesis_from_partition(
+             warnings=(),
+             cut_crossing_cost=(partition.cut_crossing_cost / max(1, len(partition.regions))),
+             body_count=sum(index in body_ids for index in region.component_indices),
++            primary_component_indices=tuple(
++                index for index in region.component_indices if index in body_ids
++            ),
++            secondary_component_indices=tuple(
++                index for index in region.component_indices if index not in body_ids
++            ),
+         )
+         for region in partition.regions
+     )
+@@ -1319,7 +1471,7 @@ def _row_hypothesis_from_partition(
+     return RowPartitionHypothesis(
+         row_index=row_index,
+         count=len(regions),
+-        boundaries=partition.cut_positions,
++        boundaries=_row_boundary_positions(result.rows[row_index], partition.regions, partition),
+         regions=regions,
+         cost=partition.cost,
+         unassigned_ink_fraction=0.0,
+@@ -1344,11 +1496,13 @@ def _page_hypotheses_for_partitions(
+     if not region_specs:
+         return (), False
+     shape = result.clean_mask.shape
+-    body_components = _spacing_body_components(result.components)
+-    body_ids = {component.index for component in body_components}
++    body_ids = {
++        component_index
++        for _, _, region in region_specs
++        for component_index in region.component_indices
++    }
++    body_components = [component for component in result.components if component.index in body_ids]
+     secondary = [component for component in result.components if component.index not in body_ids]
+-    secondary_ids = {component.index for component in secondary}
+-    body_ids = {component.index for component in result.components} - secondary_ids
+     base_masks: list[np.ndarray] = []
+     body_groups: list[tuple[Component, ...]] = []
+     for _, _, region in region_specs:
+@@ -1377,16 +1531,13 @@ def _page_hypotheses_for_partitions(
+             float | None,
+             float | None,
+             float | None,
++            tuple[int, ...],
+             tuple[tuple[int | None, float], ...],
+         ]
+     ] = []
+     body_height = (
+-        float(
+-            np.median(
+-                [component.height for component in result.components if component.index in body_ids]
+-            )
+-        )
+-        if body_ids
++        float(np.median([component.height for component in body_components]))
++        if body_components
+         else 1.0
+     )
+     for component in sorted(secondary, key=lambda item: item.index):
+@@ -1395,7 +1546,12 @@ def _page_hypotheses_for_partitions(
+         for region_index, (target_row, _, _) in enumerate(region_specs):
+             if row_index is not None and target_row != row_index:
+                 continue
+-            score = _spacing_attachment_score(component, body_groups[region_index], body_height)
++            row_scale = (
++                result.diagnostics.row_segmentation[target_row].body_height
++                if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
++                else body_height
++            )
++            score = _spacing_attachment_score(component, body_groups[region_index], row_scale)
+             if score is not None:
+                 scored.append((score, region_index))
+         scored.sort(key=lambda item: (item[0], item[1]))
+@@ -1406,6 +1562,11 @@ def _page_hypotheses_for_partitions(
+             if best_score is not None and second_score is not None
+             else None
+         )
++        candidate_region_indices = (
++            tuple(target for _, target in scored[:2])
++            if margin is not None and margin < config.spacing.mark_assignment_margin
++            else ()
++        )
+         if best_score is None:
+             choices: tuple[tuple[int | None, float], ...] = ((None, 0.0),)
+         else:
+@@ -1415,11 +1576,20 @@ def _page_hypotheses_for_partitions(
+                 else scored[:1]
+             )
+             choices = tuple((target, score) for score, target in eligible) + ((None, 2.5),)
+-        mark_options.append((component, best_score, second_score, margin, choices))
++        mark_options.append(
++            (
++                component,
++                best_score,
++                second_score,
++                margin,
++                candidate_region_indices,
++                choices,
++            )
++        )
+
+     branches: list[tuple[float, tuple[int | None, ...]]] = [(0.0, ())]
+     branches_truncated = False
+-    for _, _, _, _, choices in mark_options:
++    for _, _, _, _, _, choices in mark_options:
+         expanded = [
+             (cost + choice_cost, (*selected, target))
+             for cost, selected in branches
+@@ -1443,7 +1613,14 @@ def _page_hypotheses_for_partitions(
+             mask &= ~owned
+             owned |= mask
+         assignments: list[SecondaryMarkAssignment] = []
+-        for (component, best, second, margin, _), target in zip(mark_options, targets, strict=True):
++        for (
++            component,
++            best,
++            second,
++            margin,
++            candidate_region_indices,
++            _,
++        ), target in zip(mark_options, targets, strict=True):
+             if target is None:
+                 assignments.append(
+                     SecondaryMarkAssignment(
+@@ -1453,6 +1630,7 @@ def _page_hypotheses_for_partitions(
+                         second,
+                         margin,
+                         "unassigned",
++                        candidate_region_indices=candidate_region_indices,
+                     )
+                 )
+                 continue
+@@ -1461,11 +1639,21 @@ def _page_hypotheses_for_partitions(
+             masks[target][ys, xs] = True
+             owned[ys, xs] = True
+             assignments.append(
+-                SecondaryMarkAssignment(component.index, target, best, second, margin, "assigned")
++                SecondaryMarkAssignment(
++                    component.index,
++                    target,
++                    best,
++                    second,
++                    margin,
++                    "assigned",
++                    candidate_region_indices=candidate_region_indices,
++                )
+             )
+         unassigned = result.clean_mask & ~owned
+         row_region_hypotheses: dict[int, list[RegionHypothesis]] = {}
+-        for (row_index, row_partition, _), mask in zip(region_specs, masks, strict=True):
++        for region_spec_index, ((row_index, row_partition, _), mask) in enumerate(
++            zip(region_specs, masks, strict=True)
++        ):
+             ys, xs = np.nonzero(mask)
+             if not len(xs):
+                 continue
+@@ -1488,6 +1676,17 @@ def _page_hypotheses_for_partitions(
+                     row_partition.cut_crossing_cost / max(1, len(row_partition.regions))
+                 ),
+                 body_count=sum(index in body_ids for index in component_indices),
++                primary_component_indices=tuple(
++                    index for index in component_indices if index in body_ids
++                ),
++                secondary_component_indices=tuple(
++                    index for index in component_indices if index not in body_ids
++                ),
++                ambiguous_component_indices=tuple(
++                    component.index
++                    for component, _, _, _, candidates, _ in mark_options
++                    if region_spec_index in candidates
++                ),
+             )
+             row_region_hypotheses.setdefault(row_index, []).append(hypothesis)
+
+@@ -1497,6 +1696,17 @@ def _page_hypotheses_for_partitions(
+             if not current_regions:
+                 continue
+             row = result.rows[row_index]
++            boundaries = partition.cut_positions
++            if len(boundaries) != len(current_regions) + 1:
++                left = boundaries[0] if boundaries else row.bbox.x0
++                right = boundaries[-1] if boundaries else row.bbox.x1
++                internal = tuple(
++                    (left_region.bbox.x1 + right_region.bbox.x0) // 2
++                    for left_region, right_region in zip(
++                        current_regions, current_regions[1:], strict=False
++                    )
++                )
++                boundaries = (left, *internal, right)
+             row_unassigned = unassigned[row.bbox.y0 : row.bbox.y1]
+             row_foreground = result.clean_mask[row.bbox.y0 : row.bbox.y1]
+             row_assignments = tuple(
+@@ -1508,7 +1718,7 @@ def _page_hypotheses_for_partitions(
+                 RowPartitionHypothesis(
+                     row_index=row_index,
+                     count=len(current_regions),
+-                    boundaries=partition.cut_positions,
++                    boundaries=boundaries,
+                     regions=current_regions,
+                     cost=partition.cost,
+                     unassigned_ink_fraction=float(
+diff --git a/rasterregions/io.py b/rasterregions/io.py
+index fd4643a..0695b03 100644
+--- a/rasterregions/io.py
++++ b/rasterregions/io.py
+@@ -59,6 +59,7 @@ def detection_payload(result: DetectionResult) -> dict:
+                 "component_index": decision.component_index,
+                 "bbox": list(decision.bbox.as_tuple()),
+                 "area": decision.area,
++                "role": decision.role,
+                 "action": decision.action,
+                 "reason": decision.reason,
+             }
+@@ -91,6 +92,9 @@ def detection_payload(result: DetectionResult) -> dict:
+                 "bbox": list(region.bbox.as_tuple()),
+                 "confidence": round(region.confidence, 4),
+                 "component_indices": list(region.component_indices),
++                "primary_component_indices": list(region.primary_component_indices),
++                "secondary_component_indices": list(region.secondary_component_indices),
++                "ambiguous_component_indices": list(region.ambiguous_component_indices),
+             }
+             for region in result.regions
+         ],
+@@ -163,6 +167,7 @@ def detection_payload(result: DetectionResult) -> dict:
+                     "second_best_score": assignment.second_best_score,
+                     "margin": assignment.margin,
+                     "status": assignment.status,
++                    "candidate_region_indices": list(assignment.candidate_region_indices),
+                 }
+                 for assignment in diagnostics.secondary_mark_assignments
+             ],
+@@ -209,6 +214,7 @@ def _assignment_payload(assignment) -> dict:
+         "second_best_score": assignment.second_best_score,
+         "margin": assignment.margin,
+         "status": assignment.status,
++        "candidate_region_indices": list(assignment.candidate_region_indices),
+     }
+
+
+@@ -220,6 +226,9 @@ def _region_hypothesis_payload(region: RegionHypothesis) -> dict:
+         "area": int(region.mask.sum()),
+         "mask_runs": _mask_runs(region.mask),
+         "component_indices": list(region.component_indices),
++        "primary_component_indices": list(region.primary_component_indices),
++        "secondary_component_indices": list(region.secondary_component_indices),
++        "ambiguous_component_indices": list(region.ambiguous_component_indices),
+         "body_count": region.body_count,
+         "frame": {
+             "row_index": region.frame.row_index,
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index dc1c00e..1c8d90f 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -12,6 +12,15 @@ MaskMethod = Literal["grayscale", "dark", "color", "hybrid", "adaptive"]
+ MaskMode = Literal["auto", "grayscale", "dark", "color", "hybrid", "adaptive"]
+ ExpectedCountScope = Literal["row", "page"]
+ DetectionStatus = Literal["ok", "ambiguous", "failed"]
++ComponentRole = Literal[
++    "primary",
++    "secondary-candidate",
++    "secondary",
++    "noise",
++    "artifact",
++    "ambiguous",
++]
++
+
+ IsolationReason = Literal[
+     "nearest-to-center",
+@@ -182,6 +191,7 @@ class ComponentDecision:
+     area: int
+     action: Literal["kept", "removed"]
+     reason: str | None = None
++    role: ComponentRole = "primary"
+
+
+ @dataclass(frozen=True)
+@@ -207,7 +217,7 @@ class PartitionBoundary:
+
+ @dataclass(frozen=True)
+ class CleanupConfig:
+-    """Thresholds controlling border, rule, and tiny-component cleanup."""
++    """Thresholds for artifact removal and provisional tiny-component classification."""
+
+     tiny_area_ratio: float = 0.008
+     rule_aspect_ratio: float = 12.0
+@@ -698,6 +708,7 @@ class SecondaryMarkAssignment:
+     second_best_score: float | None
+     margin: float | None
+     status: Literal["assigned", "ambiguous", "unassigned"]
++    candidate_region_indices: tuple[int, ...] = ()
+
+     def __post_init__(self) -> None:
+         if (
+@@ -721,6 +732,13 @@ class SecondaryMarkAssignment:
+             raise ValueError("assigned marks must name a target region")
+         if self.status != "assigned" and self.target_region_index is not None:
+             raise ValueError("unassigned or ambiguous marks cannot name a target region")
++        candidate_indices = tuple(self.candidate_region_indices)
++        if any(
++            isinstance(index, bool) or not isinstance(index, int) or index < 0
++            for index in candidate_indices
++        ):
++            raise ValueError("candidate region indexes must be nonnegative integers")
++        object.__setattr__(self, "candidate_region_indices", candidate_indices)
+
+
+ @dataclass(frozen=True)
+@@ -737,9 +755,19 @@ class Region:
+
+     image: Image.Image = field(repr=False, compare=False)
+     mask: np.ndarray = field(repr=False, compare=False)
++    primary_component_indices: tuple[int, ...] = ()
++    secondary_component_indices: tuple[int, ...] = ()
++    ambiguous_component_indices: tuple[int, ...] = ()
+
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "component_indices", tuple(self.component_indices))
++        object.__setattr__(self, "primary_component_indices", tuple(self.primary_component_indices))
++        object.__setattr__(
++            self, "secondary_component_indices", tuple(self.secondary_component_indices)
++        )
++        object.__setattr__(
++            self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
++        )
+         if not 0.0 <= self.confidence <= 1.0:
+             raise ValueError("region confidence must be between zero and one")
+         mask = np.asarray(self.mask, dtype=bool)
+@@ -849,6 +877,9 @@ class RegionHypothesis:
+     cut_crossing_cost: float = 0.0
+
+     body_count: int = 0
++    primary_component_indices: tuple[int, ...] = ()
++    secondary_component_indices: tuple[int, ...] = ()
++    ambiguous_component_indices: tuple[int, ...] = ()
+
+     def __post_init__(self) -> None:
+         mask = np.asarray(self.mask, dtype=bool)
+@@ -871,6 +902,13 @@ class RegionHypothesis:
+         object.__setattr__(self, "mask", snapshot)
+         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+         object.__setattr__(self, "warnings", tuple(self.warnings))
++        object.__setattr__(self, "primary_component_indices", tuple(self.primary_component_indices))
++        object.__setattr__(
++            self, "secondary_component_indices", tuple(self.secondary_component_indices)
++        )
++        object.__setattr__(
++            self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
++        )
+
+
+ @dataclass(frozen=True)
+@@ -901,7 +939,7 @@ class RowPartitionHypothesis:
+         regions = tuple(self.regions)
+         if (
+             len(regions) != self.count
+-            or (bool(boundaries) and len(boundaries) != self.count + 1)
++            or len(boundaries) != self.count + 1
+             or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
+         ):
+             raise ValueError("row hypothesis count and boundaries must match its regions")
+diff --git a/tests/test_context_aware_cleanup.py b/tests/test_context_aware_cleanup.py
+new file mode 100644
+index 0000000..42b3141
+--- /dev/null
++++ b/tests/test_context_aware_cleanup.py
+@@ -0,0 +1,176 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from PIL import Image, ImageDraw
++
++from rasterregions import (
++    DetectionConfig,
++    SpacingConfig,
++    detect_spaced_region_hypotheses,
++    detect_spaced_regions,
++)
++
++
++def _single_body_with_mark(mark_box: tuple[int, int, int, int]) -> Image.Image:
++    image = Image.new("RGB", (100, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((25, 30, 49, 59), fill="black")
++    draw.rectangle(mark_box, fill="black")
++    return image
++
++
++def _assert_page_ownership(clean_mask: np.ndarray, page) -> None:
++    owned = np.zeros(clean_mask.shape, dtype=bool)
++    for region in page.regions:
++        local = owned[region.bbox.y0 : region.bbox.y1, region.bbox.x0 : region.bbox.x1]
++        assert not np.any(local & region.mask)
++        local |= region.mask
++    assert not np.any(owned & page.unassigned_mask)
++    assert np.array_equal(owned | page.unassigned_mask, clean_mask)
++
++
++@pytest.mark.parametrize(
++    ("mark_box", "mark_pixels"),
++    [((37, 20, 37, 20), ((20, 37),)), ((36, 19, 37, 20), ((19, 36), (19, 37), (20, 36), (20, 37)))],
++)
++def test_one_to_four_pixel_dot_above_body_is_retained_as_secondary(
++    mark_box: tuple[int, int, int, int], mark_pixels: tuple[tuple[int, int], ...]
++) -> None:
++    result = detect_spaced_regions(_single_body_with_mark(mark_box), mode="dark")
++
++    assert len(result.regions) == 1
++    for y, x in mark_pixels:
++        assert result.clean_mask[y, x]
++    mark = next(
++        decision for decision in result.component_decisions if decision.bbox.x0 == mark_box[0]
++    )
++    assert mark.action == "kept"
++    assert mark.component_index in result.regions[0].component_indices
++
++    assert mark.role == "secondary"
++    body = next(
++        decision
++        for decision in result.component_decisions
++        if decision.component_index != mark.component_index
++    )
++    assert body.role == "primary"
++    assert mark.component_index in result.regions[0].secondary_component_indices
++    assert body.component_index in result.regions[0].primary_component_indices
++
++
++def test_two_tiny_dots_above_one_body_remain_distinct_secondary_components() -> None:
++    image = Image.new("RGB", (100, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((25, 30, 49, 59), fill="black")
++    draw.point((32, 20), fill="black")
++    draw.point((42, 20), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark")
++
++    assert len(result.regions) == 1
++    marks = [decision for decision in result.component_decisions if decision.bbox.y0 == 20]
++    assert len(marks) == 2
++    assert all(mark.action == "kept" for mark in marks)
++    assert {mark.component_index for mark in marks}.issubset(result.regions[0].component_indices)
++
++
++def test_tiny_far_away_speck_is_removed_with_stable_raw_component_id() -> None:
++    image = _single_body_with_mark((3, 3, 3, 3))
++
++    result = detect_spaced_regions(image, mode="dark")
++
++    speck = next(decision for decision in result.component_decisions if decision.bbox.x0 == 3)
++    assert speck.component_index == 0
++    assert speck.action == "removed"
++    assert speck.role == "noise"
++    assert speck.reason is not None
++    assert not result.clean_mask[3, 3]
++
++
++def test_tiny_suspicious_side_speck_is_retained_unassigned() -> None:
++    result = detect_spaced_regions(_single_body_with_mark((52, 42, 52, 42)), mode="dark")
++
++    assert result.clean_mask[42, 52]
++    assert result.unassigned_mask[42, 52]
++    mark_index = next(
++        decision.component_index
++        for decision in result.component_decisions
++        if decision.bbox.x0 == 52
++    )
++    mark = next(
++        decision
++        for decision in result.component_decisions
++        if decision.component_index == mark_index
++    )
++    assert mark.role == "secondary-candidate"
++    assert all(mark_index not in region.component_indices for region in result.regions)
++
++
++def test_tiny_ambiguous_dot_between_neighboring_bodies_stays_unassigned() -> None:
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 38, 55), fill="black")
++    draw.rectangle((75, 25, 98, 55), fill="black")
++    draw.rectangle((52, 12, 53, 13), fill="black")
++    config = DetectionConfig(spacing=SpacingConfig(mark_assignment_margin=0.99))
++
++    result = detect_spaced_regions(image, mode="dark", config=config)
++
++    assert result.clean_mask[12:14, 52:54].all()
++    assignment = next(
++        item for item in result.diagnostics.secondary_mark_assignments if item.component_index == 0
++    )
++    assert assignment.status == "ambiguous"
++    assert assignment.target_region_index is None
++    assert assignment.candidate_region_indices == (0, 1)
++    mark = next(
++        decision
++        for decision in result.component_decisions
++        if decision.component_index == assignment.component_index
++    )
++    assert mark.role == "ambiguous"
++    assert all(
++        assignment.component_index in region.ambiguous_component_indices
++        for region in result.regions
++    )
++    assert result.unassigned_mask[12:14, 52:54].all()
++
++
++def test_secondary_only_partition_cell_does_not_leave_stale_boundaries() -> None:
++    image = Image.new("RGB", (130, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 38, 55), fill="black")
++    draw.rectangle((75, 25, 98, 55), fill="black")
++    draw.rectangle((52, 12, 54, 14), fill="black")
++    config = DetectionConfig(spacing=SpacingConfig(mark_assignment_margin=0.99))
++
++    result = detect_spaced_region_hypotheses(image, mode="dark", row_counts=[3], config=config)
++
++    assert result.selected.status == "failed"
++    assert result.selected.regions == ()
++    assert np.array_equal(result.selected.unassigned_mask, result.selected.clean_mask)
++    for page in result.page_hypotheses:
++        _assert_page_ownership(result.selected.clean_mask, page)
++        for row in page.row_hypotheses:
++            assert row.count == len(row.regions)
++            assert len(row.boundaries) == len(row.regions) + 1
++
++
++def test_mixed_size_rows_keep_tiny_marks_without_adding_body_regions() -> None:
++    image = Image.new("RGB", (180, 140), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((20, 18, 44, 55), fill="black")
++    draw.rectangle((100, 15, 125, 55), fill="black")
++    draw.rectangle((20, 85, 36, 108), fill="black")
++    draw.rectangle((100, 82, 119, 108), fill="black")
++    draw.point((31, 8), fill="black")
++    draw.point((28, 77), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark", row_counts=[2, 2])
++
++    assert len(result.rows) == 2
++    assert len(result.regions) == 4
++    assert result.clean_mask[8, 31]
++    assert result.clean_mask[77, 28]
++    assert sorted(region.row_index for region in result.regions) == [0, 0, 1, 1]
+diff --git a/tests/test_io.py b/tests/test_io.py
+index eb54e93..6d8c43a 100644
+--- a/tests/test_io.py
++++ b/tests/test_io.py
+@@ -72,6 +72,7 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
+     assert payload["parameters"]["expected_count_scope"] == "row"
+     assert payload["mask"]["threshold"] is not None
+     assert payload["cleanup"][0]["action"] == "kept"
++    assert payload["cleanup"][0]["role"] == "primary"
+     assert payload["rows"]
+     assert len(payload["partition_boundaries"]) == 2
+     assert payload["detected_count"] == 3
+@@ -94,6 +95,9 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
+         "bbox",
+         "confidence",
+         "component_indices",
++        "primary_component_indices",
++        "secondary_component_indices",
++        "ambiguous_component_indices",
+     } <= payload["regions"][0].keys()
+
+
+@@ -212,6 +216,23 @@ def test_spacing_diagnostics_are_serialized() -> None:
+     assert payload["spacing"]["rows"][0]["attempted_counts"] == []
+
+
++def test_spacing_payload_exposes_secondary_component_ownership() -> None:
++    image = Image.new("RGB", (100, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((25, 30, 49, 59), fill="black")
++    draw.point((37, 20), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark")
++    payload = detection_payload(result)
++    mark = next(decision for decision in result.component_decisions if decision.area == 1)
++
++    assert payload["cleanup"][mark.component_index]["role"] == "secondary"
++    region = payload["regions"][0]
++    assert mark.component_index in region["secondary_component_indices"]
++    assert region["primary_component_indices"]
++    assert payload["spacing"]["secondary_mark_assignments"][0]["candidate_region_indices"] == []
++
++
+ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
+     image = Image.new("RGB", (100, 80), "white")
+     draw = ImageDraw.Draw(image)
+@@ -227,6 +248,8 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path)
+     assert payload["page_hypotheses"][0]["count"] == 2
+     assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
+     assert (tmp_path / "cleaned_mask.png").is_file()
++    page_region = payload["page_hypotheses"][0]["rows"][0]["regions"][0]
++    assert page_region["primary_component_indices"]
+     assert (tmp_path / "candidate_cuts.png").is_file()
+     assert (tmp_path / "selected_partition.png").is_file()
+     assert (tmp_path / "alternative_partition_2.png").is_file()
+diff --git a/tests/test_models.py b/tests/test_models.py
+index 6f74e58..26fe48d 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -103,6 +103,10 @@ def test_frozen_models_normalize_sequence_fields() -> None:
+     assert isinstance(result.component_decisions, tuple)
+     assert isinstance(result.rows[0].component_indices, tuple)
+     assert isinstance(result.regions[0].component_indices, tuple)
++    assert isinstance(result.regions[0].primary_component_indices, tuple)
++    assert isinstance(result.regions[0].secondary_component_indices, tuple)
++    assert isinstance(result.regions[0].ambiguous_component_indices, tuple)
++    assert result.component_decisions[0].role == "primary"
+     assert isinstance(diagnostics.component_decisions, tuple)
+     assert isinstance(isolation.candidates, tuple)
+
+@@ -149,7 +153,9 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
+         alternative_cost_margin=0.3,
+         warnings=["one valley is weak"],
+     )
+-    assignment = SecondaryMarkAssignment(3, None, 0.2, 0.18, 0.02, "ambiguous")
++    assignment = SecondaryMarkAssignment(
++        3, None, 0.2, 0.18, 0.02, "ambiguous", candidate_region_indices=[1, 0]
++    )
+
+     assert config.width_prior_ratio == 1.25
+     assert row.component_indices == (1, 2)
+@@ -162,6 +168,7 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
+     assert row.split_anchor_indices == (1,)
+     assert row.merged_anchor_groups == ((0, 1),)
+     assert assignment.status == "ambiguous"
++    assert assignment.candidate_region_indices == (1, 0)
+     with pytest.raises(ValueError, match="positive integer"):
+         SpacingConfig(max_inferred_count=True)
+     with pytest.raises(ValueError, match="positive integers"):
+diff --git a/tests/test_region_frames.py b/tests/test_region_frames.py
+index 53463e9..a3dd4a6 100644
+--- a/tests/test_region_frames.py
++++ b/tests/test_region_frames.py
+@@ -74,6 +74,22 @@ def test_row_and_page_hypotheses_keep_count_and_geometry_evidence() -> None:
+         PagePartitionHypothesis((row,), 3, 0.5, 0.0)
+
+
++def test_row_hypothesis_requires_a_boundary_for_each_region() -> None:
++    frame = RegionFrame(baseline_y=20.0, body_height=12.0, row_center_y=14.0, row_index=0)
++    region = _region(0, 4, frame)
++
++    with pytest.raises(ValueError, match="count and boundaries"):
++        RowPartitionHypothesis(
++            row_index=0,
++            count=1,
++            boundaries=(),
++            regions=(region,),
++            cost=0.5,
++            unassigned_ink_fraction=0.0,
++            secondary_mark_assignments=(),
++        )
++
++
+ def test_spacing_search_limits_are_positive_integers() -> None:
+     for field in (
+         "hypothesis_limit",
