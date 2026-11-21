@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from ._cleanup import clean_page_mask
+from ._cleanup import CleanedPage, clean_page_mask
 from ._grouping import (
     _assign_spacing_marks,
     _automatic_regions,
@@ -27,6 +27,7 @@ from ._partition import (
     _row_partition_regions,
 )
 from ._rows import (
+    SpacingRowLayout,
     _rows_from_components,
     _spacing_rows_from_components,
     detect_rows,
@@ -134,6 +135,50 @@ def _translate_roi_result(
         component_decisions=decisions,
         expected_count_scope=result.expected_count_scope,
         diagnostics=diagnostics,
+    )
+
+
+def _remove_unassigned_provisional_components(
+    cleaned: CleanedPage,
+    layout: SpacingRowLayout,
+) -> CleanedPage:
+    noise_indices = set(layout.unassigned_component_indices) & set(
+        cleaned.provisional_component_indices
+    )
+    if not noise_indices:
+        return cleaned
+
+    clean_mask = cleaned.mask.copy()
+    retained_components: list[Component] = []
+    for component in cleaned.components:
+        if component.index in noise_indices:
+            clean_mask[component.ys, component.xs] = False
+        else:
+            retained_components.append(component)
+    decisions = tuple(
+        replace(
+            decision,
+            action="removed",
+            reason="tiny component with no plausible body target",
+            role="noise",
+        )
+        if decision.component_index in noise_indices
+        else decision
+        for decision in cleaned.component_decisions
+    )
+    warnings = (
+        *cleaned.warnings,
+        *(f"Removed component {index}: tiny isolated noise." for index in sorted(noise_indices)),
+    )
+    return replace(
+        cleaned,
+        mask=clean_mask,
+        components=tuple(retained_components),
+        warnings=warnings,
+        component_decisions=decisions,
+        provisional_component_indices=tuple(
+            index for index in cleaned.provisional_component_indices if index not in noise_indices
+        ),
     )
 
 
@@ -509,12 +554,22 @@ def detect_spaced_regions(
     image = normalized.image
     mask_result = foreground_mask(normalized, mode=mode, config=config.mask)
     cleaned = clean_page_mask(mask_result.mask, config.cleanup)
+    provisional_ids = set(cleaned.provisional_component_indices)
+    primary_components = tuple(
+        component for component in cleaned.components if component.index not in provisional_ids
+    )
     layout = _spacing_rows_from_components(
         cleaned.components,
         config.grouping,
         config.spacing,
         cleaned.mask.shape,
+        primary_components=primary_components,
     )
+    row_assignment_by_index = {
+        component.index: layout.component_row_assignments[index]
+        for index, component in enumerate(cleaned.components)
+    }
+    cleaned = _remove_unassigned_provisional_components(cleaned, layout)
     rows = layout.rows
     if row_counts is None:
         requested: tuple[int | None, ...] = (None,) * len(rows)
@@ -533,13 +588,14 @@ def detect_spaced_regions(
         ):
             raise ValueError("row counts must be positive integers or None")
 
-    body_components = _spacing_body_components(cleaned.components)
-    body_ids = {component.index for component in body_components}
     component_by_index = {component.index: component for component in cleaned.components}
-    assignment_by_index = {
-        component.index: layout.component_row_assignments[index]
-        for index, component in enumerate(cleaned.components)
+    body_ids = {
+        component_index
+        for row_component_indices in layout.body_component_indices
+        for component_index in row_component_indices
     }
+    body_components = [component_by_index[index] for index in sorted(body_ids)]
+    assignment_by_index = row_assignment_by_index
     ambiguous_row_ids = {
         component_index
         for indices in layout.ambiguous_component_indices
@@ -572,7 +628,11 @@ def detect_spaced_regions(
             partition = _row_partition_regions(
                 image,
                 cleaned.mask,
-                row_components or cleaned.components,
+                tuple(
+                    component
+                    for component in cleaned.components
+                    if component.index in layout.body_component_indices[row_index]
+                ),
                 row,
                 row_index,
                 cleaned.median_height,
@@ -949,6 +1009,9 @@ def detect_spaced_regions(
             body_groups,
             body_height,
             config.spacing,
+            region_scales=tuple(
+                row_diagnostics[region.row_index].body_height for region in regions
+            ),
         )
         if regions
         else ((), ())
@@ -959,7 +1022,31 @@ def detect_spaced_regions(
         if component.index in body_ids:
             continue
         if component.index in ambiguous_row_ids:
-            decision = SecondaryMarkAssignment(component.index, None, None, None, None, "ambiguous")
+            candidate_scores = [
+                (score, region_index)
+                for region_index, bodies in enumerate(body_groups)
+                if (
+                    score := _spacing_attachment_score(
+                        component,
+                        bodies,
+                        row_diagnostics[regions[region_index].row_index].body_height,
+                    )
+                )
+                is not None
+                and score <= 2.5
+            ]
+            candidate_scores.sort()
+            decision = SecondaryMarkAssignment(
+                component.index,
+                None,
+                None,
+                None,
+                None,
+                "ambiguous",
+                candidate_region_indices=tuple(
+                    region_index for _, region_index in candidate_scores[:2]
+                ),
+            )
         elif component.index in unassigned_row_ids:
             decision = SecondaryMarkAssignment(
                 component.index, None, None, None, None, "unassigned"
@@ -971,6 +1058,40 @@ def detect_spaced_regions(
             )
         secondary_assignments.append(decision)
     secondary_assignments.sort(key=lambda item: item.component_index)
+    role_by_index = {component_index: "primary" for component_index in body_ids}
+    role_by_index.update(
+        {
+            assignment.component_index: (
+                "secondary"
+                if assignment.status == "assigned"
+                else "ambiguous"
+                if assignment.status == "ambiguous"
+                else "secondary-candidate"
+            )
+            for assignment in secondary_assignments
+        }
+    )
+    cleaned = replace(
+        cleaned,
+        component_decisions=tuple(
+            replace(
+                decision,
+                role=role_by_index.get(decision.component_index, decision.role),
+            )
+            for decision in cleaned.component_decisions
+        ),
+    )
+    ambiguous_components_by_region = {
+        region_index: tuple(
+            sorted(
+                assignment.component_index
+                for assignment in secondary_assignments
+                if assignment.status == "ambiguous"
+                and region_index in assignment.candidate_region_indices
+            )
+        )
+        for region_index in range(len(regions))
+    }
 
     region_masks: list[np.ndarray] = []
     for region in regions:
@@ -1022,6 +1143,24 @@ def detect_spaced_regions(
         )
         owned_mask |= full_mask
 
+    region_index_by_id = {region.region_id: index for index, region in enumerate(regions)}
+    owned_regions = [
+        replace(
+            region,
+            primary_component_indices=tuple(
+                index for index in region.component_indices if role_by_index.get(index) == "primary"
+            ),
+            secondary_component_indices=tuple(
+                index
+                for index in region.component_indices
+                if role_by_index.get(index) == "secondary"
+            ),
+            ambiguous_component_indices=ambiguous_components_by_region[
+                region_index_by_id[region.region_id]
+            ],
+        )
+        for region in owned_regions
+    ]
     unassigned_mask = cleaned.mask & ~owned_mask
     unassigned_fraction = float(unassigned_mask.sum() / max(1, cleaned.mask.sum()))
     ambiguous_marks = {
@@ -1204,6 +1343,9 @@ def _selected_page_hypothesis(
                 bbox=region.bbox,
                 mask=region.mask,
                 component_indices=region.component_indices,
+                primary_component_indices=region.primary_component_indices,
+                secondary_component_indices=region.secondary_component_indices,
+                ambiguous_component_indices=region.ambiguous_component_indices,
                 frame=frame,
                 cost=row_diagnostic.cost if row_diagnostic else 0.0,
                 confidence=region.confidence,
@@ -1276,7 +1418,11 @@ def _row_hypothesis_from_partition(
     region_offset: int,
 ) -> RowPartitionHypothesis:
     frame = _region_frame(result, row_index)
-    body_ids = {component.index for component in _spacing_body_components(result.components)}
+    body_ids = {
+        decision.component_index
+        for decision in result.component_decisions
+        if decision.role == "primary"
+    }
     regions = tuple(
         RegionHypothesis(
             bbox=region.bbox,
@@ -1288,6 +1434,12 @@ def _row_hypothesis_from_partition(
             warnings=(),
             cut_crossing_cost=(partition.cut_crossing_cost / max(1, len(partition.regions))),
             body_count=sum(index in body_ids for index in region.component_indices),
+            primary_component_indices=tuple(
+                index for index in region.component_indices if index in body_ids
+            ),
+            secondary_component_indices=tuple(
+                index for index in region.component_indices if index not in body_ids
+            ),
         )
         for region in partition.regions
     )
@@ -1319,7 +1471,7 @@ def _row_hypothesis_from_partition(
     return RowPartitionHypothesis(
         row_index=row_index,
         count=len(regions),
-        boundaries=partition.cut_positions,
+        boundaries=_row_boundary_positions(result.rows[row_index], partition.regions, partition),
         regions=regions,
         cost=partition.cost,
         unassigned_ink_fraction=0.0,
@@ -1344,11 +1496,13 @@ def _page_hypotheses_for_partitions(
     if not region_specs:
         return (), False
     shape = result.clean_mask.shape
-    body_components = _spacing_body_components(result.components)
-    body_ids = {component.index for component in body_components}
+    body_ids = {
+        component_index
+        for _, _, region in region_specs
+        for component_index in region.component_indices
+    }
+    body_components = [component for component in result.components if component.index in body_ids]
     secondary = [component for component in result.components if component.index not in body_ids]
-    secondary_ids = {component.index for component in secondary}
-    body_ids = {component.index for component in result.components} - secondary_ids
     base_masks: list[np.ndarray] = []
     body_groups: list[tuple[Component, ...]] = []
     for _, _, region in region_specs:
@@ -1377,16 +1531,13 @@ def _page_hypotheses_for_partitions(
             float | None,
             float | None,
             float | None,
+            tuple[int, ...],
             tuple[tuple[int | None, float], ...],
         ]
     ] = []
     body_height = (
-        float(
-            np.median(
-                [component.height for component in result.components if component.index in body_ids]
-            )
-        )
-        if body_ids
+        float(np.median([component.height for component in body_components]))
+        if body_components
         else 1.0
     )
     for component in sorted(secondary, key=lambda item: item.index):
@@ -1395,7 +1546,12 @@ def _page_hypotheses_for_partitions(
         for region_index, (target_row, _, _) in enumerate(region_specs):
             if row_index is not None and target_row != row_index:
                 continue
-            score = _spacing_attachment_score(component, body_groups[region_index], body_height)
+            row_scale = (
+                result.diagnostics.row_segmentation[target_row].body_height
+                if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
+                else body_height
+            )
+            score = _spacing_attachment_score(component, body_groups[region_index], row_scale)
             if score is not None:
                 scored.append((score, region_index))
         scored.sort(key=lambda item: (item[0], item[1]))
@@ -1406,6 +1562,11 @@ def _page_hypotheses_for_partitions(
             if best_score is not None and second_score is not None
             else None
         )
+        candidate_region_indices = (
+            tuple(target for _, target in scored[:2])
+            if margin is not None and margin < config.spacing.mark_assignment_margin
+            else ()
+        )
         if best_score is None:
             choices: tuple[tuple[int | None, float], ...] = ((None, 0.0),)
         else:
@@ -1415,11 +1576,20 @@ def _page_hypotheses_for_partitions(
                 else scored[:1]
             )
             choices = tuple((target, score) for score, target in eligible) + ((None, 2.5),)
-        mark_options.append((component, best_score, second_score, margin, choices))
+        mark_options.append(
+            (
+                component,
+                best_score,
+                second_score,
+                margin,
+                candidate_region_indices,
+                choices,
+            )
+        )
 
     branches: list[tuple[float, tuple[int | None, ...]]] = [(0.0, ())]
     branches_truncated = False
-    for _, _, _, _, choices in mark_options:
+    for _, _, _, _, _, choices in mark_options:
         expanded = [
             (cost + choice_cost, (*selected, target))
             for cost, selected in branches
@@ -1443,7 +1613,14 @@ def _page_hypotheses_for_partitions(
             mask &= ~owned
             owned |= mask
         assignments: list[SecondaryMarkAssignment] = []
-        for (component, best, second, margin, _), target in zip(mark_options, targets, strict=True):
+        for (
+            component,
+            best,
+            second,
+            margin,
+            candidate_region_indices,
+            _,
+        ), target in zip(mark_options, targets, strict=True):
             if target is None:
                 assignments.append(
                     SecondaryMarkAssignment(
@@ -1453,6 +1630,7 @@ def _page_hypotheses_for_partitions(
                         second,
                         margin,
                         "unassigned",
+                        candidate_region_indices=candidate_region_indices,
                     )
                 )
                 continue
@@ -1461,11 +1639,21 @@ def _page_hypotheses_for_partitions(
             masks[target][ys, xs] = True
             owned[ys, xs] = True
             assignments.append(
-                SecondaryMarkAssignment(component.index, target, best, second, margin, "assigned")
+                SecondaryMarkAssignment(
+                    component.index,
+                    target,
+                    best,
+                    second,
+                    margin,
+                    "assigned",
+                    candidate_region_indices=candidate_region_indices,
+                )
             )
         unassigned = result.clean_mask & ~owned
         row_region_hypotheses: dict[int, list[RegionHypothesis]] = {}
-        for (row_index, row_partition, _), mask in zip(region_specs, masks, strict=True):
+        for region_spec_index, ((row_index, row_partition, _), mask) in enumerate(
+            zip(region_specs, masks, strict=True)
+        ):
             ys, xs = np.nonzero(mask)
             if not len(xs):
                 continue
@@ -1488,6 +1676,17 @@ def _page_hypotheses_for_partitions(
                     row_partition.cut_crossing_cost / max(1, len(row_partition.regions))
                 ),
                 body_count=sum(index in body_ids for index in component_indices),
+                primary_component_indices=tuple(
+                    index for index in component_indices if index in body_ids
+                ),
+                secondary_component_indices=tuple(
+                    index for index in component_indices if index not in body_ids
+                ),
+                ambiguous_component_indices=tuple(
+                    component.index
+                    for component, _, _, _, candidates, _ in mark_options
+                    if region_spec_index in candidates
+                ),
             )
             row_region_hypotheses.setdefault(row_index, []).append(hypothesis)
 
@@ -1497,6 +1696,17 @@ def _page_hypotheses_for_partitions(
             if not current_regions:
                 continue
             row = result.rows[row_index]
+            boundaries = partition.cut_positions
+            if len(boundaries) != len(current_regions) + 1:
+                left = boundaries[0] if boundaries else row.bbox.x0
+                right = boundaries[-1] if boundaries else row.bbox.x1
+                internal = tuple(
+                    (left_region.bbox.x1 + right_region.bbox.x0) // 2
+                    for left_region, right_region in zip(
+                        current_regions, current_regions[1:], strict=False
+                    )
+                )
+                boundaries = (left, *internal, right)
             row_unassigned = unassigned[row.bbox.y0 : row.bbox.y1]
             row_foreground = result.clean_mask[row.bbox.y0 : row.bbox.y1]
             row_assignments = tuple(
@@ -1508,7 +1718,7 @@ def _page_hypotheses_for_partitions(
                 RowPartitionHypothesis(
                     row_index=row_index,
                     count=len(current_regions),
-                    boundaries=partition.cut_positions,
+                    boundaries=boundaries,
                     regions=current_regions,
                     cost=partition.cost,
                     unassigned_ink_fraction=float(

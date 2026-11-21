@@ -11,12 +11,16 @@ from .models import CleanupConfig, Component, ComponentDecision
 
 @dataclass(frozen=True)
 class CleanedPage:
+    """Retained mask after hard artifact removal and before contextual disposition."""
+
     mask: np.ndarray
     components: tuple[Component, ...]
     primary_area: float
     median_height: float
     warnings: tuple[str, ...]
     component_decisions: tuple[ComponentDecision, ...]
+
+    provisional_component_indices: tuple[int, ...] = ()
 
 
 def _is_page_artifact(
@@ -74,11 +78,24 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
             ("No foreground components were detected.",),
             (),
         )
+
     artifacts = {
         component.index: _is_page_artifact(component, width, height, config) for component in found
     }
     non_artifacts = [component for component in found if not artifacts[component.index]]
-    primary_area, _ = _size_scale(non_artifacts)
+    provisional_scale, _ = _size_scale(non_artifacts)
+    provisional_threshold = provisional_scale * config.tiny_area_ratio
+    provisional = tuple(
+        component for component in non_artifacts if component.area < provisional_threshold
+    )
+    provisional_ids = {component.index for component in provisional}
+    primary_candidates = [
+        component for component in non_artifacts if component.index not in provisional_ids
+    ]
+    if not primary_candidates and non_artifacts:
+        primary_candidates = [max(non_artifacts, key=lambda component: component.area)]
+    primary_area, median_height = _size_scale(primary_candidates)
+
     cleaned = np.array(mask, dtype=bool, copy=True)
     warnings: list[str] = []
     decisions: list[ComponentDecision] = []
@@ -87,11 +104,11 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
         reason = None
         if artifacts[component.index]:
             reason = "page border, rule, or oversized artifact"
-        elif primary_area and component.area < primary_area * config.tiny_area_ratio:
-            reason = "tiny isolated noise"
-        if reason:
             cleaned[component.ys, component.xs] = False
             warnings.append(f"Removed component {component.index}: {reason}.")
+        elif component.index in provisional_ids:
+            reason = "provisional small component retained for contextual assignment"
+            kept_components.append(component)
         else:
             kept_components.append(component)
         decisions.append(
@@ -99,17 +116,24 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
                 component.index,
                 component.bbox,
                 component.area,
-                "removed" if reason else "kept",
+                "removed" if artifacts[component.index] else "kept",
                 reason,
+                role=(
+                    "artifact"
+                    if artifacts[component.index]
+                    else "secondary-candidate"
+                    if component.index in provisional_ids
+                    else "primary"
+                ),
             )
         )
-    kept = tuple(kept_components)
-    primary_area, median_height = _size_scale(kept)
+
     return CleanedPage(
         cleaned,
-        kept,
+        tuple(kept_components),
         primary_area,
         median_height,
         tuple(warnings),
         tuple(decisions),
+        tuple(component.index for component in provisional),
     )

@@ -103,11 +103,15 @@ def _spacing_rows_from_components(
     grouping: GroupingConfig,
     spacing: SpacingConfig,
     page_shape: tuple[int, int],
+    primary_components: tuple[Component, ...] | None = None,
 ) -> SpacingRowLayout:
     """Cluster primary-body centers, then assign satellites once or retain ambiguity."""
     if not found:
         return SpacingRowLayout((), (), (), (), ())
-    bodies = _spacing_body_components(found)
+    body_candidates = primary_components if primary_components is not None else found
+    bodies = _spacing_body_components(body_candidates)
+    if not bodies:
+        bodies = _spacing_body_components(found)
     ordered = sorted(bodies, key=lambda component: (component.center_y, component.index))
     body_scale = float(np.median([component.height for component in ordered]))
     rows_of_bodies: list[list[Component]] = []
@@ -128,6 +132,10 @@ def _spacing_rows_from_components(
         else:
             rows_of_bodies[-1].append(component)
 
+    row_scales = [
+        float(np.median([component.height for component in row])) or body_scale
+        for row in rows_of_bodies
+    ]
     body_ids = {component.index for component in bodies}
     row_members = [list(row) for row in rows_of_bodies]
     ambiguous: list[list[int]] = [[] for _ in rows_of_bodies]
@@ -140,10 +148,37 @@ def _spacing_rows_from_components(
     for component in found:
         if component.index in body_ids:
             continue
+        if component.area <= 4:
+            nearby_bodies = [
+                (score, body)
+                for row_index, row in enumerate(rows_of_bodies)
+                for body in row
+                if (
+                    score := _spacing_attachment_score(
+                        component, (body,), row_scales[row_index] or body_scale
+                    )
+                )
+                is not None
+                and score <= 2.5
+            ]
+            if len(nearby_bodies) == 1:
+                target = nearby_bodies[0][1]
+                diagonal = (
+                    component.bbox.x1 <= target.bbox.x0 or component.bbox.x0 >= target.bbox.x1
+                ) and (component.bbox.y1 <= target.bbox.y0 or component.bbox.y0 >= target.bbox.y1)
+                if diagonal:
+                    unassigned.append(component.index)
+                    component_rows[component.index] = None
+                    continue
         scores = [
             (score, row_index)
             for row_index, row in enumerate(rows_of_bodies)
-            if (score := _spacing_attachment_score(component, row, body_scale)) is not None
+            if (
+                score := _spacing_attachment_score(
+                    component, row, row_scales[row_index] or body_scale
+                )
+            )
+            is not None
         ]
         scores.sort()
         if not scores or scores[0][0] > 2.5:

@@ -59,6 +59,7 @@ def detection_payload(result: DetectionResult) -> dict:
                 "component_index": decision.component_index,
                 "bbox": list(decision.bbox.as_tuple()),
                 "area": decision.area,
+                "role": decision.role,
                 "action": decision.action,
                 "reason": decision.reason,
             }
@@ -91,6 +92,9 @@ def detection_payload(result: DetectionResult) -> dict:
                 "bbox": list(region.bbox.as_tuple()),
                 "confidence": round(region.confidence, 4),
                 "component_indices": list(region.component_indices),
+                "primary_component_indices": list(region.primary_component_indices),
+                "secondary_component_indices": list(region.secondary_component_indices),
+                "ambiguous_component_indices": list(region.ambiguous_component_indices),
             }
             for region in result.regions
         ],
@@ -163,6 +167,7 @@ def detection_payload(result: DetectionResult) -> dict:
                     "second_best_score": assignment.second_best_score,
                     "margin": assignment.margin,
                     "status": assignment.status,
+                    "candidate_region_indices": list(assignment.candidate_region_indices),
                 }
                 for assignment in diagnostics.secondary_mark_assignments
             ],
@@ -209,6 +214,7 @@ def _assignment_payload(assignment) -> dict:
         "second_best_score": assignment.second_best_score,
         "margin": assignment.margin,
         "status": assignment.status,
+        "candidate_region_indices": list(assignment.candidate_region_indices),
     }
 
 
@@ -220,6 +226,9 @@ def _region_hypothesis_payload(region: RegionHypothesis) -> dict:
         "area": int(region.mask.sum()),
         "mask_runs": _mask_runs(region.mask),
         "component_indices": list(region.component_indices),
+        "primary_component_indices": list(region.primary_component_indices),
+        "secondary_component_indices": list(region.secondary_component_indices),
+        "ambiguous_component_indices": list(region.ambiguous_component_indices),
         "body_count": region.body_count,
         "frame": {
             "row_index": region.frame.row_index,

@@ -74,6 +74,22 @@ def test_row_and_page_hypotheses_keep_count_and_geometry_evidence() -> None:
         PagePartitionHypothesis((row,), 3, 0.5, 0.0)
 
 
+def test_row_hypothesis_requires_a_boundary_for_each_region() -> None:
+    frame = RegionFrame(baseline_y=20.0, body_height=12.0, row_center_y=14.0, row_index=0)
+    region = _region(0, 4, frame)
+
+    with pytest.raises(ValueError, match="count and boundaries"):
+        RowPartitionHypothesis(
+            row_index=0,
+            count=1,
+            boundaries=(),
+            regions=(region,),
+            cost=0.5,
+            unassigned_ink_fraction=0.0,
+            secondary_mark_assignments=(),
+        )
+
+
 def test_spacing_search_limits_are_positive_integers() -> None:
     for field in (
         "hypothesis_limit",

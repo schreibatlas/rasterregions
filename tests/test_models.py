@@ -103,6 +103,10 @@ def test_frozen_models_normalize_sequence_fields() -> None:
     assert isinstance(result.component_decisions, tuple)
     assert isinstance(result.rows[0].component_indices, tuple)
     assert isinstance(result.regions[0].component_indices, tuple)
+    assert isinstance(result.regions[0].primary_component_indices, tuple)
+    assert isinstance(result.regions[0].secondary_component_indices, tuple)
+    assert isinstance(result.regions[0].ambiguous_component_indices, tuple)
+    assert result.component_decisions[0].role == "primary"
     assert isinstance(diagnostics.component_decisions, tuple)
     assert isinstance(isolation.candidates, tuple)
 
@@ -149,7 +153,9 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
         alternative_cost_margin=0.3,
         warnings=["one valley is weak"],
     )
-    assignment = SecondaryMarkAssignment(3, None, 0.2, 0.18, 0.02, "ambiguous")
+    assignment = SecondaryMarkAssignment(
+        3, None, 0.2, 0.18, 0.02, "ambiguous", candidate_region_indices=[1, 0]
+    )
 
     assert config.width_prior_ratio == 1.25
     assert row.component_indices == (1, 2)
@@ -162,6 +168,7 @@ def test_spacing_diagnostic_models_validate_and_keep_immutable_sequences() -> No
     assert row.split_anchor_indices == (1,)
     assert row.merged_anchor_groups == ((0, 1),)
     assert assignment.status == "ambiguous"
+    assert assignment.candidate_region_indices == (1, 0)
     with pytest.raises(ValueError, match="positive integer"):
         SpacingConfig(max_inferred_count=True)
     with pytest.raises(ValueError, match="positive integers"):

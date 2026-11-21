@@ -72,6 +72,7 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
     assert payload["parameters"]["expected_count_scope"] == "row"
     assert payload["mask"]["threshold"] is not None
     assert payload["cleanup"][0]["action"] == "kept"
+    assert payload["cleanup"][0]["role"] == "primary"
     assert payload["rows"]
     assert len(payload["partition_boundaries"]) == 2
     assert payload["detected_count"] == 3
@@ -94,6 +95,9 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
         "bbox",
         "confidence",
         "component_indices",
+        "primary_component_indices",
+        "secondary_component_indices",
+        "ambiguous_component_indices",
     } <= payload["regions"][0].keys()
 
 
@@ -212,6 +216,23 @@ def test_spacing_diagnostics_are_serialized() -> None:
     assert payload["spacing"]["rows"][0]["attempted_counts"] == []
 
 
+def test_spacing_payload_exposes_secondary_component_ownership() -> None:
+    image = Image.new("RGB", (100, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((25, 30, 49, 59), fill="black")
+    draw.point((37, 20), fill="black")
+
+    result = detect_spaced_regions(image, mode="dark")
+    payload = detection_payload(result)
+    mark = next(decision for decision in result.component_decisions if decision.area == 1)
+
+    assert payload["cleanup"][mark.component_index]["role"] == "secondary"
+    region = payload["regions"][0]
+    assert mark.component_index in region["secondary_component_indices"]
+    assert region["primary_component_indices"]
+    assert payload["spacing"]["secondary_mark_assignments"][0]["candidate_region_indices"] == []
+
+
 def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
     image = Image.new("RGB", (100, 80), "white")
     draw = ImageDraw.Draw(image)
@@ -227,6 +248,8 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) 
     assert payload["page_hypotheses"][0]["count"] == 2
     assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
     assert (tmp_path / "cleaned_mask.png").is_file()
+    page_region = payload["page_hypotheses"][0]["rows"][0]["regions"][0]
+    assert page_region["primary_component_indices"]
     assert (tmp_path / "candidate_cuts.png").is_file()
     assert (tmp_path / "selected_partition.png").is_file()
     assert (tmp_path / "alternative_partition_2.png").is_file()

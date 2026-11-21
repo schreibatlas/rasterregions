@@ -282,6 +282,17 @@ def _spacing_attachment_score(
     return max(0.0, min(scores)) if scores else None
 
 
+def _is_suspicious_lateral_speck(mark: Component, targets: Sequence[Component]) -> bool:
+    return any(
+        mark.area <= 4
+        and target.bbox.y0 + target.height * 0.25
+        < mark.center_y
+        < target.bbox.y1 - target.height * 0.25
+        and (mark.bbox.x1 <= target.bbox.x0 or mark.bbox.x0 >= target.bbox.x1)
+        for target in targets
+    )
+
+
 def _assign_spacing_marks(
     marks: tuple[Component, ...] | list[Component],
     bodies_by_region: Sequence[Sequence[Component]],
@@ -289,18 +300,31 @@ def _assign_spacing_marks(
     config: SpacingConfig,
     *,
     region_indices: tuple[int, ...] | None = None,
+    region_scales: tuple[float, ...] | None = None,
 ) -> tuple[tuple[SecondaryMarkAssignment, ...], tuple[tuple[Component, ...], ...]]:
     """Assign each secondary component to at most one region, preserving close ties."""
     indices = region_indices or tuple(range(len(bodies_by_region)))
     assigned: list[list[Component]] = [[] for _ in bodies_by_region]
     decisions: list[SecondaryMarkAssignment] = []
     for mark in sorted(marks, key=lambda component: component.index):
+        if any(_is_suspicious_lateral_speck(mark, bodies) for bodies in bodies_by_region):
+            decisions.append(
+                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
+            )
+            continue
         scores = [
             (score, region_index, local_index)
             for local_index, (region_index, bodies) in enumerate(
                 zip(indices, bodies_by_region, strict=True)
             )
-            if (score := _spacing_attachment_score(mark, bodies, median_height)) is not None
+            if (
+                score := _spacing_attachment_score(
+                    mark,
+                    bodies,
+                    region_scales[local_index] if region_scales is not None else median_height,
+                )
+            )
+            is not None
         ]
         scores.sort()
         if not scores or scores[0][0] > 2.5:
@@ -318,7 +342,13 @@ def _assign_spacing_marks(
         if margin is not None and margin < config.mark_assignment_margin:
             decisions.append(
                 SecondaryMarkAssignment(
-                    mark.index, None, best_score, second_score, margin, "ambiguous"
+                    mark.index,
+                    None,
+                    best_score,
+                    second_score,
+                    margin,
+                    "ambiguous",
+                    candidate_region_indices=tuple(target for _, target, _ in scores[:2]),
                 )
             )
             continue

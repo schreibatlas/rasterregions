@@ -12,6 +12,15 @@ MaskMethod = Literal["grayscale", "dark", "color", "hybrid", "adaptive"]
 MaskMode = Literal["auto", "grayscale", "dark", "color", "hybrid", "adaptive"]
 ExpectedCountScope = Literal["row", "page"]
 DetectionStatus = Literal["ok", "ambiguous", "failed"]
+ComponentRole = Literal[
+    "primary",
+    "secondary-candidate",
+    "secondary",
+    "noise",
+    "artifact",
+    "ambiguous",
+]
+
 
 IsolationReason = Literal[
     "nearest-to-center",
@@ -182,6 +191,7 @@ class ComponentDecision:
     area: int
     action: Literal["kept", "removed"]
     reason: str | None = None
+    role: ComponentRole = "primary"
 
 
 @dataclass(frozen=True)
@@ -207,7 +217,7 @@ class PartitionBoundary:
 
 @dataclass(frozen=True)
 class CleanupConfig:
-    """Thresholds controlling border, rule, and tiny-component cleanup."""
+    """Thresholds for artifact removal and provisional tiny-component classification."""
 
     tiny_area_ratio: float = 0.008
     rule_aspect_ratio: float = 12.0
@@ -698,6 +708,7 @@ class SecondaryMarkAssignment:
     second_best_score: float | None
     margin: float | None
     status: Literal["assigned", "ambiguous", "unassigned"]
+    candidate_region_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -721,6 +732,13 @@ class SecondaryMarkAssignment:
             raise ValueError("assigned marks must name a target region")
         if self.status != "assigned" and self.target_region_index is not None:
             raise ValueError("unassigned or ambiguous marks cannot name a target region")
+        candidate_indices = tuple(self.candidate_region_indices)
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in candidate_indices
+        ):
+            raise ValueError("candidate region indexes must be nonnegative integers")
+        object.__setattr__(self, "candidate_region_indices", candidate_indices)
 
 
 @dataclass(frozen=True)
@@ -737,9 +755,19 @@ class Region:
 
     image: Image.Image = field(repr=False, compare=False)
     mask: np.ndarray = field(repr=False, compare=False)
+    primary_component_indices: tuple[int, ...] = ()
+    secondary_component_indices: tuple[int, ...] = ()
+    ambiguous_component_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+        object.__setattr__(self, "primary_component_indices", tuple(self.primary_component_indices))
+        object.__setattr__(
+            self, "secondary_component_indices", tuple(self.secondary_component_indices)
+        )
+        object.__setattr__(
+            self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
+        )
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("region confidence must be between zero and one")
         mask = np.asarray(self.mask, dtype=bool)
@@ -849,6 +877,9 @@ class RegionHypothesis:
     cut_crossing_cost: float = 0.0
 
     body_count: int = 0
+    primary_component_indices: tuple[int, ...] = ()
+    secondary_component_indices: tuple[int, ...] = ()
+    ambiguous_component_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         mask = np.asarray(self.mask, dtype=bool)
@@ -871,6 +902,13 @@ class RegionHypothesis:
         object.__setattr__(self, "mask", snapshot)
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "primary_component_indices", tuple(self.primary_component_indices))
+        object.__setattr__(
+            self, "secondary_component_indices", tuple(self.secondary_component_indices)
+        )
+        object.__setattr__(
+            self, "ambiguous_component_indices", tuple(self.ambiguous_component_indices)
+        )
 
 
 @dataclass(frozen=True)
@@ -901,7 +939,7 @@ class RowPartitionHypothesis:
         regions = tuple(self.regions)
         if (
             len(regions) != self.count
-            or (bool(boundaries) and len(boundaries) != self.count + 1)
+            or len(boundaries) != self.count + 1
             or any(a >= b for a, b in zip(boundaries, boundaries[1:], strict=False))
         ):
             raise ValueError("row hypothesis count and boundaries must match its regions")

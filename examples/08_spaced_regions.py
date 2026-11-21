@@ -28,6 +28,16 @@ def main() -> None:
     print("status:", hypotheses.selected.status)
     print("selected regions:", len(hypotheses.selected.regions))
     print("page hypotheses:", len(hypotheses.page_hypotheses))
+    for region in hypotheses.selected.regions:
+        print(
+            region.region_id,
+            "primary:",
+            region.primary_component_indices,
+            "secondary:",
+            region.secondary_component_indices,
+            "ambiguous:",
+            region.ambiguous_component_indices,
+        )
     print("search truncated:", hypotheses.truncated)
     print("artifacts:", BUILD)
 
