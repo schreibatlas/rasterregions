@@ -36,6 +36,7 @@ from .mask import foreground_mask
 from .models import (
     BBox,
     Component,
+    ComponentRole,
     DetectionConfig,
     DetectionDiagnostics,
     DetectionResult,
@@ -1058,7 +1059,9 @@ def detect_spaced_regions(
             )
         secondary_assignments.append(decision)
     secondary_assignments.sort(key=lambda item: item.component_index)
-    role_by_index = {component_index: "primary" for component_index in body_ids}
+    role_by_index: dict[int, ComponentRole] = {
+        component_index: "primary" for component_index in body_ids
+    }
     role_by_index.update(
         {
             assignment.component_index: (
