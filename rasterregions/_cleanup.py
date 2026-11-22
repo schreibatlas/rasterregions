@@ -6,7 +6,12 @@ import numpy as np
 
 from ._grouping import _size_scale
 from .components import components as label_components
-from .models import CleanupConfig, Component, ComponentDecision
+from .models import (
+    CleanupConfig,
+    Component,
+    ComponentDecision,
+    _component_scale_features,
+)
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,7 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
     body_area = 0.0
     body_height = body_width = 0.0
     bodies: list[Component] = []
+    scale_features = {}
     if scale_candidates:
         ordered = sorted(scale_candidates, key=lambda component: component.area)
         upper = ordered[len(ordered) // 2 :]
@@ -96,33 +102,34 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
         body_area = float(np.median([component.area for component in bodies]))
         body_height = float(np.median([component.height for component in bodies]))
         body_width = float(np.median([component.width for component in bodies]))
+        scale_features = {
+            component.index: _component_scale_features(
+                component, body_area, body_height, body_width
+            )
+            for component in non_artifacts
+        }
+        area_limit = (
+            config.hard_micro_noise_max_area_ratio
+            if config.hard_micro_noise_max_area_ratio is not None
+            else config.micro_noise_max_area_ratio
+        )
+        height_limit = (
+            config.hard_micro_noise_max_height_ratio
+            if config.hard_micro_noise_max_height_ratio is not None
+            else config.micro_noise_max_height_ratio
+        )
+        width_limit = (
+            config.hard_micro_noise_max_width_ratio
+            if config.hard_micro_noise_max_width_ratio is not None
+            else config.micro_noise_max_width_ratio
+        )
         micro_ids = {
             component.index
             for component in non_artifacts
-            if component.area < body_area * config.micro_noise_max_area_ratio
-            and component.height < body_height * config.micro_noise_max_height_ratio
-            and component.width < body_width * config.micro_noise_max_width_ratio
+            if scale_features[component.index].area_ratio < area_limit
+            and scale_features[component.index].height_ratio < height_limit
+            and scale_features[component.index].width_ratio < width_limit
         }
-        micro_ids.difference_update(
-            component.index
-            for component in non_artifacts
-            if component.index in micro_ids
-            and any(
-                max(
-                    0,
-                    component.bbox.y0 - body.bbox.y1,
-                    body.bbox.y0 - component.bbox.y1,
-                )
-                <= body_height * config.micro_noise_mark_max_vertical_gap_ratio
-                and max(
-                    0,
-                    component.bbox.x0 - body.bbox.x1,
-                    body.bbox.x0 - component.bbox.x1,
-                )
-                <= body_width * config.micro_noise_mark_max_horizontal_gap_ratio
-                for body in bodies
-            )
-        )
     retained = [component for component in non_artifacts if component.index not in micro_ids]
     provisional_scale, _ = _size_scale(retained)
     provisional = tuple(
@@ -147,13 +154,14 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
     decisions: list[ComponentDecision] = []
     kept_components: list[Component] = []
     for component in found:
+        features = scale_features.get(component.index)
         reason = None
         if artifacts[component.index]:
             reason = "page border, rule, or oversized artifact"
             cleaned[component.ys, component.xs] = False
             warnings.append(f"Removed component {component.index}: {reason}.")
         elif component.index in micro_ids:
-            reason = "tiny component below plausible detached-mark scale"
+            reason = "below hard handwriting-scale threshold"
             cleaned[component.ys, component.xs] = False
             warnings.append(f"Removed component {component.index}: {reason}.")
         elif component.index in provisional_ids:
@@ -177,7 +185,10 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
                     if component.index in provisional_ids
                     else "primary"
                 ),
-                body_area_ratio=component.area / body_area if body_area else None,
+                body_area_ratio=features.area_ratio if features else None,
+                body_height_ratio=features.height_ratio if features else None,
+                body_width_ratio=features.width_ratio if features else None,
+                aspect_ratio=features.aspect_ratio if features else None,
             )
         )
 

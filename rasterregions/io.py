@@ -87,6 +87,19 @@ def detection_payload(result: DetectionResult) -> dict:
                     if decision.body_area_ratio is not None
                     else None
                 ),
+                "body_height_ratio": (
+                    round(decision.body_height_ratio, 6)
+                    if decision.body_height_ratio is not None
+                    else None
+                ),
+                "body_width_ratio": (
+                    round(decision.body_width_ratio, 6)
+                    if decision.body_width_ratio is not None
+                    else None
+                ),
+                "aspect_ratio": (
+                    round(decision.aspect_ratio, 6) if decision.aspect_ratio is not None else None
+                ),
             }
             for decision in decisions
         ],
@@ -210,6 +223,10 @@ def detection_payload(result: DetectionResult) -> dict:
                     "horizontal_center_distance": assignment.horizontal_center_distance,
                     "vertical_gap_ratio": assignment.vertical_gap_ratio,
                     "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
+                    "mark_kind": assignment.mark_kind,
+                    "target_relation": assignment.target_relation,
+                    "horizontal_gap_ratio": assignment.horizontal_gap_ratio,
+                    "excluded_region_indices": list(assignment.excluded_region_indices),
                     "reason": assignment.reason,
                     "candidate_region_indices": list(assignment.candidate_region_indices),
                 }
@@ -318,6 +335,10 @@ def _assignment_payload(assignment) -> dict:
         "horizontal_center_distance": assignment.horizontal_center_distance,
         "vertical_gap_ratio": assignment.vertical_gap_ratio,
         "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
+        "mark_kind": assignment.mark_kind,
+        "target_relation": assignment.target_relation,
+        "horizontal_gap_ratio": assignment.horizontal_gap_ratio,
+        "excluded_region_indices": list(assignment.excluded_region_indices),
         "reason": assignment.reason,
     }
 
@@ -406,7 +427,6 @@ def spaced_hypotheses_payload(
 ) -> dict:
     """Return JSON-compatible selected, alternative, and search diagnostics."""
     selected = result.selected
-    diagnostics = selected.diagnostics
     payload = {
         "schema_version": 1,
         "segmentation": "spaced",
@@ -420,7 +440,10 @@ def spaced_hypotheses_payload(
         ],
         "search": {
             "truncated": result.truncated,
-            "limit": diagnostics.search_limit if diagnostics else None,
+            "search_truncated": result.search_truncated,
+            "search_limit": result.search_limit,
+            "alternatives_omitted": result.alternatives_omitted,
+            "limit": result.search_limit,
             "failure_reason": result.failure_reason,
         },
     }

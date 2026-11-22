@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from PIL import Image
@@ -10,10 +11,13 @@ from PIL import Image
 from ._cleanup import CleanedPage, clean_page_mask
 from ._grouping import (
     _assign_spacing_marks,
+    _AttachmentMetrics,
     _automatic_regions,
     _BodyAnchor,
     _make_region,
     _merge_spacing_body_anchors,
+    _secondary_mark_kind,
+    _spacing_attachment_metrics,
     _spacing_attachment_score,
     _spacing_body_anchor_has_strong_valley,
     _spacing_body_anchor_split_evidence,
@@ -1687,16 +1691,16 @@ def _page_hypotheses_for_partitions(
     result: DetectionResult,
     partitions: Sequence[RowPartition],
     config: DetectionConfig,
-) -> tuple[tuple[PagePartitionHypothesis, ...], bool]:
+) -> tuple[tuple[PagePartitionHypothesis, ...], str | None]:
     if not partitions:
-        return (), False
+        return (), None
     region_specs = [
         (row_index, row_partition, region)
         for row_index, row_partition in enumerate(partitions)
         for region in row_partition.regions
     ]
     if not region_specs:
-        return (), False
+        return (), None
     shape = result.clean_mask.shape
     body_ids = {
         component_index
@@ -1735,6 +1739,8 @@ def _page_hypotheses_for_partitions(
             float | None,
             tuple[int, ...],
             tuple[tuple[int | None, float], ...],
+            Literal["dot", "stroke"],
+            tuple[int, ...],
         ]
     ] = []
     body_height = (
@@ -1744,7 +1750,9 @@ def _page_hypotheses_for_partitions(
     )
     for component in sorted(secondary, key=lambda item: item.index):
         row_index = row_for_component.get(component.index)
-        scored: list[tuple[float, int]] = []
+        mark_kind = _secondary_mark_kind(component, body_height, config.spacing)
+        scored: list[tuple[_AttachmentMetrics, int]] = []
+        rejected: list[tuple[_AttachmentMetrics, int]] = []
         for region_index, (target_row, _, _) in enumerate(region_specs):
             if row_index is not None and target_row != row_index:
                 continue
@@ -1753,33 +1761,42 @@ def _page_hypotheses_for_partitions(
                 if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
                 else body_height
             )
-            score = _spacing_attachment_score(
-                component, body_groups[region_index], row_scale, config.spacing
+            metrics = _spacing_attachment_metrics(
+                component, body_groups[region_index], row_scale, config.spacing, mark_kind
             )
-            if score is not None:
-                scored.append((score, region_index))
-        scored.sort(key=lambda item: (item[0], item[1]))
-        best_score = scored[0][0] if scored and scored[0][0] <= 2.5 else None
-        second_score = scored[1][0] if best_score is not None and len(scored) > 1 else None
+            if metrics is not None:
+                (scored if metrics.eligible else rejected).append((metrics, region_index))
+        scored.sort(key=lambda item: (item[0].score, item[1]))
+        rejected.sort(key=lambda item: (item[0].score, item[1]))
+        best_metrics = scored[0][0] if scored and scored[0][0].score <= 2.5 else None
+        best_score = best_metrics.score if best_metrics is not None else None
+        second_score = scored[1][0].score if best_metrics is not None and len(scored) > 1 else None
         margin = (
             (second_score - best_score) / max(1.0, abs(second_score))
             if best_score is not None and second_score is not None
             else None
         )
+        uncertain = margin is not None and margin < config.spacing.mark_assignment_margin
         candidate_region_indices = (
-            tuple(target for _, target in scored[:2])
-            if margin is not None and margin < config.spacing.mark_assignment_margin
+            tuple(region_index for _, region_index in scored[:2])
+            if uncertain
+            else (scored[0][1],)
+            if best_metrics is not None
             else ()
+        )
+        excluded_region_indices = tuple(
+            region_index
+            for metrics, region_index in rejected
+            if mark_kind == "dot" and metrics.target_relation == "lateral"
         )
         if best_score is None:
             choices: tuple[tuple[int | None, float], ...] = ((None, 0.0),)
+        elif uncertain:
+            choices = tuple(
+                (region_index, metrics.score) for metrics, region_index in scored[:2]
+            ) + ((None, 2.5),)
         else:
-            eligible = (
-                scored[:2]
-                if margin is not None and margin < config.spacing.mark_assignment_margin
-                else scored[:1]
-            )
-            choices = tuple((target, score) for score, target in eligible) + ((None, 2.5),)
+            choices = ((scored[0][1], best_score),)
         mark_options.append(
             (
                 component,
@@ -1788,12 +1805,14 @@ def _page_hypotheses_for_partitions(
                 margin,
                 candidate_region_indices,
                 choices,
+                mark_kind,
+                excluded_region_indices,
             )
         )
 
     branches: list[tuple[float, tuple[int | None, ...]]] = [(0.0, ())]
     branches_truncated = False
-    for _, _, _, _, _, choices in mark_options:
+    for _, _, _, _, _, choices, _, _ in mark_options:
         expanded = [
             (cost + choice_cost, (*selected, target))
             for cost, selected in branches
@@ -1824,6 +1843,8 @@ def _page_hypotheses_for_partitions(
             margin,
             candidate_region_indices,
             _,
+            mark_kind,
+            excluded_region_indices,
         ), target in zip(mark_options, targets, strict=True):
             if target is None:
                 assignments.append(
@@ -1835,6 +1856,13 @@ def _page_hypotheses_for_partitions(
                         margin,
                         "unassigned",
                         candidate_region_indices=candidate_region_indices,
+                        excluded_region_indices=excluded_region_indices,
+                        mark_kind=mark_kind,
+                        reason=(
+                            "branch left a plausible secondary mark unassigned"
+                            if best is not None
+                            else "no eligible target passed mark geometry and bbox-expansion limits"
+                        ),
                     )
                 )
                 continue
@@ -1842,6 +1870,15 @@ def _page_hypotheses_for_partitions(
             ys, xs = component.ys[new_pixels], component.xs[new_pixels]
             masks[target][ys, xs] = True
             owned[ys, xs] = True
+            target_row = region_specs[target][0]
+            row_scale = (
+                result.diagnostics.row_segmentation[target_row].body_height
+                if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
+                else body_height
+            )
+            metrics = _spacing_attachment_metrics(
+                component, body_groups[target], row_scale, config.spacing, mark_kind
+            )
             assignments.append(
                 SecondaryMarkAssignment(
                     component.index,
@@ -1851,6 +1888,24 @@ def _page_hypotheses_for_partitions(
                     margin,
                     "assigned",
                     candidate_region_indices=candidate_region_indices,
+                    excluded_region_indices=excluded_region_indices,
+                    area_ratio=metrics.area_ratio if metrics else None,
+                    horizontal_overlap_ratio=(
+                        metrics.horizontal_overlap_ratio if metrics else None
+                    ),
+                    horizontal_center_distance=(
+                        metrics.horizontal_center_distance if metrics else None
+                    ),
+                    vertical_gap_ratio=metrics.vertical_gap_ratio if metrics else None,
+                    bbox_expansion_ratio=metrics.bbox_expansion_ratio if metrics else None,
+                    mark_kind=mark_kind,
+                    target_relation=metrics.target_relation if metrics else None,
+                    horizontal_gap_ratio=metrics.horizontal_gap_ratio if metrics else None,
+                    reason=(
+                        "clear target geometry; compact-dot lateral targets were rejected"
+                        if excluded_region_indices
+                        else "plausible mark assigned to this target"
+                    ),
                 )
             )
         unassigned = result.clean_mask & ~owned
@@ -1888,8 +1943,12 @@ def _page_hypotheses_for_partitions(
                 ),
                 ambiguous_component_indices=tuple(
                     component.index
-                    for component, _, _, _, candidates, _ in mark_options
-                    if region_spec_index in candidates
+                    for component, _, _, margin, candidates, _, _, _ in mark_options
+                    if (
+                        margin is not None
+                        and margin < config.spacing.mark_assignment_margin
+                        and region_spec_index in candidates
+                    )
                 ),
             )
             row_region_hypotheses.setdefault(row_index, []).append(hypothesis)
@@ -1949,7 +2008,7 @@ def _page_hypotheses_for_partitions(
                 unassigned_mask=unassigned,
             )
         )
-    return tuple(pages), branches_truncated
+    return tuple(pages), ("secondary-mark-branch-budget" if branches_truncated else None)
 
 
 def detect_spaced_region_hypotheses(
@@ -1984,7 +2043,9 @@ def detect_spaced_region_hypotheses(
     page_hypotheses: list[PagePartitionHypothesis] = []
     if selected_page is not None:
         page_hypotheses.append(selected_page)
-    truncated = bool(truncated_output and truncated_output[0])
+    search_truncated = bool(truncated_output and truncated_output[0])
+    search_limit = selected.diagnostics.search_limit if selected.diagnostics else None
+    alternatives_omitted = False
     if page_options:
         selected_signature = (
             _page_hypothesis_signature(selected_page, selected.clean_mask)
@@ -1999,7 +2060,9 @@ def detect_spaced_region_hypotheses(
                 partitions,
                 selected_config,
             )
-            truncated |= branch_truncated
+            if branch_truncated is not None:
+                search_truncated = True
+                search_limit = branch_truncated
             for page in variants:
                 signature = _page_hypothesis_signature(page, selected.clean_mask)
                 if signature in seen_signatures:
@@ -2015,7 +2078,7 @@ def detect_spaced_region_hypotheses(
         )
         remaining = selected_config.spacing.hypothesis_limit - len(page_hypotheses)
         if len(candidates) > remaining:
-            truncated = True
+            alternatives_omitted = True
         page_hypotheses.extend(candidates[:remaining])
     row_hypotheses: list[tuple[RowPartitionHypothesis, ...]] = []
     selected_rows = selected_page.row_hypotheses if selected_page else ()
@@ -2039,7 +2102,7 @@ def detect_spaced_region_hypotheses(
                 row_candidates.append(candidate)
             if len(row_candidates) >= selected_config.spacing.hypothesis_limit:
                 if len(options) > len(row_candidates):
-                    truncated = True
+                    alternatives_omitted = True
                 break
         row_hypotheses.append(tuple(row_candidates))
     failure_reason = None
@@ -2052,7 +2115,10 @@ def detect_spaced_region_hypotheses(
         selected=selected,
         row_hypotheses=tuple(row_hypotheses),
         page_hypotheses=tuple(page_hypotheses),
-        truncated=truncated,
+        truncated=search_truncated or alternatives_omitted,
+        search_truncated=search_truncated,
+        search_limit=search_limit,
+        alternatives_omitted=alternatives_omitted,
         failure_reason=failure_reason,
     )
 

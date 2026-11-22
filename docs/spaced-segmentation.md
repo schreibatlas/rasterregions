@@ -19,12 +19,15 @@ The sequence must have one entry per detected row. Automatic inference is determ
 
 ## Scale-aware cleanup and mark ownership
 
-`DetectionConfig.cleanup` controls component cleanup. A component is removed as micro-noise only when its area, height, and width are all below their respective ratios of the inferred median body scale. A small component within the configured mark-gap limits of a plausible body is preserved for contextual assignment instead. This keeps plausible dots available while discarding isolated specks. Page rules and border artifacts are handled by separate cleanup controls.
+`DetectionConfig.cleanup` applies a hard noise floor before secondary-mark assignment. A component is removed as micro-noise only when its area, height, and width ratios are all below their respective body-scale limits. Nearby position never rescues a component below this floor. Each explicit `hard_micro_noise_max_area_ratio`, `hard_micro_noise_max_height_ratio`, or `hard_micro_noise_max_width_ratio` setting overrides its corresponding legacy limit; `None` inherits the matching `micro_noise_max_*` value. Page rules and border artifacts use separate cleanup controls.
 
 
-The default micro-noise limits are 0.02 of median body area and 0.08 of median body height and width. Tiny components within 0.50 body heights vertically and 0.40 body widths horizontally are exempted for mark assignment. Mark assignment defaults to a 0.001 minimum relative area, 0.65 maximum vertical gap, 0.75 maximum horizontal gap, 3.0 maximum bbox expansion, and a 0.15 best-versus-second-best score margin.
+The default scale limits are 0.03 body areas, 0.12 body heights, and 0.12 body widths, and all three checks are required for hard-noise removal. Components that pass this floor may remain secondary candidates; their ownership is decided by target geometry, not a proximity exemption.
 
-`DetectionConfig.spacing` controls secondary-mark attachment and automatic repairs. Mark candidates must satisfy size, alignment, distance, bbox-expansion, and score-margin gates. A mark that has no credible owner remains in `unassigned_mask`; it does not enlarge a region box.
+`DetectionConfig.spacing` controls secondary-mark attachment and automatic repairs. Secondary geometry is classified as compact dot-like or elongated stroke-like. Each dot is scored against each target independently and is ineligible for a target with only lateral separation, vertical overlap, and no horizontal overlap. Stroke-like marks retain gap, overlap, area, and bbox-expansion scoring. Clear owners are assigned once; only ambiguous marks produce competing target and unassigned branches. Marks with no plausible owner remain in `unassigned_mask` and do not enlarge a region box.
+
+
+Dot classification defaults to a symmetric bbox aspect ratio of at most 2.0 and a relative area ratio of at most 0.05. Attachment defaults also include a 0.001 minimum and 0.6 maximum relative mark area, a 0.65 vertical-gap limit, a 0.75 horizontal-gap limit, a 3.0 bbox-expansion limit, and a 0.15 best-versus-second-best margin. These values are configurable through `SpacingConfig`.
 
 Automatic splits compete with the unsplit primary-body baseline. A split requires a narrow projection neck, substantial children with supported heights, an anomalously wide anchor, and the configured minimum improvement over the baseline after complexity cost. `auto_split_min_width_ratio`, `auto_split_max_neck_width_ratio`, `auto_split_min_child_area_fraction`, `auto_split_min_child_height_ratio`, and `auto_split_min_improvement` control these checks. Split evidence records the candidate cut and its allowed valley interval, measured ratios, acceptance, and reason codes. Caller-supplied exact counts can still use the broader partition search.
 
@@ -83,12 +86,18 @@ hypotheses = detect_spaced_region_hypotheses(
 )
 selected = hypotheses.selected
 best_page = hypotheses.page_hypotheses[0] if hypotheses.page_hypotheses else None
-print(hypotheses.truncated, hypotheses.failure_reason)
+print(
+    hypotheses.truncated,
+    hypotheses.search_truncated,
+    hypotheses.search_limit,
+    hypotheses.alternatives_omitted,
+    hypotheses.failure_reason,
+)
 ```
 
-When page hypotheses exist, hypothesis zero matches `selected`. Row and page hypotheses expose costs, boundary evidence, cut-crossing costs, body counts, region widths, frames, secondary-mark assignments, and unassigned-ink fractions. A detached mark can appear assigned to different regions in separate page hypotheses, including an explicit unassigned option. Every page hypothesis owns each cleaned foreground pixel exactly once, either through one region mask or its unassigned mask.
+When page hypotheses exist, hypothesis zero matches `selected`. Row and page hypotheses expose costs, boundary evidence, cut-crossing costs, body counts, region widths, frames, secondary-mark assignments, and unassigned-ink fractions. Assignment diagnostics include the mark kind, target relation, candidate target indexes, and excluded lateral dot targets. Clear ownership does not branch to an unassigned alternative. Ambiguous marks can remain assigned differently in separate page hypotheses, including an unassigned option. Every page hypothesis owns each cleaned foreground pixel exactly once, either through one region mask or its unassigned mask.
 
-`SpacingConfig` bounds candidate boundaries, row counts, row and page search states, secondary-mark branches, and returned hypotheses. `truncated=True` means at least one configured bound removed alternatives. The selected result and search diagnostics remain available when a bounded search finds no feasible page allocation.
+`SpacingConfig` bounds candidate boundaries, row counts, row and page search states, secondary-mark branches, and returned hypotheses. `search_truncated` reports that a search budget stopped exploration, and `search_limit` names the bound, including `secondary-mark-branch-budget`. `alternatives_omitted` reports diagnostic alternatives clipped after ranking. The compatibility field `truncated` is true when either condition applies. The selected result and search diagnostics remain available when a bounded search finds no feasible page allocation.
 
 Serialize the aggregate result with `rasterregions.io.spaced_hypotheses_payload`. Masks are JSON-compatible row runs, and region runs are relative to their bounding boxes. `write_spaced_hypotheses` writes the payload plus cleaned-mask, row, candidate-cut, selected-partition, alternative-partition, and unassigned-ink images.
 
@@ -98,4 +107,4 @@ The CLI exposes the same path:
 rasterregions spaced page.png --expected-count 5 --row-counts auto,auto --output build/page-segmentation
 ```
 
-`--row-counts` accepts comma-separated positive counts or `auto`, with one entry required per detected row. The CLI reports the number of returned page hypotheses and whether search was truncated; `hypotheses.json` includes the limiting budget and detailed alternatives.
+`--row-counts` accepts comma-separated positive counts or `auto`, with one entry required per detected row. The CLI reports search truncation, omitted alternatives, and any applicable limit; `hypotheses.json` includes the detailed ownership and search diagnostics.

@@ -92,6 +92,37 @@ def test_detached_dot_and_crossbar_are_assigned_to_their_nearest_regions() -> No
     _assert_exact_ownership(result)
 
 
+def test_dot_above_body_rejects_lateral_ascender_target() -> None:
+    image = Image.new("RGB", (120, 100), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((45, 40, 62, 82), fill="black")
+    draw.rectangle((68, 10, 85, 82), fill="black")
+    draw.rectangle((50, 22, 58, 34), fill="black")
+
+    result = detect_spaced_regions(image, mode="dark", row_counts=[2])
+
+    assert result.status == "ok"
+    assert len(result.regions) == 2
+    dot = next(d for d in result.component_decisions if d.bbox.x0 == 50)
+    assignment = next(
+        item
+        for item in result.diagnostics.secondary_mark_assignments
+        if item.component_index == dot.component_index
+    )
+    j_region_index = min(
+        range(len(result.regions)), key=lambda index: result.regions[index].bbox.x0
+    )
+    assert assignment.status == "assigned"
+    assert assignment.target_region_index == j_region_index
+    assert assignment.second_best_score is None
+
+    assert assignment.candidate_region_indices == (j_region_index,)
+    assert assignment.excluded_region_indices == (1 - j_region_index,)
+    assert assignment.mark_kind == "dot"
+    assert assignment.target_relation == "above"
+    assert assignment.horizontal_gap_ratio is not None
+
+
 def test_ambiguous_detached_mark_stays_unassigned_and_is_reported() -> None:
     image = Image.new("RGB", (130, 80), "white")
     draw = ImageDraw.Draw(image)

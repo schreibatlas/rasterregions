@@ -19,6 +19,9 @@ This procedure is documentation only. No tag, package upload, or release publica
 
 The project version is dynamic and comes from Git tags through `setuptools-scm`. The tag `v0.1.0` must therefore exist before building the final distributions. A source archive without Git metadata uses the configured development fallback and is not a substitute for building from the release tag.
 
+Planned release records and `Unreleased` changelog sections do not set the package version. Before a release tag exists, setuptools-scm derives a development version from the latest tag and commits; this checkout builds as `0.2.7.dev0` plus Git-local metadata from `v0.2.6`. The final `0.2.7` version is generated from the release tag after the reviewed code is committed. Do not edit the generated `rasterregions/_version.py` directly.
+
+
 After an explicitly approved release decision, create and check out the annotated tag:
 
 ```bash

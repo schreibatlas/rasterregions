@@ -20,6 +20,32 @@ def _single_body_with_mark(mark_box: tuple[int, int, int, int]) -> Image.Image:
     return image
 
 
+def _single_low_resolution_body_with_mark(mark_box: tuple[int, int, int, int]) -> Image.Image:
+    image = Image.new("RGB", (100, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 30, 47, 39), outline="black", width=1)
+    draw.rectangle(mark_box, fill="black")
+    return image
+
+
+@pytest.mark.parametrize(
+    ("mark_box", "mark_pixels"),
+    [((43, 20, 43, 20), ((20, 43),)), ((43, 20, 44, 21), ((20, 43), (20, 44), (21, 43), (21, 44)))],
+)
+def test_low_resolution_dots_are_retained_relative_to_pen_scale(
+    mark_box: tuple[int, int, int, int], mark_pixels: tuple[tuple[int, int], ...]
+) -> None:
+    result = detect_spaced_regions(_single_low_resolution_body_with_mark(mark_box), mode="dark")
+
+    for y, x in mark_pixels:
+        assert result.clean_mask[y, x]
+    mark = next(
+        decision for decision in result.component_decisions if decision.bbox.x0 == mark_box[0]
+    )
+    assert mark.action == "kept"
+    assert mark.role == "secondary-candidate"
+
+
 def _assert_page_ownership(clean_mask: np.ndarray, page) -> None:
     owned = np.zeros(clean_mask.shape, dtype=bool)
     for region in page.regions:
@@ -34,37 +60,28 @@ def _assert_page_ownership(clean_mask: np.ndarray, page) -> None:
     ("mark_box", "mark_pixels"),
     [((37, 20, 37, 20), ((20, 37),)), ((36, 19, 37, 20), ((19, 36), (19, 37), (20, 36), (20, 37)))],
 )
-def test_one_to_four_pixel_dot_above_body_is_retained_as_secondary(
+def test_tiny_dots_above_large_body_are_removed_at_scale(
     mark_box: tuple[int, int, int, int], mark_pixels: tuple[tuple[int, int], ...]
 ) -> None:
     result = detect_spaced_regions(_single_body_with_mark(mark_box), mode="dark")
 
     assert len(result.regions) == 1
     for y, x in mark_pixels:
-        assert result.clean_mask[y, x]
+        assert not result.clean_mask[y, x]
     mark = next(
         decision for decision in result.component_decisions if decision.bbox.x0 == mark_box[0]
     )
-    assert mark.action == "kept"
-    assert mark.component_index in result.regions[0].component_indices
-
-    assert mark.role == "secondary"
-    body = next(
-        decision
-        for decision in result.component_decisions
-        if decision.component_index != mark.component_index
-    )
-    assert body.role == "primary"
-    assert mark.component_index in result.regions[0].secondary_component_indices
-    assert body.component_index in result.regions[0].primary_component_indices
+    assert mark.action == "removed"
+    assert mark.role == "micro-noise"
+    assert mark.reason == "below hard handwriting-scale threshold"
 
 
-def test_two_tiny_dots_above_one_body_remain_distinct_secondary_components() -> None:
+def test_two_low_resolution_dots_remain_distinct_candidates() -> None:
     image = Image.new("RGB", (100, 80), "white")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((25, 30, 49, 59), fill="black")
-    draw.point((32, 20), fill="black")
-    draw.point((42, 20), fill="black")
+    draw.rectangle((35, 30, 42, 39), outline="black", width=1)
+    draw.point((37, 20), fill="black")
+    draw.point((40, 20), fill="black")
 
     result = detect_spaced_regions(image, mode="dark")
 
@@ -72,7 +89,10 @@ def test_two_tiny_dots_above_one_body_remain_distinct_secondary_components() -> 
     marks = [decision for decision in result.component_decisions if decision.bbox.y0 == 20]
     assert len(marks) == 2
     assert all(mark.action == "kept" for mark in marks)
-    assert {mark.component_index for mark in marks}.issubset(result.regions[0].component_indices)
+    assert all(mark.role == "secondary-candidate" for mark in marks)
+    assert len({mark.component_index for mark in marks}) == 2
+    assert result.clean_mask[20, 37]
+    assert result.clean_mask[20, 40]
 
 
 def test_tiny_far_away_speck_is_removed_with_stable_raw_component_id() -> None:
@@ -88,15 +108,15 @@ def test_tiny_far_away_speck_is_removed_with_stable_raw_component_id() -> None:
     assert not result.clean_mask[3, 3]
 
 
-def test_tiny_suspicious_side_speck_is_retained_unassigned() -> None:
-    result = detect_spaced_regions(_single_body_with_mark((52, 42, 52, 42)), mode="dark")
+def test_non_micro_side_mark_is_retained_unassigned() -> None:
+    result = detect_spaced_regions(_single_body_with_mark((75, 42, 78, 45)), mode="dark")
 
-    assert result.clean_mask[42, 52]
-    assert result.unassigned_mask[42, 52]
+    assert result.clean_mask[42, 75]
+    assert result.unassigned_mask[42, 75]
     mark_index = next(
         decision.component_index
         for decision in result.component_decisions
-        if decision.bbox.x0 == 52
+        if decision.bbox.x0 == 75
     )
     mark = next(
         decision
@@ -112,12 +132,12 @@ def test_tiny_ambiguous_dot_between_neighboring_bodies_stays_unassigned() -> Non
     draw = ImageDraw.Draw(image)
     draw.rectangle((15, 25, 38, 55), fill="black")
     draw.rectangle((75, 25, 98, 55), fill="black")
-    draw.rectangle((52, 12, 53, 13), fill="black")
+    draw.rectangle((53, 12, 57, 16), fill="black")
     config = DetectionConfig(spacing=SpacingConfig(mark_assignment_margin=0.99))
 
     result = detect_spaced_regions(image, mode="dark", config=config)
 
-    assert result.clean_mask[12:14, 52:54].all()
+    assert result.clean_mask[12:17, 53:58].all()
     assignment = next(
         item for item in result.diagnostics.secondary_mark_assignments if item.component_index == 0
     )
@@ -134,7 +154,7 @@ def test_tiny_ambiguous_dot_between_neighboring_bodies_stays_unassigned() -> Non
         assignment.component_index in region.ambiguous_component_indices
         for region in result.regions
     )
-    assert result.unassigned_mask[12:14, 52:54].all()
+    assert result.unassigned_mask[12:17, 53:58].all()
 
 
 def test_secondary_only_partition_cell_does_not_leave_stale_boundaries() -> None:
@@ -164,8 +184,8 @@ def test_mixed_size_rows_keep_tiny_marks_without_adding_body_regions() -> None:
     draw.rectangle((100, 15, 125, 55), fill="black")
     draw.rectangle((20, 85, 36, 108), fill="black")
     draw.rectangle((100, 82, 119, 108), fill="black")
-    draw.point((31, 8), fill="black")
-    draw.point((28, 77), fill="black")
+    draw.rectangle((29, 8, 33, 12), fill="black")
+    draw.rectangle((26, 77, 30, 81), fill="black")
 
     result = detect_spaced_regions(image, mode="dark", row_counts=[2, 2])
 

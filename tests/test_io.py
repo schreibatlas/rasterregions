@@ -22,6 +22,7 @@ from rasterregions.io import (
     write_detection,
     write_spaced_hypotheses,
 )
+from rasterregions.models import DetectionConfig, SpacingConfig
 
 
 def test_tighten_bbox_and_crop_preserve_pixels() -> None:
@@ -70,7 +71,7 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
     assert payload["ownership"]["valid"]
     assert payload["cleaned_foreground"]["pixels"] == int(result.clean_mask.sum())
     assert payload["cleaned_foreground"]["mask_runs"]
-    assert payload["parameters"]["cleanup_config"]["micro_noise_max_area_ratio"] == 0.02
+    assert payload["parameters"]["cleanup_config"]["micro_noise_max_area_ratio"] == 0.03
     assert payload["parameters"]["spacing_config"]["auto_split_min_width_ratio"] == 1.35
     assert payload["regions"][0]["mask_runs"]
     assert json.dumps(payload, sort_keys=True) == json.dumps(
@@ -234,17 +235,21 @@ def test_spacing_payload_exposes_secondary_component_ownership() -> None:
     image = Image.new("RGB", (100, 80), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((25, 30, 49, 59), fill="black")
-    draw.point((37, 20), fill="black")
+    draw.rectangle((35, 18, 39, 22), fill="black")
 
     result = detect_spaced_regions(image, mode="dark")
     payload = detection_payload(result)
-    mark = next(decision for decision in result.component_decisions if decision.area == 1)
+    mark = next(decision for decision in result.component_decisions if decision.area == 25)
 
     assert payload["cleanup"][mark.component_index]["role"] == "secondary"
     region = payload["regions"][0]
     assert mark.component_index in region["secondary_component_indices"]
     assert region["primary_component_indices"]
-    assert payload["spacing"]["secondary_mark_assignments"][0]["candidate_region_indices"] == []
+    assignment = payload["spacing"]["secondary_mark_assignments"][0]
+    assert assignment["candidate_region_indices"] == [0]
+    assert assignment["mark_kind"] == "dot"
+    assert assignment["target_relation"] == "above"
+    assert assignment["excluded_region_indices"] == []
 
 
 def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) -> None:
@@ -261,6 +266,9 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) 
     assert payload["page_hypotheses"][0]["ownership_valid"]
     assert payload["selected"]["ownership"]["valid"]
     assert json.loads(encoded)["search"]["truncated"] == result.truncated
+    assert payload["search"]["search_truncated"] == result.search_truncated
+    assert payload["search"]["search_limit"] == result.search_limit
+    assert payload["search"]["alternatives_omitted"] == result.alternatives_omitted
     assert payload["page_hypotheses"][0]["count"] == 2
     assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
     assert (tmp_path / "cleaned_mask.png").is_file()
@@ -270,6 +278,38 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) 
     assert (tmp_path / "selected_partition.png").is_file()
     assert (tmp_path / "alternative_partition_2.png").is_file()
     assert manifest.is_file()
+
+
+def test_secondary_mark_branch_budget_is_explicit_and_only_limits_uncertain_ownership() -> None:
+    clear_image = Image.new("RGB", (150, 80), "white")
+    clear_draw = ImageDraw.Draw(clear_image)
+    clear_draw.rectangle((20, 25, 40, 55), fill="black")
+    clear_draw.ellipse((27, 12, 32, 17), fill="black")
+    clear_draw.rectangle((70, 25, 95, 55), fill="black")
+    config = DetectionConfig(spacing=SpacingConfig(max_secondary_mark_branches=1))
+    clear_result = detect_spaced_region_hypotheses(
+        clear_image, mode="dark", row_counts=[2], config=config
+    )
+    assert not clear_result.search_truncated
+
+    ambiguous_image = Image.new("RGB", (130, 80), "white")
+    ambiguous_draw = ImageDraw.Draw(ambiguous_image)
+    ambiguous_draw.rectangle((15, 25, 38, 55), fill="black")
+    ambiguous_draw.rectangle((75, 25, 98, 55), fill="black")
+    ambiguous_draw.ellipse((52, 12, 55, 15), fill="black")
+    ambiguous_config = DetectionConfig(
+        spacing=SpacingConfig(mark_assignment_margin=0.99, max_secondary_mark_branches=1)
+    )
+    hypotheses = detect_spaced_region_hypotheses(
+        ambiguous_image, mode="dark", row_counts=[2], config=ambiguous_config
+    )
+    payload = spaced_hypotheses_payload(hypotheses)
+
+    assert hypotheses.search_truncated
+    assert hypotheses.search_limit == "secondary-mark-branch-budget"
+    assert not hypotheses.alternatives_omitted
+    assert payload["search"]["search_limit"] == "secondary-mark-branch-budget"
+    assert payload["page_hypotheses"][0]["ownership_valid"]
 
 
 def test_anchor_diagnostics_and_boxes_are_serialized(tmp_path) -> None:
@@ -329,7 +369,7 @@ def test_detection_result_rejects_incomplete_explicit_ownership() -> None:
     image = Image.new("RGB", (300, 200), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((40, 90, 99, 149), fill="black")
-    draw.rectangle((200, 70, 205, 75), fill="black")
+    draw.rectangle((195, 65, 206, 76), fill="black")
     result = detect_spaced_regions(image, mode="dark")
     assert result.unassigned_mask is not None
     assert result.unassigned_mask.any()

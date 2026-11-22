@@ -302,6 +302,28 @@ class Component:
 
 
 @dataclass(frozen=True)
+class _ComponentScaleFeatures:
+    area_ratio: float
+    height_ratio: float
+    width_ratio: float
+    aspect_ratio: float
+
+
+def _component_scale_features(
+    component: Component,
+    body_area: float,
+    body_height: float,
+    body_width: float,
+) -> _ComponentScaleFeatures:
+    return _ComponentScaleFeatures(
+        area_ratio=component.area / max(1.0, body_area),
+        height_ratio=component.height / max(1.0, body_height),
+        width_ratio=component.width / max(1.0, body_width),
+        aspect_ratio=component.width / max(1, component.height),
+    )
+
+
+@dataclass(frozen=True)
 class ComponentDecision:
     """A raw-mask component's cleanup disposition and explanation."""
 
@@ -312,6 +334,10 @@ class ComponentDecision:
     reason: str | None = None
     role: ComponentRole = "primary"
     body_area_ratio: float | None = None
+
+    body_height_ratio: float | None = None
+    body_width_ratio: float | None = None
+    aspect_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -382,9 +408,10 @@ class AnchorSplitEvidence:
 
 @dataclass(frozen=True)
 class CleanupConfig:
-    """Artifact thresholds and maximum micro-noise ratios to median body dimensions.
+    """Artifact thresholds and scale-relative hard micro-noise limits.
 
-    Micro-noise is removed only when all three ratios are below their limits.
+    The legacy ``micro_noise_max_*`` fields remain as defaults for existing
+    configurations. Explicit ``hard_micro_noise_max_*`` values override them.
     """
 
     tiny_area_ratio: float = 0.008
@@ -395,12 +422,15 @@ class CleanupConfig:
     border_fill_ratio: float = 0.15
     max_component_area_ratio: float = 0.50
 
-    micro_noise_max_area_ratio: float = 0.02
-    micro_noise_max_height_ratio: float = 0.08
-    micro_noise_max_width_ratio: float = 0.08
+    micro_noise_max_area_ratio: float = 0.03
+    micro_noise_max_height_ratio: float = 0.12
+    micro_noise_max_width_ratio: float = 0.12
     secondary_mark_max_area_ratio: float = 0.20
     micro_noise_mark_max_vertical_gap_ratio: float = 0.50
     micro_noise_mark_max_horizontal_gap_ratio: float = 0.40
+    hard_micro_noise_max_area_ratio: float | None = None
+    hard_micro_noise_max_height_ratio: float | None = None
+    hard_micro_noise_max_width_ratio: float | None = None
 
     def __post_init__(self) -> None:
         values = (
@@ -436,6 +466,15 @@ class CleanupConfig:
         )
         if any(not 0.0 <= value <= 1.0 for value in fractions):
             raise ValueError("cleanup fractions must be between zero and one")
+        hard_thresholds = (
+            self.hard_micro_noise_max_area_ratio,
+            self.hard_micro_noise_max_height_ratio,
+            self.hard_micro_noise_max_width_ratio,
+        )
+        if any(value is not None and not isfinite(value) for value in hard_thresholds):
+            raise ValueError("hard micro-noise thresholds must be finite")
+        if any(value is not None and not 0.0 <= value <= 1.0 for value in hard_thresholds):
+            raise ValueError("hard micro-noise fractions must be between zero and one")
         if self.rule_aspect_ratio <= 0.0:
             raise ValueError("rule_aspect_ratio must be positive")
 
@@ -648,6 +687,8 @@ class SpacingConfig:
     secondary_mark_max_vertical_gap_ratio: float = 0.65
     secondary_mark_max_horizontal_gap_ratio: float = 0.75
     secondary_mark_max_bbox_expansion_ratio: float = 3.0
+    secondary_dot_max_aspect_ratio: float = 2.0
+    secondary_dot_max_area_ratio: float = 0.05
     secondary_bbox_expansion_weight: float = 0.4
 
     hypothesis_limit: int = 5
@@ -676,6 +717,8 @@ class SpacingConfig:
             self.secondary_mark_max_vertical_gap_ratio,
             self.secondary_mark_max_horizontal_gap_ratio,
             self.secondary_mark_max_bbox_expansion_ratio,
+            self.secondary_dot_max_aspect_ratio,
+            self.secondary_dot_max_area_ratio,
             self.secondary_bbox_expansion_weight,
         )
         if not all(isfinite(value) for value in values):
@@ -728,6 +771,10 @@ class SpacingConfig:
             0.0 <= self.secondary_mark_min_area_ratio <= self.secondary_mark_max_area_ratio <= 1.0
         ):
             raise ValueError("secondary mark area ratios must be ordered and in [0, 1]")
+        if self.secondary_dot_max_aspect_ratio < 1.0:
+            raise ValueError("secondary_dot_max_aspect_ratio must be at least one")
+        if not 0.0 <= self.secondary_dot_max_area_ratio <= 1.0:
+            raise ValueError("secondary_dot_max_area_ratio must be between zero and one")
         if (
             min(
                 self.secondary_mark_max_vertical_gap_ratio,
@@ -965,6 +1012,10 @@ class SecondaryMarkAssignment:
     horizontal_center_distance: float | None = None
     vertical_gap_ratio: float | None = None
     bbox_expansion_ratio: float | None = None
+    mark_kind: Literal["dot", "stroke"] | None = None
+    target_relation: Literal["above", "below", "overlap", "lateral"] | None = None
+    horizontal_gap_ratio: float | None = None
+    excluded_region_indices: tuple[int, ...] = ()
     reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -989,6 +1040,7 @@ class SecondaryMarkAssignment:
             self.horizontal_center_distance,
             self.vertical_gap_ratio,
             self.bbox_expansion_ratio,
+            self.horizontal_gap_ratio,
         )
         if any(value is not None and not isfinite(value) for value in metrics):
             raise ValueError("mark assignment geometry must be finite")
@@ -1005,6 +1057,12 @@ class SecondaryMarkAssignment:
             raise ValueError("horizontal center distance must be nonnegative")
         if self.bbox_expansion_ratio is not None and self.bbox_expansion_ratio < 1.0:
             raise ValueError("bbox expansion ratio must be at least one")
+        if self.horizontal_gap_ratio is not None and self.horizontal_gap_ratio < 0.0:
+            raise ValueError("horizontal gap ratio must be nonnegative")
+        if self.mark_kind not in {None, "dot", "stroke"}:
+            raise ValueError("mark_kind must be dot or stroke")
+        if self.target_relation not in {None, "above", "below", "overlap", "lateral"}:
+            raise ValueError("unsupported target relation")
         if self.margin is not None and self.margin < 0.0:
             raise ValueError("mark assignment margin must be nonnegative")
         if self.status == "assigned" and self.target_region_index is None:
@@ -1018,6 +1076,13 @@ class SecondaryMarkAssignment:
         ):
             raise ValueError("candidate region indexes must be nonnegative integers")
         object.__setattr__(self, "candidate_region_indices", candidate_indices)
+        excluded_indices = tuple(self.excluded_region_indices)
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in excluded_indices
+        ):
+            raise ValueError("excluded region indexes must be nonnegative integers")
+        object.__setattr__(self, "excluded_region_indices", excluded_indices)
 
 
 @dataclass(frozen=True)
@@ -1317,11 +1382,17 @@ class SpacedSegmentationHypotheses:
     truncated: bool
     failure_reason: str | None = None
 
+    search_truncated: bool = False
+    search_limit: str | None = None
+    alternatives_omitted: bool = False
+
     def __post_init__(self) -> None:
         rows = tuple(tuple(hypotheses) for hypotheses in self.row_hypotheses)
         pages = tuple(self.page_hypotheses)
         if self.failure_reason is not None and not self.failure_reason:
             raise ValueError("failure_reason must be nonempty when supplied")
+        if self.search_limit is not None and not self.search_limit:
+            raise ValueError("search_limit must be nonempty when supplied")
         if pages:
             selected_regions = self.selected.regions
             hypothesis_regions = pages[0].regions

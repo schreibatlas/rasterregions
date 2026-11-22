@@ -110,10 +110,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"status: {hypotheses.selected.status}")
             print(f"regions: {len(hypotheses.selected.regions)}")
             print(f"page hypotheses: {len(hypotheses.page_hypotheses)}")
-            diagnostics = hypotheses.selected.diagnostics
-            print(f"search truncated: {hypotheses.truncated}")
-            if diagnostics and diagnostics.search_limit:
-                print(f"search limit: {diagnostics.search_limit}")
+            print(f"search truncated: {hypotheses.search_truncated}")
+            print(f"alternatives omitted: {hypotheses.alternatives_omitted}")
+            if hypotheses.search_limit:
+                print(f"search limit: {hypotheses.search_limit}")
             if hypotheses.failure_reason:
                 print(f"failure: {hypotheses.failure_reason}")
             print(f"manifest: {manifest}")

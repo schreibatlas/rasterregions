@@ -84,7 +84,7 @@ def _draw_slanted_row(
             )
         if index % 8 == 0:
             dot_x = x + glyph_width - 20
-            draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
+            draw.ellipse((dot_x - 3, y - 7, dot_x + 3, y - 1), fill="black")
 
 
 def _alphabet_page() -> Image.Image:

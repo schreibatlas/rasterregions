@@ -9,7 +9,7 @@ def test_micro_noise_removed_and_dot_and_narrow_fragment_retained() -> None:
     mask = np.zeros((220, 440), dtype=bool)
     for x in (30, 130, 230):
         mask[90:150, x : x + 60] = True
-    mask[70:76, 55:61] = True
+    mask[68:77, 55:64] = True
     mask[60:70, 320] = True
     mask[20, 20] = True
     mask[20, 30:32] = True
@@ -21,8 +21,8 @@ def test_micro_noise_removed_and_dot_and_narrow_fragment_retained() -> None:
     removed = [d for d in cleaned.component_decisions if d.role == "micro-noise"]
     assert sorted(d.area for d in removed) == [1, 2, 3, 5]
     assert all(d.action == "removed" and d.body_area_ratio is not None for d in removed)
-    assert cleaned.mask[70:76, 55:61].all()
-    dot = next(d for d in cleaned.component_decisions if d.area == 36)
+    assert cleaned.mask[68:77, 55:64].all()
+    dot = next(d for d in cleaned.component_decisions if d.area == 81)
     assert dot.role == "secondary-candidate"
     assert dot.component_index in cleaned.provisional_component_indices
     assert cleaned.mask[60:70, 320].all()
@@ -37,15 +37,62 @@ def test_body_scale_ignores_page_rule_and_many_pixel_specks() -> None:
     mask[220, :] = True
     for x in range(10, 490, 5):
         mask[20, x] = True
-    mask[60:66, 65:71] = True
+    mask[58:67, 65:74] = True
 
     cleaned = clean_page_mask(mask)
     assert sum(d.role == "micro-noise" for d in cleaned.component_decisions) == 96
     assert any(d.role == "artifact" for d in cleaned.component_decisions)
-    dot = next(d for d in cleaned.component_decisions if d.area == 36)
+    dot = next(d for d in cleaned.component_decisions if d.area == 81)
     assert dot.action == "kept"
     assert dot.role == "secondary-candidate"
-    assert dot.body_area_ratio == pytest.approx(0.01)
+    assert dot.body_area_ratio == pytest.approx(0.0225)
+
+
+def test_near_body_specks_are_removed_at_supplied_scale_but_dots_survive() -> None:
+    mask = np.zeros((200, 300), dtype=bool)
+    for x in (20, 120, 220):
+        mask[60:140, x : x + 65] = True
+        mask[65:135, x + 5 : x + 60] = False
+    mask[40:53, 48:57] = True
+    mask[40:53, 148:157] = True
+    mask[100, 86:88] = True
+    mask[103:105, 86:88] = True
+    mask[108:111, 86:89] = True
+    mask[115:119, 86:89] = True
+
+    cleaned = clean_page_mask(mask)
+    specks = [d for d in cleaned.component_decisions if d.role == "micro-noise"]
+    dots = [d for d in cleaned.component_decisions if d.bbox.x0 in (48, 148)]
+
+    assert sorted(d.area for d in specks) == [2, 4, 9, 12]
+    assert all(d.reason == "below hard handwriting-scale threshold" for d in specks)
+    assert all(d.body_area_ratio is not None for d in specks)
+    assert len(dots) == 2
+    assert all(d.action == "kept" and d.role == "secondary-candidate" for d in dots)
+    assert all(d.body_area_ratio == pytest.approx(117 / 1350) for d in dots)
+    assert all(d.body_height_ratio == pytest.approx(13 / 80) for d in dots)
+    assert all(d.body_width_ratio == pytest.approx(9 / 65) for d in dots)
+    assert all(d.aspect_ratio == pytest.approx(9 / 13) for d in dots)
+    assert not cleaned.mask[100, 86:88].any()
+    assert not cleaned.mask[103:105, 86:88].any()
+    assert not cleaned.mask[108:111, 86:89].any()
+    assert not cleaned.mask[115:119, 86:89].any()
+    assert cleaned.mask[40:53, 48:57].all()
+    assert cleaned.mask[40:53, 148:157].all()
+
+
+def test_one_pixel_dot_is_retained_at_low_resolution_pen_scale() -> None:
+    mask = np.zeros((80, 100), dtype=bool)
+    mask[30:40, 40:42] = True
+    mask[20, 40] = True
+
+    cleaned = clean_page_mask(mask)
+    dot = next(d for d in cleaned.component_decisions if d.area == 1)
+
+    assert dot.action == "kept"
+    assert dot.role == "secondary-candidate"
+    assert dot.body_area_ratio == pytest.approx(1 / 20)
+    assert cleaned.mask[20, 40]
 
 
 def test_plausible_dot_is_assigned_and_remote_mark_does_not_expand_region() -> None:
@@ -55,8 +102,8 @@ def test_plausible_dot_is_assigned_and_remote_mark_does_not_expand_region() -> N
 
     mask = np.full((200, 300), 255, dtype=np.uint8)
     mask[90:150, 40:100] = 0
-    mask[70:76, 65:71] = 0
-    mask[20:26, 200:206] = 0
+    mask[68:77, 65:74] = 0
+    mask[20:29, 200:209] = 0
     result = detect_spaced_regions(Image.fromarray(mask), mode="dark")
     dot = next(d for d in result.component_decisions if d.bbox.x0 == 65)
     remote = next(d for d in result.component_decisions if d.bbox.x0 == 200)
@@ -95,6 +142,9 @@ def test_plausible_dot_is_assigned_and_remote_mark_does_not_expand_region() -> N
         "micro_noise_max_width_ratio",
         "micro_noise_mark_max_vertical_gap_ratio",
         "micro_noise_mark_max_horizontal_gap_ratio",
+        "hard_micro_noise_max_area_ratio",
+        "hard_micro_noise_max_height_ratio",
+        "hard_micro_noise_max_width_ratio",
     ],
 )
 def test_micro_noise_ratios_are_validated(name: str) -> None:

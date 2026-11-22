@@ -32,7 +32,7 @@ def test_three_widely_spaced_objects_and_page_artifacts_are_detected() -> None:
     assert result.page_hypotheses[0].row_hypotheses[0].count == 3
     reasons = [decision.reason for decision in result.selected.component_decisions]
     assert any(reason and "rule" in reason for reason in reasons)
-    assert any(reason and "tiny" in reason for reason in reasons)
+    assert any(reason == "below hard handwriting-scale threshold" for reason in reasons)
 
 
 def test_page_total_returns_competing_two_row_allocations_deterministically() -> None:

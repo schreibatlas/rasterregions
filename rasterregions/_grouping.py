@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 import numpy as np
 from PIL import Image
@@ -16,8 +16,22 @@ from .models import (
     RowBand,
     SecondaryMarkAssignment,
     SpacingConfig,
+    _component_scale_features,
 )
 from .regions import crop, tighten_bbox
+
+
+class _AttachmentMetrics(NamedTuple):
+    score: float
+    area_ratio: float
+    horizontal_overlap_ratio: float
+    horizontal_center_distance: float
+    vertical_gap_ratio: float
+    bbox_expansion_ratio: float
+    eligible: bool
+    mark_kind: Literal["dot", "stroke"]
+    target_relation: Literal["above", "below", "overlap", "lateral"]
+    horizontal_gap_ratio: float
 
 
 class _MarkAssignmentDetails(TypedDict, total=False):
@@ -26,6 +40,9 @@ class _MarkAssignmentDetails(TypedDict, total=False):
     horizontal_center_distance: float
     vertical_gap_ratio: float
     bbox_expansion_ratio: float
+    mark_kind: Literal["dot", "stroke"]
+    target_relation: Literal["above", "below", "overlap", "lateral"]
+    horizontal_gap_ratio: float
 
 
 def _size_scale(found: tuple[Component, ...] | list[Component]) -> tuple[float, float]:
@@ -384,75 +401,109 @@ def _split_spacing_body_anchor(
     return children[0], children[1]
 
 
+def _secondary_mark_kind(
+    component: Component, scale: float, config: SpacingConfig
+) -> Literal["dot", "stroke"]:
+    scale = max(1.0, scale)
+    features = _component_scale_features(component, scale * scale, scale, scale)
+    aspect_ratio = max(features.aspect_ratio, 1.0 / max(features.aspect_ratio, 1e-9))
+    if (
+        aspect_ratio <= config.secondary_dot_max_aspect_ratio
+        and features.area_ratio <= config.secondary_dot_max_area_ratio
+    ):
+        return "dot"
+    return "stroke"
+
+
+def _target_attachment_metrics(
+    component: Component,
+    target: Component,
+    scale: float,
+    config: SpacingConfig,
+    mark_kind: Literal["dot", "stroke"] | None = None,
+) -> _AttachmentMetrics:
+    scale = max(1.0, scale)
+    mark_kind = mark_kind or _secondary_mark_kind(component, scale, config)
+    horizontal_gap = max(
+        target.bbox.x0 - component.bbox.x1,
+        component.bbox.x0 - target.bbox.x1,
+        0,
+    )
+    vertical_gap = max(
+        target.bbox.y0 - component.bbox.y1,
+        component.bbox.y0 - target.bbox.y1,
+        0,
+    )
+    area_ratio = component.area / max(1.0, target.area)
+    expanded_width = max(target.bbox.x1, component.bbox.x1) - min(target.bbox.x0, component.bbox.x0)
+    expanded_height = max(target.bbox.y1, component.bbox.y1) - min(
+        target.bbox.y0, component.bbox.y0
+    )
+    expansion = expanded_width * expanded_height / (target.width * target.height)
+    overlap_x = max(
+        0,
+        min(target.bbox.x1, component.bbox.x1) - max(target.bbox.x0, component.bbox.x0),
+    )
+    overlap_y = max(
+        0,
+        min(target.bbox.y1, component.bbox.y1) - max(target.bbox.y0, component.bbox.y0),
+    )
+    overlap_ratio = overlap_x / max(1, min(target.width, component.width))
+    center_distance = abs(component.center_x - target.center_x) / scale
+    horizontal_gap_ratio = horizontal_gap / scale
+    vertical_gap_ratio = vertical_gap / scale
+    if component.bbox.y1 <= target.bbox.y0:
+        target_relation: Literal["above", "below", "overlap", "lateral"] = "above"
+    elif component.bbox.y0 >= target.bbox.y1:
+        target_relation = "below"
+    elif horizontal_gap > 0:
+        target_relation = "lateral"
+    else:
+        target_relation = "overlap"
+    score = (
+        horizontal_gap_ratio
+        + 0.7 * vertical_gap_ratio
+        - 0.30 * overlap_x / scale
+        - 0.20 * overlap_y / scale
+        + 0.15 * max(0.0, area_ratio - 0.45)
+        + config.secondary_bbox_expansion_weight * (expansion - 1.0)
+    )
+    eligible = (
+        config.secondary_mark_min_area_ratio <= area_ratio <= config.secondary_mark_max_area_ratio
+        and horizontal_gap <= config.secondary_mark_max_horizontal_gap_ratio * scale
+        and vertical_gap <= config.secondary_mark_max_vertical_gap_ratio * scale
+        and expansion <= config.secondary_mark_max_bbox_expansion_ratio
+    )
+    lateral_dot = mark_kind == "dot" and overlap_y > 0 and horizontal_gap > 0 and overlap_x == 0
+    return _AttachmentMetrics(
+        max(0.0, score),
+        area_ratio,
+        overlap_ratio,
+        center_distance,
+        vertical_gap_ratio,
+        expansion,
+        eligible and not lateral_dot,
+        mark_kind,
+        target_relation,
+        horizontal_gap_ratio,
+    )
+
+
 def _spacing_attachment_metrics(
     component: Component,
     targets: Sequence[Component],
     scale: float,
     config: SpacingConfig,
-) -> tuple[float, float, float, float, float, float, bool] | None:
-    """Return score, geometry, and eligibility for the best target."""
+    mark_kind: Literal["dot", "stroke"] | None = None,
+) -> _AttachmentMetrics | None:
+    """Return the best target-local geometry and eligibility."""
     if not targets:
         return None
-    scale = max(1.0, scale)
-    options = []
-    for target in targets:
-        horizontal_gap = max(
-            target.bbox.x0 - component.bbox.x1,
-            component.bbox.x0 - target.bbox.x1,
-            0,
-        )
-        vertical_gap = max(
-            target.bbox.y0 - component.bbox.y1,
-            component.bbox.y0 - target.bbox.y1,
-            0,
-        )
-        area_ratio = component.area / max(1.0, target.area)
-        expanded_width = max(target.bbox.x1, component.bbox.x1) - min(
-            target.bbox.x0, component.bbox.x0
-        )
-        expanded_height = max(target.bbox.y1, component.bbox.y1) - min(
-            target.bbox.y0, component.bbox.y0
-        )
-        expansion = expanded_width * expanded_height / (target.width * target.height)
-        overlap_x = max(
-            0,
-            min(target.bbox.x1, component.bbox.x1) - max(target.bbox.x0, component.bbox.x0),
-        )
-        overlap_y = max(
-            0,
-            min(target.bbox.y1, component.bbox.y1) - max(target.bbox.y0, component.bbox.y0),
-        )
-        overlap_ratio = overlap_x / max(1, min(target.width, component.width))
-        center_distance = abs(component.center_x - target.center_x) / scale
-        vertical_gap_ratio = vertical_gap / scale
-        score = (
-            horizontal_gap / scale
-            + 0.7 * vertical_gap_ratio
-            - 0.30 * overlap_x / scale
-            - 0.20 * overlap_y / scale
-            + 0.15 * max(0.0, area_ratio - 0.45)
-            + config.secondary_bbox_expansion_weight * (expansion - 1.0)
-        )
-        eligible = (
-            config.secondary_mark_min_area_ratio
-            <= area_ratio
-            <= config.secondary_mark_max_area_ratio
-            and horizontal_gap <= config.secondary_mark_max_horizontal_gap_ratio * scale
-            and vertical_gap <= config.secondary_mark_max_vertical_gap_ratio * scale
-            and expansion <= config.secondary_mark_max_bbox_expansion_ratio
-        )
-        options.append(
-            (
-                max(0.0, score),
-                area_ratio,
-                overlap_ratio,
-                center_distance,
-                vertical_gap_ratio,
-                expansion,
-                eligible,
-            )
-        )
-    eligible_options = [option for option in options if option[-1]]
+    options = [
+        _target_attachment_metrics(component, target, scale, config, mark_kind)
+        for target in targets
+    ]
+    eligible_options = [option for option in options if option.eligible]
     return min(eligible_options or options)
 
 
@@ -463,18 +514,7 @@ def _spacing_attachment_score(
     config: SpacingConfig | None = None,
 ) -> float | None:
     metrics = _spacing_attachment_metrics(component, targets, scale, config or SpacingConfig())
-    return metrics[0] if metrics is not None and metrics[-1] else None
-
-
-def _is_suspicious_lateral_speck(mark: Component, targets: Sequence[Component]) -> bool:
-    return any(
-        mark.area <= 4
-        and target.bbox.y0 + target.height * 0.25
-        < mark.center_y
-        < target.bbox.y1 - target.height * 0.25
-        and (mark.bbox.x1 <= target.bbox.x0 or mark.bbox.x0 >= target.bbox.x1)
-        for target in targets
-    )
+    return metrics.score if metrics is not None and metrics.eligible else None
 
 
 def _assign_spacing_marks(
@@ -491,56 +531,55 @@ def _assign_spacing_marks(
     assigned: list[list[Component]] = [[] for _ in bodies_by_region]
     decisions: list[SecondaryMarkAssignment] = []
     for mark in sorted(marks, key=lambda component: component.index):
-        if any(_is_suspicious_lateral_speck(mark, bodies) for bodies in bodies_by_region):
-            decisions.append(
-                SecondaryMarkAssignment(
-                    mark.index,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "unassigned",
-                    reason="lateral mark is not aligned with a body",
-                )
-            )
-            continue
-        options: list[tuple[tuple[float, float, float, float, float, float, bool], int, int]] = []
-        rejected: list[tuple[tuple[float, float, float, float, float, float, bool], int, int]] = []
+        mark_kind = _secondary_mark_kind(mark, median_height, config)
+        options: list[tuple[_AttachmentMetrics, int, int]] = []
+        rejected: list[tuple[_AttachmentMetrics, int, int]] = []
         for local_index, (region_index, bodies) in enumerate(
             zip(indices, bodies_by_region, strict=True)
         ):
             scale = region_scales[local_index] if region_scales is not None else median_height
-            metrics = _spacing_attachment_metrics(mark, bodies, scale, config)
+            metrics = _spacing_attachment_metrics(mark, bodies, scale, config, mark_kind)
             if metrics is not None:
                 entry = (metrics, region_index, local_index)
-                (options if metrics[-1] else rejected).append(entry)
-        options.sort(key=lambda item: (item[0], item[1]))
-        rejected.sort(key=lambda item: (item[0], item[1]))
-        if not options or options[0][0][0] > 2.5:
+                (options if metrics.eligible else rejected).append(entry)
+        options.sort(key=lambda item: (item[0].score, item[1]))
+        rejected.sort(key=lambda item: (item[0].score, item[1]))
+        excluded_region_indices = tuple(
+            region_index
+            for metrics, region_index, _ in rejected
+            if mark_kind == "dot" and metrics.target_relation == "lateral"
+        )
+        if not options or options[0][0].score > 2.5:
             evidence = options[0][0] if options else rejected[0][0] if rejected else None
-            details = _mark_assignment_details(evidence)
+            details = _mark_assignment_details(evidence, mark_kind)
+            reason = (
+                "compact dot has no eligible target after rejecting lateral geometry"
+                if excluded_region_indices
+                else "no nearby body passed mark geometry and bbox-expansion limits"
+            )
             decisions.append(
                 SecondaryMarkAssignment(
                     mark.index,
                     None,
-                    evidence[0] if evidence else None,
+                    evidence.score if evidence else None,
                     None,
                     None,
                     "unassigned",
-                    reason="no nearby body passed mark geometry and bbox-expansion limits",
+                    excluded_region_indices=excluded_region_indices,
+                    reason=reason,
                     **details,
                 )
             )
             continue
         best_metrics, target, local_target = options[0]
-        best_score = best_metrics[0]
-        second_score = options[1][0][0] if len(options) > 1 else None
+        best_score = best_metrics.score
+        second_score = options[1][0].score if len(options) > 1 else None
         margin = (
             (second_score - best_score) / max(1.0, abs(second_score))
             if second_score is not None
             else None
         )
-        details = _mark_assignment_details(best_metrics)
+        details = _mark_assignment_details(best_metrics, mark_kind)
         if margin is not None and margin < config.mark_assignment_margin:
             decisions.append(
                 SecondaryMarkAssignment(
@@ -551,6 +590,7 @@ def _assign_spacing_marks(
                     margin,
                     "ambiguous",
                     candidate_region_indices=tuple(item[1] for item in options[:2]),
+                    excluded_region_indices=excluded_region_indices,
                     reason="best-target score margin is below the configured threshold",
                     **details,
                 )
@@ -565,7 +605,13 @@ def _assign_spacing_marks(
                 second_score,
                 margin,
                 "assigned",
-                reason="plausible mark with clear best target and bounded bbox expansion",
+                candidate_region_indices=(target,),
+                excluded_region_indices=excluded_region_indices,
+                reason=(
+                    "clear target geometry; compact-dot lateral targets were rejected"
+                    if excluded_region_indices
+                    else "plausible mark with clear best target and bounded bbox expansion"
+                ),
                 **details,
             )
         )
@@ -573,16 +619,20 @@ def _assign_spacing_marks(
 
 
 def _mark_assignment_details(
-    metrics: tuple[float, float, float, float, float, float, bool] | None,
+    metrics: _AttachmentMetrics | None,
+    mark_kind: Literal["dot", "stroke"] | None = None,
 ) -> _MarkAssignmentDetails:
     if metrics is None:
-        return {}
+        return {"mark_kind": mark_kind} if mark_kind is not None else {}
     return {
-        "area_ratio": metrics[1],
-        "horizontal_overlap_ratio": metrics[2],
-        "horizontal_center_distance": metrics[3],
-        "vertical_gap_ratio": metrics[4],
-        "bbox_expansion_ratio": metrics[5],
+        "area_ratio": metrics.area_ratio,
+        "horizontal_overlap_ratio": metrics.horizontal_overlap_ratio,
+        "horizontal_center_distance": metrics.horizontal_center_distance,
+        "vertical_gap_ratio": metrics.vertical_gap_ratio,
+        "bbox_expansion_ratio": metrics.bbox_expansion_ratio,
+        "mark_kind": metrics.mark_kind,
+        "target_relation": metrics.target_relation,
+        "horizontal_gap_ratio": metrics.horizontal_gap_ratio,
     }
 
 
