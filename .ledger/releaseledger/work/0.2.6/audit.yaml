@@ -1,0 +1,45 @@
+schema_version: 1
+object_type: commit_audit_sheet
+versioning:
+  schema_version: 1
+  revision: 1
+release_version: 0.2.6
+git_base_ref: v0.2.5
+git_base_sha: 8769a6bb35bd6175b5488f8794fb657c643c7eb8
+git_head_ref: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+git_head_sha: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+git_range: 8769a6bb35bd6175b5488f8794fb657c643c7eb8..5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+commit_count: 1
+rows:
+- sha: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+  source_ref: git:5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+  short_sha: 5c3f657
+  changed_paths:
+  - docs/diagnostics.md
+  - docs/spaced-segmentation.md
+  - rasterregions/__init__.py
+  - rasterregions/_cleanup.py
+  - rasterregions/_grouping.py
+  - rasterregions/_partition.py
+  - rasterregions/_rows.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_anchor_first_segmentation.py
+  - tests/test_anchor_split_evidence.py
+  - tests/test_context_aware_cleanup.py
+  - tests/test_io.py
+  - tests/test_micro_noise_cleanup.py
+  - tests/test_segmentation_search_limits.py
+  - tests/test_spaced_regions.py
+  stats:
+    files_changed: 17
+    insertions: 1204
+    deletions: 73
+  inspected: false
+  inspected_paths: []
+  observed_behavior: ''
+  public_impact: unknown
+  decision: needs_review
+  stale: false
+  evidence_subject: 'feat: better detection and noise cleanup'

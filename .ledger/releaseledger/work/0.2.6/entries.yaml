@@ -1,0 +1,40 @@
+schema: releaseledger.entry-batch.v1
+operation: create
+schema_version: 1
+object_type: release_entry_batch
+release_version: 0.2.6
+git_base_ref: 8769a6bb35bd6175b5488f8794fb657c643c7eb8
+git_base_sha: 8769a6bb35bd6175b5488f8794fb657c643c7eb8
+git_head_ref: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+git_head_sha: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+include_merges: nontrivial
+entries:
+- kind: changed
+  summary: "Improved spaced segmentation with scale-aware cleanup, context-aware mark assignment, and evidence-based splits"
+  status: accepted
+  source_refs:
+  - git:5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+  paths:
+  - docs/diagnostics.md
+  - docs/spaced-segmentation.md
+  - rasterregions/__init__.py
+  - rasterregions/_cleanup.py
+  - rasterregions/_grouping.py
+  - rasterregions/_partition.py
+  - rasterregions/_rows.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_anchor_first_segmentation.py
+  - tests/test_anchor_split_evidence.py
+  - tests/test_context_aware_cleanup.py
+  - tests/test_io.py
+  - tests/test_micro_noise_cleanup.py
+  - tests/test_segmentation_search_limits.py
+  - tests/test_spaced_regions.py
+  sources:
+  - git:5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+  prs: []
+  issues: []
+  contributors:
+  - '@holgern'

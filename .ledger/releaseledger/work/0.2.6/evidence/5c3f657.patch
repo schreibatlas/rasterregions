@@ -1,0 +1,1983 @@
+ docs/diagnostics.md                      |   3 +
+ docs/spaced-segmentation.md              |  13 ++
+ rasterregions/__init__.py                |   2 +
+ rasterregions/_cleanup.py                |  73 ++++++--
+ rasterregions/_grouping.py               | 284 +++++++++++++++++++++++++++----
+ rasterregions/_partition.py              |   7 +
+ rasterregions/_rows.py                   |   4 +-
+ rasterregions/detect.py                  | 213 ++++++++++++++++++++++-
+ rasterregions/io.py                      | 104 +++++++++++
+ rasterregions/models.py                  | 194 ++++++++++++++++++++-
+ tests/test_anchor_first_segmentation.py  | 114 +++++++++++--
+ tests/test_anchor_split_evidence.py      |  72 ++++++++
+ tests/test_context_aware_cleanup.py      |   2 +-
+ tests/test_io.py                         |  61 ++++++-
+ tests/test_micro_noise_cleanup.py        | 102 +++++++++++
+ tests/test_segmentation_search_limits.py |  15 +-
+ tests/test_spaced_regions.py             |  14 +-
+ 17 files changed, 1204 insertions(+), 73 deletions(-)
+
+diff --git a/docs/diagnostics.md b/docs/diagnostics.md
+index 73530a2..ca29b62 100644
+--- a/docs/diagnostics.md
++++ b/docs/diagnostics.md
+@@ -15,6 +15,9 @@
+
+
+ Spacing-mode results add a `spacing` object to `detection_payload`: row-level counts and warnings, candidate and selected boundary evidence, secondary-mark assignments and margins, body counts, width-prior deviation, and unassigned-ink fraction/pixel count. The exact owner pixels are available through each `Region.mask` and `DetectionResult.unassigned_mask`; their union accounts for the cleaned foreground.
++Cleanup decisions include component width and height, scale-relative area, action, role, and reason. `DetectionDiagnostics.cleanup_config` and `spacing_config` expose the effective thresholds. `detection_payload` includes cleaned foreground row runs, each region's mask runs relative to its bbox, and an `ownership` summary with validity, owned, overlapping, and unassigned pixel counts.
++
++Spacing row diagnostics include the selected count and cost, the unsplit baseline cost, repair count, split-anchor indices, and structured evidence for accepted and rejected split candidates. Evidence includes the exact candidate cut, its allowed cut interval, geometry ratios, score, and reason codes. Row and page hypothesis payloads retain the unsplit alternative and split metadata. The search object reports truncation, the applicable limit, and any failure reason.
+ Component indexes in cleanup decisions, rows, and regions use the explicitly named `raw_mask` namespace. Removed components may therefore leave gaps in indexes for retained components.
+
+ ## Write artifacts
+diff --git a/docs/spaced-segmentation.md b/docs/spaced-segmentation.md
+index 06d3a5e..40e4167 100644
+--- a/docs/spaced-segmentation.md
++++ b/docs/spaced-segmentation.md
+@@ -17,6 +17,19 @@ result = detect_spaced_regions("page.png", row_counts=[None, 4])
+
+ The sequence must have one entry per detected row. Automatic inference is deterministic and bounded by `SpacingConfig.max_inferred_count`. Similar-cost alternatives, strong internal valleys in a single connected body, weak boundaries, suspicious width deviations, ambiguous marks, or unassigned ink can make the status `ambiguous`. A row that cannot be partitioned returns diagnostics rather than fabricated cuts.
+
++## Scale-aware cleanup and mark ownership
++
++`DetectionConfig.cleanup` controls component cleanup. A component is removed as micro-noise only when its area, height, and width are all below their respective ratios of the inferred median body scale. A small component within the configured mark-gap limits of a plausible body is preserved for contextual assignment instead. This keeps plausible dots available while discarding isolated specks. Page rules and border artifacts are handled by separate cleanup controls.
++
++
++The default micro-noise limits are 0.02 of median body area and 0.08 of median body height and width. Tiny components within 0.50 body heights vertically and 0.40 body widths horizontally are exempted for mark assignment. Mark assignment defaults to a 0.001 minimum relative area, 0.65 maximum vertical gap, 0.75 maximum horizontal gap, 3.0 maximum bbox expansion, and a 0.15 best-versus-second-best score margin.
++
++`DetectionConfig.spacing` controls secondary-mark attachment and automatic repairs. Mark candidates must satisfy size, alignment, distance, bbox-expansion, and score-margin gates. A mark that has no credible owner remains in `unassigned_mask`; it does not enlarge a region box.
++
++Automatic splits compete with the unsplit primary-body baseline. A split requires a narrow projection neck, substantial children with supported heights, an anomalously wide anchor, and the configured minimum improvement over the baseline after complexity cost. `auto_split_min_width_ratio`, `auto_split_max_neck_width_ratio`, `auto_split_min_child_area_fraction`, `auto_split_min_child_height_ratio`, and `auto_split_min_improvement` control these checks. Split evidence records the candidate cut and its allowed valley interval, measured ratios, acceptance, and reason codes. Caller-supplied exact counts can still use the broader partition search.
++
++The effective cleanup and spacing configurations are retained in `DetectionResult.diagnostics` and serialized in `detection_payload`. The result also exposes the cleaned `clean_mask`, each region's exact mask, and the complementary `unassigned_mask`. Explicit ownership masks are validated for overlap and exact foreground conservation.
++
+ ## Ownership and diagnostics
+
+ The API uses body and secondary-mark evidence, smoothed projection valleys, component-center midpoints, and the existing dynamic-programming partitioner. Width priors are estimated from the current row; scale-relative controls live in `DetectionConfig.spacing`:
+diff --git a/rasterregions/__init__.py b/rasterregions/__init__.py
+index 96d215b..579c580 100644
+--- a/rasterregions/__init__.py
++++ b/rasterregions/__init__.py
+@@ -18,6 +18,7 @@ from .detect import (
+ )
+ from .mask import foreground_evidence, foreground_mask
+ from .models import (
++    AnchorSplitEvidence,
+     BBox,
+     CleanupConfig,
+     Component,
+@@ -65,6 +66,7 @@ except ImportError:
+         __version__ = "0+unknown"
+
+ __all__ = [
++    "AnchorSplitEvidence",
+     "BBox",
+     "CleanupConfig",
+     "Component",
+diff --git a/rasterregions/_cleanup.py b/rasterregions/_cleanup.py
+index 23a14b2..e316ae4 100644
+--- a/rasterregions/_cleanup.py
++++ b/rasterregions/_cleanup.py
+@@ -83,18 +83,64 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+         component.index: _is_page_artifact(component, width, height, config) for component in found
+     }
+     non_artifacts = [component for component in found if not artifacts[component.index]]
+-    provisional_scale, _ = _size_scale(non_artifacts)
+-    provisional_threshold = provisional_scale * config.tiny_area_ratio
++    scale_candidates = [component for component in non_artifacts if component.area > 5]
++    micro_ids: set[int] = set()
++    body_area = 0.0
++    body_height = body_width = 0.0
++    bodies: list[Component] = []
++    if scale_candidates:
++        ordered = sorted(scale_candidates, key=lambda component: component.area)
++        upper = ordered[len(ordered) // 2 :]
++        body_area = float(np.median([component.area for component in upper]))
++        bodies = [component for component in ordered if component.area >= body_area * 0.2]
++        body_area = float(np.median([component.area for component in bodies]))
++        body_height = float(np.median([component.height for component in bodies]))
++        body_width = float(np.median([component.width for component in bodies]))
++        micro_ids = {
++            component.index
++            for component in non_artifacts
++            if component.area < body_area * config.micro_noise_max_area_ratio
++            and component.height < body_height * config.micro_noise_max_height_ratio
++            and component.width < body_width * config.micro_noise_max_width_ratio
++        }
++        micro_ids.difference_update(
++            component.index
++            for component in non_artifacts
++            if component.index in micro_ids
++            and any(
++                max(
++                    0,
++                    component.bbox.y0 - body.bbox.y1,
++                    body.bbox.y0 - component.bbox.y1,
++                )
++                <= body_height * config.micro_noise_mark_max_vertical_gap_ratio
++                and max(
++                    0,
++                    component.bbox.x0 - body.bbox.x1,
++                    body.bbox.x0 - component.bbox.x1,
++                )
++                <= body_width * config.micro_noise_mark_max_horizontal_gap_ratio
++                for body in bodies
++            )
++        )
++    retained = [component for component in non_artifacts if component.index not in micro_ids]
++    provisional_scale, _ = _size_scale(retained)
+     provisional = tuple(
+-        component for component in non_artifacts if component.area < provisional_threshold
++        component
++        for component in retained
++        if component.area
++        < max(
++            provisional_scale * config.tiny_area_ratio,
++            body_area * config.secondary_mark_max_area_ratio,
++        )
++        and component.height < body_height * 0.65
++        and component.width < body_width * 0.65
+     )
+     provisional_ids = {component.index for component in provisional}
+     primary_candidates = [
+-        component for component in non_artifacts if component.index not in provisional_ids
++        component for component in retained if component.index not in provisional_ids
+     ]
+-    if not primary_candidates and non_artifacts:
+-        primary_candidates = [max(non_artifacts, key=lambda component: component.area)]
+-    primary_area, median_height = _size_scale(primary_candidates)
++    primary_area, median_height = _size_scale(primary_candidates or retained)
+
+     cleaned = np.array(mask, dtype=bool, copy=True)
+     warnings: list[str] = []
+@@ -106,8 +152,12 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+             reason = "page border, rule, or oversized artifact"
+             cleaned[component.ys, component.xs] = False
+             warnings.append(f"Removed component {component.index}: {reason}.")
++        elif component.index in micro_ids:
++            reason = "tiny component below plausible detached-mark scale"
++            cleaned[component.ys, component.xs] = False
++            warnings.append(f"Removed component {component.index}: {reason}.")
+         elif component.index in provisional_ids:
+-            reason = "provisional small component retained for contextual assignment"
++            reason = "plausible detached handwriting mark retained for contextual assignment"
+             kept_components.append(component)
+         else:
+             kept_components.append(component)
+@@ -116,15 +166,18 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+                 component.index,
+                 component.bbox,
+                 component.area,
+-                "removed" if artifacts[component.index] else "kept",
++                "removed" if artifacts[component.index] or component.index in micro_ids else "kept",
+                 reason,
+                 role=(
+                     "artifact"
+                     if artifacts[component.index]
++                    else "micro-noise"
++                    if component.index in micro_ids
+                     else "secondary-candidate"
+                     if component.index in provisional_ids
+                     else "primary"
+                 ),
++                body_area_ratio=component.area / body_area if body_area else None,
+             )
+         )
+
+@@ -135,5 +188,5 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
+         median_height,
+         tuple(warnings),
+         tuple(decisions),
+-        tuple(component.index for component in provisional),
++        tuple(component.index for component in provisional if component.index not in micro_ids),
+     )
+diff --git a/rasterregions/_grouping.py b/rasterregions/_grouping.py
+index 9490793..5d8c3ed 100644
+--- a/rasterregions/_grouping.py
++++ b/rasterregions/_grouping.py
+@@ -7,6 +7,7 @@ import numpy as np
+ from PIL import Image
+
+ from .models import (
++    AnchorSplitEvidence,
+     BBox,
+     Component,
+     GroupingConfig,
+@@ -242,16 +243,149 @@ def _spacing_body_anchor_has_strong_valley(anchor: _BodyAnchor) -> bool:
+     return False
+
+
+-def _spacing_attachment_score(
++def _spacing_body_anchor_split_evidence(
++    anchor: _BodyAnchor,
++    anchor_index: int,
++    median_width: float | None,
++    config: SpacingConfig,
++) -> AnchorSplitEvidence | None:
++    projection = anchor.mask.sum(axis=0).astype(int)
++    if projection.size < 4:
++        return None
++    start = max(1, projection.size // 5)
++    stop = min(projection.size - 1, (projection.size * 4) // 5)
++    minima = [
++        x
++        for x in range(start, stop)
++        if projection[x] <= projection[x - 1] and projection[x] <= projection[x + 1]
++    ]
++    if not minima:
++        return None
++    cut = min(
++        minima,
++        key=lambda x: (
++            projection[x] / max(1, min(int(projection[:x].max()), int(projection[x + 1 :].max()))),
++            x,
++        ),
++    )
++    left_peak = int(projection[:cut].max())
++    right_peak = int(projection[cut + 1 :].max())
++    neck_reference = max(1, min(left_peak, right_peak))
++    valley_ratio = float(projection[cut] / neck_reference)
++    low_limit = max(1, int(np.floor(neck_reference * config.auto_split_max_neck_width_ratio)))
++    neck_start = cut
++    neck_stop = cut
++    while neck_start > 0 and projection[neck_start - 1] <= low_limit:
++        neck_start -= 1
++    while neck_stop + 1 < projection.size and projection[neck_stop + 1] <= low_limit:
++        neck_stop += 1
++    neck_width = neck_stop - neck_start + 1
++    neck_ratio = max(valley_ratio, neck_width / max(1, anchor.width))
++    left = anchor.mask[:, :cut]
++    right = anchor.mask[:, cut:]
++    total_area = max(1, anchor.area)
++    left_area_fraction = float(left.sum() / total_area)
++    right_area_fraction = float(right.sum() / total_area)
++
++    def child_height(mask: np.ndarray) -> float:
++        ys = np.flatnonzero(mask.any(axis=1))
++        return (int(ys[-1]) - int(ys[0]) + 1) / max(1, anchor.height) if len(ys) else 0.0
++
++    left_height_ratio = child_height(left)
++    right_height_ratio = child_height(right)
++    width_ratio = (
++        anchor.width / median_width if median_width is not None and median_width > 0 else None
++    )
++    narrow_neck = neck_ratio <= config.auto_split_max_neck_width_ratio
++    substantial_children = (
++        min(left_area_fraction, right_area_fraction) >= config.auto_split_min_child_area_fraction
++    )
++    tall_children = (
++        min(left_height_ratio, right_height_ratio) >= config.auto_split_min_child_height_ratio
++    )
++    width_anomaly = width_ratio is None or width_ratio >= config.auto_split_min_width_ratio
++    reasons = []
++    reasons.append("narrow-neck" if narrow_neck else "neck-too-wide")
++    reasons.append("substantial-children" if substantial_children else "child-area-too-small")
++    reasons.append("child-heights-supported" if tall_children else "child-height-too-small")
++    if width_ratio is None:
++        reasons.append("width-anomaly-not-applicable")
++    else:
++        reasons.append("wide-anchor" if width_anomaly else "anchor-width-not-anomalous")
++    signals = (
++        float(np.clip(1.0 - neck_ratio, 0.0, 1.0)),
++        float(np.clip(min(left_area_fraction, right_area_fraction) / 0.25, 0.0, 1.0)),
++        float(np.clip(min(left_height_ratio, right_height_ratio) / 0.70, 0.0, 1.0)),
++        float(np.clip(width_ratio / config.auto_split_min_width_ratio, 0.0, 1.0))
++        if width_ratio is not None
++        else 1.0,
++    )
++    score = float(np.mean(signals))
++    accepted = narrow_neck and substantial_children and tall_children and width_anomaly
++    return AnchorSplitEvidence(
++        anchor_index=anchor_index,
++        cut_x=anchor.bbox.x0 + cut,
++        cut_range=(anchor.bbox.x0 + neck_start, anchor.bbox.x0 + neck_stop + 1),
++        valley_strength=float(np.clip(1.0 - valley_ratio, 0.0, 1.0)),
++        neck_width=neck_width,
++        neck_width_ratio=float(np.clip(neck_ratio, 0.0, 1.0)),
++        left_area_fraction=left_area_fraction,
++        right_area_fraction=right_area_fraction,
++        left_height_ratio=left_height_ratio,
++        right_height_ratio=right_height_ratio,
++        anchor_width_ratio=width_ratio,
++        score=score,
++        accepted=accepted,
++        reasons=tuple(reasons),
++    )
++
++
++def _split_spacing_body_anchor(
++    anchor: _BodyAnchor, cut_x: int
++) -> tuple[_BodyAnchor, _BodyAnchor] | None:
++    local_cut = cut_x - anchor.bbox.x0
++    if not 0 < local_cut < anchor.width:
++        return None
++    children = []
++    for x0, x1 in ((0, local_cut), (local_cut, anchor.width)):
++        mask = anchor.mask[:, x0:x1]
++        ys, xs = np.nonzero(mask)
++        if not len(xs):
++            return None
++        left, right = int(xs.min()), int(xs.max()) + 1
++        top, bottom = int(ys.min()), int(ys.max()) + 1
++        child_mask = np.array(mask[top:bottom, left:right], copy=True)
++        bbox = BBox(
++            anchor.bbox.x0 + x0 + left,
++            anchor.bbox.y0 + top,
++            anchor.bbox.x0 + x0 + right,
++            anchor.bbox.y0 + bottom,
++        )
++        children.append(
++            _BodyAnchor(
++                component_indices=anchor.component_indices,
++                mask=child_mask,
++                bbox=bbox,
++                center_x=bbox.center_x,
++                width=bbox.width,
++                height=bbox.height,
++                area=int(child_mask.sum()),
++            )
++        )
++    return children[0], children[1]
++
++
++def _spacing_attachment_metrics(
+     component: Component,
+     targets: Sequence[Component],
+     scale: float,
+-) -> float | None:
+-    """Return the best scale-normalized geometric score for one mark and target set."""
++    config: SpacingConfig,
++) -> tuple[float, float, float, float, float, float, bool] | None:
++    """Return score, geometry, and eligibility for the best target."""
+     if not targets:
+         return None
+     scale = max(1.0, scale)
+-    scores: list[float] = []
++    options = []
+     for target in targets:
+         horizontal_gap = max(
+             target.bbox.x0 - component.bbox.x1,
+@@ -263,8 +397,14 @@ def _spacing_attachment_score(
+             component.bbox.y0 - target.bbox.y1,
+             0,
+         )
+-        if horizontal_gap > 1.5 * scale or vertical_gap > 1.75 * scale:
+-            continue
++        area_ratio = component.area / max(1.0, target.area)
++        expanded_width = max(target.bbox.x1, component.bbox.x1) - min(
++            target.bbox.x0, component.bbox.x0
++        )
++        expanded_height = max(target.bbox.y1, component.bbox.y1) - min(
++            target.bbox.y0, component.bbox.y0
++        )
++        expansion = expanded_width * expanded_height / (target.width * target.height)
+         overlap_x = max(
+             0,
+             min(target.bbox.x1, component.bbox.x1) - max(target.bbox.x0, component.bbox.x0),
+@@ -273,13 +413,48 @@ def _spacing_attachment_score(
+             0,
+             min(target.bbox.y1, component.bbox.y1) - max(target.bbox.y0, component.bbox.y0),
+         )
+-        size_ratio = min(component.area, target.area) / max(1.0, target.area)
+-        alignment_bonus = 0.30 * overlap_x / scale + 0.20 * overlap_y / scale
+-        size_penalty = 0.15 * max(0.0, size_ratio - 0.45)
+-        scores.append(
+-            horizontal_gap / scale + 0.7 * vertical_gap / scale - alignment_bonus + size_penalty
++        overlap_ratio = overlap_x / max(1, min(target.width, component.width))
++        center_distance = abs(component.center_x - target.center_x) / scale
++        vertical_gap_ratio = vertical_gap / scale
++        score = (
++            horizontal_gap / scale
++            + 0.7 * vertical_gap_ratio
++            - 0.30 * overlap_x / scale
++            - 0.20 * overlap_y / scale
++            + 0.15 * max(0.0, area_ratio - 0.45)
++            + config.secondary_bbox_expansion_weight * (expansion - 1.0)
++        )
++        eligible = (
++            config.secondary_mark_min_area_ratio
++            <= area_ratio
++            <= config.secondary_mark_max_area_ratio
++            and horizontal_gap <= config.secondary_mark_max_horizontal_gap_ratio * scale
++            and vertical_gap <= config.secondary_mark_max_vertical_gap_ratio * scale
++            and expansion <= config.secondary_mark_max_bbox_expansion_ratio
+         )
+-    return max(0.0, min(scores)) if scores else None
++        options.append(
++            (
++                max(0.0, score),
++                area_ratio,
++                overlap_ratio,
++                center_distance,
++                vertical_gap_ratio,
++                expansion,
++                eligible,
++            )
++        )
++    eligible_options = [option for option in options if option[-1]]
++    return min(eligible_options or options)
++
++
++def _spacing_attachment_score(
++    component: Component,
++    targets: Sequence[Component],
++    scale: float,
++    config: SpacingConfig | None = None,
++) -> float | None:
++    metrics = _spacing_attachment_metrics(component, targets, scale, config or SpacingConfig())
++    return metrics[0] if metrics is not None and metrics[-1] else None
+
+
+ def _is_suspicious_lateral_speck(mark: Component, targets: Sequence[Component]) -> bool:
+@@ -302,43 +477,61 @@ def _assign_spacing_marks(
+     region_indices: tuple[int, ...] | None = None,
+     region_scales: tuple[float, ...] | None = None,
+ ) -> tuple[tuple[SecondaryMarkAssignment, ...], tuple[tuple[Component, ...], ...]]:
+-    """Assign each secondary component to at most one region, preserving close ties."""
++    """Assign each plausible secondary component to at most one region."""
+     indices = region_indices or tuple(range(len(bodies_by_region)))
+     assigned: list[list[Component]] = [[] for _ in bodies_by_region]
+     decisions: list[SecondaryMarkAssignment] = []
+     for mark in sorted(marks, key=lambda component: component.index):
+         if any(_is_suspicious_lateral_speck(mark, bodies) for bodies in bodies_by_region):
+             decisions.append(
+-                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
+-            )
+-            continue
+-        scores = [
+-            (score, region_index, local_index)
+-            for local_index, (region_index, bodies) in enumerate(
+-                zip(indices, bodies_by_region, strict=True)
+-            )
+-            if (
+-                score := _spacing_attachment_score(
+-                    mark,
+-                    bodies,
+-                    region_scales[local_index] if region_scales is not None else median_height,
++                SecondaryMarkAssignment(
++                    mark.index,
++                    None,
++                    None,
++                    None,
++                    None,
++                    "unassigned",
++                    reason="lateral mark is not aligned with a body",
+                 )
+             )
+-            is not None
+-        ]
+-        scores.sort()
+-        if not scores or scores[0][0] > 2.5:
++            continue
++        options = []
++        rejected = []
++        for local_index, (region_index, bodies) in enumerate(
++            zip(indices, bodies_by_region, strict=True)
++        ):
++            scale = region_scales[local_index] if region_scales is not None else median_height
++            metrics = _spacing_attachment_metrics(mark, bodies, scale, config)
++            if metrics is not None:
++                entry = (metrics, region_index, local_index)
++                (options if metrics[-1] else rejected).append(entry)
++        options.sort(key=lambda item: (item[0], item[1]))
++        rejected.sort(key=lambda item: (item[0], item[1]))
++        if not options or options[0][0][0] > 2.5:
++            evidence = options[0][0] if options else rejected[0][0] if rejected else None
++            details = _mark_assignment_details(evidence)
+             decisions.append(
+-                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
++                SecondaryMarkAssignment(
++                    mark.index,
++                    None,
++                    evidence[0] if evidence else None,
++                    None,
++                    None,
++                    "unassigned",
++                    reason="no nearby body passed mark geometry and bbox-expansion limits",
++                    **details,
++                )
+             )
+             continue
+-        best_score, target, local_target = scores[0]
+-        second_score = scores[1][0] if len(scores) > 1 else None
++        best_metrics, target, local_target = options[0]
++        best_score = best_metrics[0]
++        second_score = options[1][0][0] if len(options) > 1 else None
+         margin = (
+             (second_score - best_score) / max(1.0, abs(second_score))
+             if second_score is not None
+             else None
+         )
++        details = _mark_assignment_details(best_metrics)
+         if margin is not None and margin < config.mark_assignment_margin:
+             decisions.append(
+                 SecondaryMarkAssignment(
+@@ -348,19 +541,40 @@ def _assign_spacing_marks(
+                     second_score,
+                     margin,
+                     "ambiguous",
+-                    candidate_region_indices=tuple(target for _, target, _ in scores[:2]),
++                    candidate_region_indices=tuple(item[1] for item in options[:2]),
++                    reason="best-target score margin is below the configured threshold",
++                    **details,
+                 )
+             )
+             continue
+         assigned[local_target].append(mark)
+         decisions.append(
+             SecondaryMarkAssignment(
+-                mark.index, target, best_score, second_score, margin, "assigned"
++                mark.index,
++                target,
++                best_score,
++                second_score,
++                margin,
++                "assigned",
++                reason="plausible mark with clear best target and bounded bbox expansion",
++                **details,
+             )
+         )
+     return tuple(decisions), tuple(tuple(group) for group in assigned)
+
+
++def _mark_assignment_details(metrics) -> dict[str, float | None]:
++    if metrics is None:
++        return {}
++    return {
++        "area_ratio": metrics[1],
++        "horizontal_overlap_ratio": metrics[2],
++        "horizontal_center_distance": metrics[3],
++        "vertical_gap_ratio": metrics[4],
++        "bbox_expansion_ratio": metrics[5],
++    }
++
++
+ def _make_region(
+     image: Image.Image,
+     mask: np.ndarray,
+diff --git a/rasterregions/_partition.py b/rasterregions/_partition.py
+index ba1f859..0c8c270 100644
+--- a/rasterregions/_partition.py
++++ b/rasterregions/_partition.py
+@@ -11,6 +11,7 @@ from PIL import Image
+ from ._grouping import _make_region, _size_scale, _spacing_body_components
+ from ._rows import _row_y_bounds
+ from .models import (
++    AnchorSplitEvidence,
+     BBox,
+     Component,
+     ExpectedCountScope,
+@@ -59,6 +60,12 @@ class RowPartition:
+     truncated_counts: tuple[int, ...] = ()
+     split_anchor_indices: tuple[int, ...] = ()
+     merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
++    baseline_cost: float | None = None
++    repair_count: int = 0
++    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
++    baseline_cost: float | None = None
++    repair_count: int = 0
++    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
+
+
+ def _combine_page_partitions(
+diff --git a/rasterregions/_rows.py b/rasterregions/_rows.py
+index a030d99..6114a79 100644
+--- a/rasterregions/_rows.py
++++ b/rasterregions/_rows.py
+@@ -155,7 +155,7 @@ def _spacing_rows_from_components(
+                 for body in row
+                 if (
+                     score := _spacing_attachment_score(
+-                        component, (body,), row_scales[row_index] or body_scale
++                        component, (body,), row_scales[row_index] or body_scale, spacing
+                     )
+                 )
+                 is not None
+@@ -175,7 +175,7 @@ def _spacing_rows_from_components(
+             for row_index, row in enumerate(rows_of_bodies)
+             if (
+                 score := _spacing_attachment_score(
+-                    component, row, row_scales[row_index] or body_scale
++                    component, row, row_scales[row_index] or body_scale, spacing
+                 )
+             )
+             is not None
+diff --git a/rasterregions/detect.py b/rasterregions/detect.py
+index cc3def4..20c2e09 100644
+--- a/rasterregions/detect.py
++++ b/rasterregions/detect.py
+@@ -16,8 +16,10 @@ from ._grouping import (
+     _merge_spacing_body_anchors,
+     _spacing_attachment_score,
+     _spacing_body_anchor_has_strong_valley,
++    _spacing_body_anchor_split_evidence,
+     _spacing_body_anchors,
+     _spacing_body_components,
++    _split_spacing_body_anchor,
+ )
+ from ._image import normalize_image
+ from ._partition import (
+@@ -309,6 +311,8 @@ def detect_regions(
+         mask_method=mask_result.method,
+         mask_confidence=mask_result.confidence,
+         foreground_fraction=float(mask_result.mask.mean()),
++        cleanup_config=config.cleanup,
++        spacing_config=config.spacing,
+     )
+     return DetectionResult(
+         source_path=normalized.source_path,
+@@ -417,6 +421,161 @@ def _row_from_body_anchors(
+     )
+
+
++def _automatic_anchor_hypotheses(
++    image: Image.Image,
++    found: tuple[Component, ...],
++    component_indices: Sequence[int],
++    page_shape: tuple[int, int],
++    row: RowBand,
++    row_index: int,
++    padding: int,
++    anchors: Sequence[_BodyAnchor],
++    baseline: RowPartition,
++    config: DetectionConfig,
++) -> RowPartition:
++    median_width = (
++        float(np.median([anchor.width for anchor in anchors])) if len(anchors) > 1 else None
++    )
++    evidence = []
++    for index, anchor in enumerate(anchors):
++        item = _spacing_body_anchor_split_evidence(anchor, index, median_width, config.spacing)
++        if item is None:
++            continue
++        if item.accepted and (
++            item.score - config.spacing.complexity_penalty
++            < config.spacing.auto_split_min_improvement
++        ):
++            item = replace(
++                item,
++                accepted=False,
++                reasons=(*item.reasons, "insufficient-improvement-over-unsplit-baseline"),
++            )
++        evidence.append(item)
++    accepted = tuple(item for item in evidence if item.accepted)
++    baseline_cost = float(sum(item.score for item in accepted))
++
++    def geometry(option: RowPartition) -> tuple[tuple[object, ...], ...]:
++        return tuple((region.bbox.as_tuple(), region.mask.tobytes()) for region in option.regions)
++
++    baseline = replace(
++        baseline,
++        cost=baseline_cost,
++        baseline_cost=baseline_cost,
++        repair_count=0,
++        split_anchor_indices=(),
++        segmentation_strategy="anchors",
++        attempted_counts=(len(baseline.regions),),
++        split_evidence=tuple(evidence),
++    )
++    options = [baseline]
++    seen_geometries = {geometry(baseline)}
++    choices = [[item] for item in accepted]
++    if len(accepted) > 1:
++        choices.append(list(accepted))
++    for choice in choices:
++        by_index = {item.anchor_index: item for item in choice}
++        repaired_anchors: list[_BodyAnchor] = []
++        valid = True
++        for index, anchor in enumerate(anchors):
++            item = by_index.get(index)
++            if item is None:
++                repaired_anchors.append(anchor)
++                continue
++            children = _split_spacing_body_anchor(anchor, item.cut_x)
++            if children is None:
++                valid = False
++                break
++            repaired_anchors.extend(children)
++        if not valid:
++            continue
++        complexity = config.spacing.complexity_penalty * len(choice)
++        candidate_cost = max(0.0, baseline_cost - sum(item.score for item in choice) + complexity)
++        candidate = _row_from_body_anchors(
++            image,
++            found,
++            component_indices,
++            page_shape,
++            row_index,
++            padding,
++            repaired_anchors,
++            candidate_cost,
++        )
++        if candidate is None:
++            continue
++        candidate_geometry = geometry(candidate)
++        if candidate_geometry in seen_geometries:
++            continue
++        seen_geometries.add(candidate_geometry)
++        boundaries = tuple(
++            PartitionBoundary(
++                x=item.cut_x,
++                projection=float(item.neck_width),
++                crossing_components=1,
++                confidence=item.score,
++                valley_strength=item.valley_strength,
++                component_indices=anchors[item.anchor_index].component_indices,
++                selected=True,
++                kind="valley",
++            )
++            for item in choice
++        )
++        ordered_regions = sorted(candidate.regions, key=lambda region: region.bbox.x0)
++        cut_positions = (
++            row.bbox.x0,
++            *(
++                (left.bbox.center_x + right.bbox.center_x) // 2
++                for left, right in zip(ordered_regions, ordered_regions[1:], strict=False)
++            ),
++            row.bbox.x1,
++        )
++        options.append(
++            replace(
++                candidate,
++                confidence=min(item.score for item in choice),
++                cost=candidate_cost,
++                baseline_cost=baseline_cost,
++                repair_count=len(choice),
++                split_anchor_indices=tuple(sorted(item.anchor_index for item in choice)),
++                segmentation_strategy="hybrid",
++                attempted_counts=(len(candidate.regions),),
++                partition_boundaries=boundaries,
++                body_counts_per_region=tuple(1 for _ in candidate.regions),
++                cut_positions=tuple(int(value) for value in cut_positions),
++                split_evidence=tuple(evidence),
++            )
++        )
++    options.sort(
++        key=lambda option: (
++            option.cost,
++            option.repair_count,
++            geometry(option),
++        )
++    )
++    selected = options[0]
++    limit = config.spacing.hypothesis_limit
++    retained = options[:limit]
++    if all(option is not baseline for option in retained):
++        retained[-1] = baseline
++        retained.sort(
++            key=lambda option: (
++                option.cost,
++                option.repair_count,
++                geometry(option),
++            )
++        )
++    alternatives = tuple(option for option in retained if option is not selected)
++    margin = None
++    if len(retained) > 1:
++        second_cost = retained[1].cost
++        margin = max(0.0, second_cost - selected.cost) / max(1.0, abs(second_cost))
++    return replace(
++        selected,
++        alternative_cost_margin=margin,
++        alternatives=alternatives,
++        truncated=selected.truncated or len(options) > limit,
++    )
++
++
+ def _row_with_local_anchor_repairs(
+     image: Image.Image,
+     mask: np.ndarray,
+@@ -436,6 +595,19 @@ def _row_with_local_anchor_repairs(
+     )
+     if partition is None:
+         return None
++    if target_count is None:
++        return _automatic_anchor_hypotheses(
++            image,
++            found,
++            component_indices,
++            mask.shape,
++            row,
++            row_index,
++            padding,
++            anchors,
++            partition,
++            config,
++        )
+     suspicious = [
+         index
+         for index, anchor in enumerate(anchors)
+@@ -570,7 +742,6 @@ def detect_spaced_regions(
+         component.index: layout.component_row_assignments[index]
+         for index, component in enumerate(cleaned.components)
+     }
+-    cleaned = _remove_unassigned_provisional_components(cleaned, layout)
+     rows = layout.rows
+     if row_counts is None:
+         requested: tuple[int | None, ...] = (None,) * len(rows)
+@@ -951,6 +1122,9 @@ def detect_spaced_regions(
+                 ),
+                 split_anchor_indices=partition.split_anchor_indices if partition else (),
+                 merged_anchor_groups=partition.merged_anchor_groups if partition else (),
++                baseline_cost=partition.baseline_cost if partition else None,
++                repair_count=partition.repair_count if partition else 0,
++                split_evidence=partition.split_evidence if partition else (),
+             )
+         )
+         for column_index, region in enumerate(row_regions):
+@@ -1031,6 +1205,7 @@ def detect_spaced_regions(
+                         component,
+                         bodies,
+                         row_diagnostics[regions[region_index].row_index].body_height,
++                        config.spacing,
+                     )
+                 )
+                 is not None
+@@ -1050,12 +1225,26 @@ def detect_spaced_regions(
+             )
+         elif component.index in unassigned_row_ids:
+             decision = SecondaryMarkAssignment(
+-                component.index, None, None, None, None, "unassigned"
++                component.index,
++                None,
++                None,
++                None,
++                None,
++                "unassigned",
++                reason="component is not plausibly associated with a primary body",
+             )
+         else:
+             decision = decision_by_component.get(
+                 component.index,
+-                SecondaryMarkAssignment(component.index, None, None, None, None, "unassigned"),
++                SecondaryMarkAssignment(
++                    component.index,
++                    None,
++                    None,
++                    None,
++                    None,
++                    "unassigned",
++                    reason="component has no secondary-mark assignment decision",
++                ),
+             )
+         secondary_assignments.append(decision)
+     secondary_assignments.sort(key=lambda item: item.component_index)
+@@ -1247,6 +1436,8 @@ def detect_spaced_regions(
+         unassigned_ink_fraction=unassigned_fraction,
+         search_truncated=search_truncated,
+         search_limit=search_limit,
++        cleanup_config=config.cleanup,
++        spacing_config=config.spacing,
+     )
+     result = DetectionResult(
+         source_path=normalized.source_path,
+@@ -1401,6 +1592,10 @@ def _selected_page_hypothesis(
+                         if boundary.x in boundaries[1:-1]
+                     )
+                 ),
++                baseline_cost=row_diagnostic.baseline_cost if row_diagnostic else None,
++                split_evidence=part.split_evidence if part else (),
++                split_anchor_indices=part.split_anchor_indices if part else (),
++                repair_count=part.repair_count if part else 0,
+                 cut_crossing_cost=part.cut_crossing_cost if part else 0.0,
+             )
+         )
+@@ -1481,6 +1676,10 @@ def _row_hypothesis_from_partition(
+         secondary_mark_assignments=tuple(row_assignments),
+         boundary_evidence=partition.partition_boundaries,
+         cut_crossing_cost=partition.cut_crossing_cost,
++        baseline_cost=partition.baseline_cost,
++        split_evidence=partition.split_evidence,
++        split_anchor_indices=partition.split_anchor_indices,
++        repair_count=partition.repair_count,
+     )
+
+
+@@ -1554,7 +1753,9 @@ def _page_hypotheses_for_partitions(
+                 if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
+                 else body_height
+             )
+-            score = _spacing_attachment_score(component, body_groups[region_index], row_scale)
++            score = _spacing_attachment_score(
++                component, body_groups[region_index], row_scale, config.spacing
++            )
+             if score is not None:
+                 scored.append((score, region_index))
+         scored.sort(key=lambda item: (item[0], item[1]))
+@@ -1730,6 +1931,10 @@ def _page_hypotheses_for_partitions(
+                     secondary_mark_assignments=row_assignments,
+                     boundary_evidence=partition.partition_boundaries,
+                     cut_crossing_cost=partition.cut_crossing_cost,
++                    baseline_cost=partition.baseline_cost,
++                    split_evidence=partition.split_evidence,
++                    split_anchor_indices=partition.split_anchor_indices,
++                    repair_count=partition.repair_count,
+                 )
+             )
+         if not row_hypotheses:
+diff --git a/rasterregions/io.py b/rasterregions/io.py
+index 0695b03..12c24bf 100644
+--- a/rasterregions/io.py
++++ b/rasterregions/io.py
+@@ -4,12 +4,14 @@ import contextlib
+ import json
+ import os
+ import tempfile
++from dataclasses import asdict
+ from pathlib import Path
+
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+ from .models import (
++    AnchorSplitEvidence,
+     DetectionResult,
+     PagePartitionHypothesis,
+     RegionHypothesis,
+@@ -46,6 +48,8 @@ def detection_payload(result: DetectionResult) -> dict:
+             "expected_count": result.expected_count,
+             "expected_count_scope": result.expected_count_scope,
+             "roi": list(diagnostics.roi.as_tuple()) if diagnostics and diagnostics.roi else None,
++            "cleanup_config": asdict(diagnostics.cleanup_config) if diagnostics else None,
++            "spacing_config": asdict(diagnostics.spacing_config) if diagnostics else None,
+         },
+         "mask": {
+             "method": result.mask_result.method,
+@@ -54,14 +58,27 @@ def detection_payload(result: DetectionResult) -> dict:
+             "foreground_fraction": round(float(result.mask_result.mask.mean()), 6),
+             "warnings": list(result.mask_result.warnings),
+         },
++        "cleaned_foreground": {
++            "shape": list(result.clean_mask.shape),
++            "pixels": int(result.clean_mask.sum()),
++            "mask_runs": _mask_runs(result.clean_mask),
++        },
++        "ownership": _ownership_payload(result),
+         "cleanup": [
+             {
+                 "component_index": decision.component_index,
+                 "bbox": list(decision.bbox.as_tuple()),
++                "width": decision.bbox.width,
++                "height": decision.bbox.height,
+                 "area": decision.area,
+                 "role": decision.role,
+                 "action": decision.action,
+                 "reason": decision.reason,
++                "body_area_ratio": (
++                    round(decision.body_area_ratio, 6)
++                    if decision.body_area_ratio is not None
++                    else None
++                ),
+             }
+             for decision in decisions
+         ],
+@@ -91,6 +108,10 @@ def detection_payload(result: DetectionResult) -> dict:
+                 "reading_order": region.reading_order,
+                 "bbox": list(region.bbox.as_tuple()),
+                 "confidence": round(region.confidence, 4),
++                "width": region.bbox.width,
++                "height": region.bbox.height,
++                "area": int(region.mask.sum()),
++                "mask_runs": _mask_runs(region.mask),
+                 "component_indices": list(region.component_indices),
+                 "primary_component_indices": list(region.primary_component_indices),
+                 "secondary_component_indices": list(region.secondary_component_indices),
+@@ -110,6 +131,7 @@ def detection_payload(result: DetectionResult) -> dict:
+             "best_second_best_partition_margin": diagnostics.best_second_best_partition_margin,
+             "unassigned_ink_fraction": round(diagnostics.unassigned_ink_fraction, 6),
+             "unassigned_ink_pixels": int(result.unassigned_mask.sum()),
++            "ownership": _ownership_payload(result),
+             "search_truncated": diagnostics.search_truncated,
+             "search_limit": diagnostics.search_limit,
+             "width_prior_deviation": diagnostics.width_prior_deviation,
+@@ -130,11 +152,19 @@ def detection_payload(result: DetectionResult) -> dict:
+                     "attempted_counts": list(row.attempted_counts),
+                     "truncated_counts": list(row.truncated_counts),
+                     "split_anchor_indices": list(row.split_anchor_indices),
++                    "repair_count": row.repair_count,
++                    "split_evidence": [
++                        _split_evidence_payload(evidence) for evidence in row.split_evidence
++                    ],
+                     "merged_anchor_groups": [list(group) for group in row.merged_anchor_groups],
+                     "inferred_count": row.inferred_count,
+                     "requested_count": row.requested_count,
+                     "selected_boundaries": list(row.selected_boundaries),
+                     "confidence": round(row.confidence, 4),
++                    "selected_count": row.inferred_count,
++                    "baseline_cost": (
++                        round(row.baseline_cost, 4) if row.baseline_cost is not None else None
++                    ),
+                     "cost": round(row.cost, 4),
+                     "alternative_cost_margin": (
+                         round(row.alternative_cost_margin, 4)
+@@ -167,6 +197,12 @@ def detection_payload(result: DetectionResult) -> dict:
+                     "second_best_score": assignment.second_best_score,
+                     "margin": assignment.margin,
+                     "status": assignment.status,
++                    "area_ratio": assignment.area_ratio,
++                    "horizontal_overlap_ratio": assignment.horizontal_overlap_ratio,
++                    "horizontal_center_distance": assignment.horizontal_center_distance,
++                    "vertical_gap_ratio": assignment.vertical_gap_ratio,
++                    "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
++                    "reason": assignment.reason,
+                     "candidate_region_indices": list(assignment.candidate_region_indices),
+                 }
+                 for assignment in diagnostics.secondary_mark_assignments
+@@ -192,6 +228,60 @@ def _mask_runs(mask: np.ndarray) -> list[list[int]]:
+     return runs
+
+
++def _split_evidence_payload(evidence: AnchorSplitEvidence) -> dict:
++    return {
++        "anchor_index": evidence.anchor_index,
++        "cut_x": evidence.cut_x,
++        "cut_range": list(evidence.cut_range),
++        "valley_strength": round(evidence.valley_strength, 6),
++        "neck_width": evidence.neck_width,
++        "neck_width_ratio": round(evidence.neck_width_ratio, 6),
++        "left_area_fraction": round(evidence.left_area_fraction, 6),
++        "right_area_fraction": round(evidence.right_area_fraction, 6),
++        "left_height_ratio": round(evidence.left_height_ratio, 6),
++        "right_height_ratio": round(evidence.right_height_ratio, 6),
++        "anchor_width_ratio": (
++            round(evidence.anchor_width_ratio, 6)
++            if evidence.anchor_width_ratio is not None
++            else None
++        ),
++        "score": round(evidence.score, 6),
++        "accepted": evidence.accepted,
++        "reasons": list(evidence.reasons),
++    }
++
++
++def _ownership_payload(result: DetectionResult) -> dict:
++    ownership = np.zeros_like(result.clean_mask)
++    overlap = np.zeros_like(result.clean_mask)
++    in_bounds = True
++    for region in result.regions:
++        bbox = region.bbox
++        if bbox.x1 > ownership.shape[1] or bbox.y1 > ownership.shape[0]:
++            in_bounds = False
++            continue
++        local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
++        local_overlap = overlap[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
++        local_overlap |= local & region.mask
++        local |= region.mask
++    unassigned = result.unassigned_mask
++    assert unassigned is not None
++    valid = (
++        in_bounds
++        and not np.any(overlap)
++        and not np.any(ownership & unassigned)
++        and np.array_equal(ownership | unassigned, result.clean_mask)
++    )
++    return {
++        "valid": bool(valid),
++        "cleaned_foreground_pixels": int(result.clean_mask.sum()),
++        "region_owned_pixels": int(ownership.sum()),
++        "overlap_pixels": int(overlap.sum()),
++        "unassigned_pixels": int(unassigned.sum()),
++        "unassigned_mask_runs": _mask_runs(unassigned),
++    }
++
++
+ def _boundary_payload(boundary) -> dict:
+     return {
+         "x": boundary.x,
+@@ -215,6 +305,12 @@ def _assignment_payload(assignment) -> dict:
+         "margin": assignment.margin,
+         "status": assignment.status,
+         "candidate_region_indices": list(assignment.candidate_region_indices),
++        "area_ratio": assignment.area_ratio,
++        "horizontal_overlap_ratio": assignment.horizontal_overlap_ratio,
++        "horizontal_center_distance": assignment.horizontal_center_distance,
++        "vertical_gap_ratio": assignment.vertical_gap_ratio,
++        "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
++        "reason": assignment.reason,
+     }
+
+
+@@ -247,6 +343,10 @@ def _row_hypothesis_payload(row: RowPartitionHypothesis) -> dict:
+     return {
+         "row_index": row.row_index,
+         "count": row.count,
++        "split_anchor_indices": list(row.split_anchor_indices),
++        "repair_count": row.repair_count,
++        "baseline_cost": round(row.baseline_cost, 6) if row.baseline_cost is not None else None,
++        "split_evidence": [_split_evidence_payload(item) for item in row.split_evidence],
+         "boundaries": list(row.boundaries),
+         "boundary_evidence": [_boundary_payload(boundary) for boundary in row.boundary_evidence],
+         "cost": round(row.cost, 6),
+@@ -285,6 +385,10 @@ def _page_hypothesis_payload(
+         "unassigned_ink_pixels": int(unassigned.sum()),
+         "unassigned_mask_runs": _mask_runs(unassigned),
+         "cleaned_foreground_pixels": cleaned_foreground_pixels,
++        "region_owned_pixels": sum(
++            int(region.mask.sum()) for row in page.row_hypotheses for region in row.regions
++        ),
++        "ownership_valid": True,
+         "rows": [_row_hypothesis_payload(row) for row in page.row_hypotheses],
+     }
+
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index 7659a22..bf51b71 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -19,6 +19,7 @@ ComponentRole = Literal[
+     "noise",
+     "artifact",
+     "ambiguous",
++    "micro-noise",
+ ]
+
+
+@@ -310,6 +311,7 @@ class ComponentDecision:
+     action: Literal["kept", "removed"]
+     reason: str | None = None
+     role: ComponentRole = "primary"
++    body_area_ratio: float | None = None
+
+
+ @dataclass(frozen=True)
+@@ -333,9 +335,57 @@ class PartitionBoundary:
+             raise ValueError("boundary crossing_cost must be finite and nonnegative")
+
+
++@dataclass(frozen=True)
++class AnchorSplitEvidence:
++    """Measured evidence for splitting one primary body anchor."""
++
++    anchor_index: int
++    cut_x: int
++    cut_range: tuple[int, int]
++    valley_strength: float
++    neck_width: int
++    neck_width_ratio: float
++    left_area_fraction: float
++    right_area_fraction: float
++    left_height_ratio: float
++    right_height_ratio: float
++    anchor_width_ratio: float | None
++    score: float
++    accepted: bool
++    reasons: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if self.anchor_index < 0 or self.cut_x < 0 or self.neck_width < 1:
++            raise ValueError("split evidence indexes and neck width must be positive")
++        if len(self.cut_range) != 2 or not self.cut_range[0] <= self.cut_x < self.cut_range[1]:
++            raise ValueError("cut_x must lie inside the positive cut_range")
++        values = (
++            self.valley_strength,
++            self.neck_width_ratio,
++            self.left_area_fraction,
++            self.right_area_fraction,
++            self.left_height_ratio,
++            self.right_height_ratio,
++            self.score,
++        )
++        if not all(isfinite(value) for value in values):
++            raise ValueError("split evidence values must be finite")
++        if any(not 0.0 <= value <= 1.0 for value in values):
++            raise ValueError("split evidence ratios and score must be between zero and one")
++        if self.anchor_width_ratio is not None and (
++            not isfinite(self.anchor_width_ratio) or self.anchor_width_ratio <= 0.0
++        ):
++            raise ValueError("anchor_width_ratio must be finite and positive")
++        object.__setattr__(self, "cut_range", tuple(self.cut_range))
++        object.__setattr__(self, "reasons", tuple(self.reasons))
++
++
+ @dataclass(frozen=True)
+ class CleanupConfig:
+-    """Thresholds for artifact removal and provisional tiny-component classification."""
++    """Artifact thresholds and maximum micro-noise ratios to median body dimensions.
++
++    Micro-noise is removed only when all three ratios are below their limits.
++    """
+
+     tiny_area_ratio: float = 0.008
+     rule_aspect_ratio: float = 12.0
+@@ -345,6 +395,13 @@ class CleanupConfig:
+     border_fill_ratio: float = 0.15
+     max_component_area_ratio: float = 0.50
+
++    micro_noise_max_area_ratio: float = 0.02
++    micro_noise_max_height_ratio: float = 0.08
++    micro_noise_max_width_ratio: float = 0.08
++    secondary_mark_max_area_ratio: float = 0.20
++    micro_noise_mark_max_vertical_gap_ratio: float = 0.50
++    micro_noise_mark_max_horizontal_gap_ratio: float = 0.40
++
+     def __post_init__(self) -> None:
+         values = (
+             self.tiny_area_ratio,
+@@ -354,6 +411,12 @@ class CleanupConfig:
+             self.border_bbox_ratio,
+             self.border_fill_ratio,
+             self.max_component_area_ratio,
++            self.micro_noise_max_area_ratio,
++            self.micro_noise_max_height_ratio,
++            self.micro_noise_max_width_ratio,
++            self.secondary_mark_max_area_ratio,
++            self.micro_noise_mark_max_vertical_gap_ratio,
++            self.micro_noise_mark_max_horizontal_gap_ratio,
+         )
+         if not all(isfinite(value) for value in values):
+             raise ValueError("cleanup configuration values must be finite")
+@@ -364,6 +427,12 @@ class CleanupConfig:
+             self.border_bbox_ratio,
+             self.border_fill_ratio,
+             self.max_component_area_ratio,
++            self.micro_noise_max_area_ratio,
++            self.micro_noise_max_height_ratio,
++            self.micro_noise_max_width_ratio,
++            self.secondary_mark_max_area_ratio,
++            self.micro_noise_mark_max_vertical_gap_ratio,
++            self.micro_noise_mark_max_horizontal_gap_ratio,
+         )
+         if any(not 0.0 <= value <= 1.0 for value in fractions):
+             raise ValueError("cleanup fractions must be between zero and one")
+@@ -566,9 +635,20 @@ class SpacingConfig:
+     max_region_width_ratio: float = 3.5
+     max_inferred_count: int = 24
+     complexity_penalty: float = 0.35
++    auto_split_min_width_ratio: float = 1.35
++    auto_split_max_neck_width_ratio: float = 0.20
++    auto_split_min_child_area_fraction: float = 0.16
++    auto_split_min_child_height_ratio: float = 0.45
++    auto_split_min_improvement: float = 0.15
+     ambiguity_margin: float = 0.10
+     mark_assignment_margin: float = 0.15
+     row_assignment_margin: float = 0.15
++    secondary_mark_min_area_ratio: float = 0.001
++    secondary_mark_max_area_ratio: float = 0.60
++    secondary_mark_max_vertical_gap_ratio: float = 0.65
++    secondary_mark_max_horizontal_gap_ratio: float = 0.75
++    secondary_mark_max_bbox_expansion_ratio: float = 3.0
++    secondary_bbox_expansion_weight: float = 0.4
+
+     hypothesis_limit: int = 5
+     max_candidate_boundaries: int = 256
+@@ -586,6 +666,17 @@ class SpacingConfig:
+             self.ambiguity_margin,
+             self.mark_assignment_margin,
+             self.row_assignment_margin,
++            self.auto_split_min_width_ratio,
++            self.auto_split_max_neck_width_ratio,
++            self.auto_split_min_child_area_fraction,
++            self.auto_split_min_child_height_ratio,
++            self.auto_split_min_improvement,
++            self.secondary_mark_min_area_ratio,
++            self.secondary_mark_max_area_ratio,
++            self.secondary_mark_max_vertical_gap_ratio,
++            self.secondary_mark_max_horizontal_gap_ratio,
++            self.secondary_mark_max_bbox_expansion_ratio,
++            self.secondary_bbox_expansion_weight,
+         )
+         if not all(isfinite(value) for value in values):
+             raise ValueError("spacing configuration values must be finite")
+@@ -623,6 +714,30 @@ class SpacingConfig:
+         margins = (self.ambiguity_margin, self.mark_assignment_margin, self.row_assignment_margin)
+         if any(not 0.0 <= margin <= 1.0 for margin in margins):
+             raise ValueError("spacing confidence margins must be between zero and one")
++        if self.auto_split_min_width_ratio < 1.0:
++            raise ValueError("auto_split_min_width_ratio must be at least one")
++        auto_split_fractions = (
++            self.auto_split_max_neck_width_ratio,
++            self.auto_split_min_child_area_fraction,
++            self.auto_split_min_child_height_ratio,
++            self.auto_split_min_improvement,
++        )
++        if any(not 0.0 <= value <= 1.0 for value in auto_split_fractions):
++            raise ValueError("automatic split ratios and improvement must be between zero and one")
++        if not (
++            0.0 <= self.secondary_mark_min_area_ratio <= self.secondary_mark_max_area_ratio <= 1.0
++        ):
++            raise ValueError("secondary mark area ratios must be ordered and in [0, 1]")
++        if (
++            min(
++                self.secondary_mark_max_vertical_gap_ratio,
++                self.secondary_mark_max_horizontal_gap_ratio,
++                self.secondary_bbox_expansion_weight,
++            )
++            < 0.0
++            or self.secondary_mark_max_bbox_expansion_ratio < 1.0
++        ):
++            raise ValueError("secondary mark distance and expansion limits must be nonnegative")
+
+
+ @dataclass(frozen=True)
+@@ -656,6 +771,8 @@ class DetectionDiagnostics:
+     foreground_fraction: float = 0.0
+     roi: BBox | None = None
+
++    cleanup_config: CleanupConfig | None = None
++    spacing_config: SpacingConfig | None = None
+     row_segmentation: tuple[RowSegmentationDiagnostics, ...] = ()
+     secondary_mark_assignments: tuple[SecondaryMarkAssignment, ...] = ()
+     selected_region_count: int | None = None
+@@ -675,6 +792,10 @@ class DetectionDiagnostics:
+             self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
+         )
+         object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
++        if self.cleanup_config is not None and not isinstance(self.cleanup_config, CleanupConfig):
++            raise ValueError("cleanup_config must be CleanupConfig")
++        if self.spacing_config is not None and not isinstance(self.spacing_config, SpacingConfig):
++            raise ValueError("spacing_config must be SpacingConfig")
+         if any(
+             isinstance(count, bool) or not isinstance(count, int) or count < 0
+             for count in self.body_counts_per_region
+@@ -739,6 +860,9 @@ class RowSegmentationDiagnostics:
+     truncated_counts: tuple[int, ...] = ()
+     split_anchor_indices: tuple[int, ...] = ()
+     merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
++    baseline_cost: float | None = None
++    repair_count: int = 0
++    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
+
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "component_indices", tuple(self.component_indices))
+@@ -751,6 +875,7 @@ class RowSegmentationDiagnostics:
+         object.__setattr__(self, "attempted_counts", tuple(self.attempted_counts))
+         object.__setattr__(self, "truncated_counts", tuple(self.truncated_counts))
+         object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
++        object.__setattr__(self, "split_evidence", tuple(self.split_evidence))
+         merged_groups = tuple(tuple(group) for group in self.merged_anchor_groups)
+         object.__setattr__(self, "merged_anchor_groups", merged_groups)
+         if self.anchor_count is not None and (
+@@ -767,6 +892,14 @@ class RowSegmentationDiagnostics:
+                 for count in counts
+             ):
+                 raise ValueError("attempted counts must be positive integers")
++        if self.repair_count < 0:
++            raise ValueError("repair_count must be nonnegative")
++        if self.baseline_cost is not None and (
++            not isfinite(self.baseline_cost) or self.baseline_cost < 0.0
++        ):
++            raise ValueError("baseline_cost must be finite and nonnegative")
++        if any(not isinstance(item, AnchorSplitEvidence) for item in self.split_evidence):
++            raise ValueError("split_evidence must contain AnchorSplitEvidence values")
+         if any(index < 0 for index in self.split_anchor_indices):
+             raise ValueError("split anchor indices must be nonnegative")
+         if any(len(group) < 2 or any(index < 0 for index in group) for group in merged_groups):
+@@ -827,6 +960,12 @@ class SecondaryMarkAssignment:
+     margin: float | None
+     status: Literal["assigned", "ambiguous", "unassigned"]
+     candidate_region_indices: tuple[int, ...] = ()
++    area_ratio: float | None = None
++    horizontal_overlap_ratio: float | None = None
++    horizontal_center_distance: float | None = None
++    vertical_gap_ratio: float | None = None
++    bbox_expansion_ratio: float | None = None
++    reason: str | None = None
+
+     def __post_init__(self) -> None:
+         if (
+@@ -844,6 +983,28 @@ class SecondaryMarkAssignment:
+         scores = (self.best_score, self.second_best_score, self.margin)
+         if any(value is not None and not isfinite(value) for value in scores):
+             raise ValueError("mark assignment scores must be finite")
++        metrics = (
++            self.area_ratio,
++            self.horizontal_overlap_ratio,
++            self.horizontal_center_distance,
++            self.vertical_gap_ratio,
++            self.bbox_expansion_ratio,
++        )
++        if any(value is not None and not isfinite(value) for value in metrics):
++            raise ValueError("mark assignment geometry must be finite")
++        if any(
++            value is not None and not 0.0 <= value <= 1.0
++            for value in (
++                self.area_ratio,
++                self.horizontal_overlap_ratio,
++                self.vertical_gap_ratio,
++            )
++        ):
++            raise ValueError("mark assignment ratios must be between zero and one")
++        if self.horizontal_center_distance is not None and self.horizontal_center_distance < 0.0:
++            raise ValueError("horizontal center distance must be nonnegative")
++        if self.bbox_expansion_ratio is not None and self.bbox_expansion_ratio < 1.0:
++            raise ValueError("bbox expansion ratio must be at least one")
+         if self.margin is not None and self.margin < 0.0:
+             raise ValueError("mark assignment margin must be nonnegative")
+         if self.status == "assigned" and self.target_region_index is None:
+@@ -931,12 +1092,29 @@ class DetectionResult:
+             if self.unassigned_mask is None
+             else np.asarray(self.unassigned_mask, dtype=bool)
+         )
++        provided_unassigned_mask = self.unassigned_mask is not None
+         if unassigned.shape != clean.shape:
+             raise ValueError("unassigned mask must match clean mask shape")
+         unassigned = np.array(unassigned, copy=True)
+         unassigned.setflags(write=False)
+         object.__setattr__(self, "unassigned_mask", unassigned)
+         object.__setattr__(self, "clean_mask", clean)
++        if (
++            provided_unassigned_mask
++            and self.diagnostics is not None
++            and self.diagnostics.row_count is not None
++        ):
++            ownership = np.zeros_like(clean)
++            for region in self.regions:
++                bbox = region.bbox
++                if bbox.x1 > clean.shape[1] or bbox.y1 > clean.shape[0]:
++                    raise ValueError("region ownership must stay inside cleaned foreground bounds")
++                local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
++                if np.any(local & region.mask):
++                    raise ValueError("region ownership masks must be pairwise disjoint")
++                local |= region.mask
++            if np.any(ownership & unassigned) or not np.array_equal(ownership | unassigned, clean):
++                raise ValueError("region and unassigned masks must conserve cleaned foreground")
+         object.__setattr__(self, "warnings", tuple(self.warnings))
+         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
+         if self.source_path is not None:
+@@ -1043,6 +1221,10 @@ class RowPartitionHypothesis:
+
+     boundary_evidence: tuple[PartitionBoundary, ...] = ()
+     cut_crossing_cost: float = 0.0
++    baseline_cost: float | None = None
++    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
++    split_anchor_indices: tuple[int, ...] = ()
++    repair_count: int = 0
+
+     def __post_init__(self) -> None:
+         if (
+@@ -1076,6 +1258,16 @@ class RowPartitionHypothesis:
+             self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
+         )
+         object.__setattr__(self, "boundary_evidence", tuple(self.boundary_evidence))
++        object.__setattr__(self, "split_evidence", tuple(self.split_evidence))
++        if self.baseline_cost is not None and (
++            not isfinite(self.baseline_cost) or self.baseline_cost < 0.0
++        ):
++            raise ValueError("baseline_cost must be finite and nonnegative")
++        if any(not isinstance(item, AnchorSplitEvidence) for item in self.split_evidence):
++            raise ValueError("split_evidence must contain AnchorSplitEvidence values")
++        object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
++        if self.repair_count < 0 or any(index < 0 for index in self.split_anchor_indices):
++            raise ValueError("split anchors and repair count must be nonnegative")
+
+
+ @dataclass(frozen=True)
+diff --git a/tests/test_anchor_first_segmentation.py b/tests/test_anchor_first_segmentation.py
+index 5a855bf..eff82f6 100644
+--- a/tests/test_anchor_first_segmentation.py
++++ b/tests/test_anchor_first_segmentation.py
+@@ -3,24 +3,87 @@ from __future__ import annotations
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+-from rasterregions import detect_spaced_region_hypotheses, detect_spaced_regions
++from rasterregions import (
++    DetectionConfig,
++    SpacingConfig,
++    detect_spaced_region_hypotheses,
++    detect_spaced_regions,
++)
+ from rasterregions.io import spaced_hypotheses_payload
+
+ ALPHABET_ROW_COUNTS = (12, 8, 6, 11, 11, 5, 10)
+
+
+-def _draw_slanted_row(draw: ImageDraw.ImageDraw, count: int, y: int, width: int) -> None:
++def _draw_digit(draw: ImageDraw.ImageDraw, x: int, y: int, digit: int) -> None:
++    segments = {
++        "a": (x + 5, y + 5, x + 65, y + 5),
++        "b": (x + 65, y + 5, x + 65, y + 30),
++        "c": (x + 65, y + 30, x + 65, y + 55),
++        "d": (x + 5, y + 55, x + 65, y + 55),
++        "e": (x + 5, y + 30, x + 5, y + 55),
++        "f": (x + 5, y + 5, x + 5, y + 30),
++        "g": (x + 5, y + 30, x + 65, y + 30),
++    }
++    patterns = (
++        "abcdef",
++        "bc",
++        "abged",
++        "abgcd",
++        "fgbc",
++        "afgcd",
++        "afgecd",
++        "abc",
++        "abcdefg",
++        "abfgcd",
++    )
++    for segment in patterns[digit % 10]:
++        draw.line(segments[segment], fill="black", width=4)
++
++
++def _draw_h(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
++    draw.line((x + 12, y + 5, x + 12, y + 55), fill="black", width=4)
++    draw.line((x + 60, y + 5, x + 60, y + 55), fill="black", width=4)
++    draw.line((x + 12, y + 30, x + 60, y + 30), fill="black", width=4)
++
++
++def _draw_m(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
++    draw.line((x + 12, y + 55, x + 12, y + 5), fill="black", width=4)
++    draw.line((x + 12, y + 5, x + 36, y + 38), fill="black", width=4)
++    draw.line((x + 36, y + 38, x + 60, y + 5), fill="black", width=4)
++    draw.line((x + 60, y + 5, x + 60, y + 55), fill="black", width=4)
++
++
++def _draw_slanted_row(
++    draw: ImageDraw.ImageDraw,
++    count: int,
++    y: int,
++    width: int,
++    *,
++    h_indices: tuple[int, ...] = (),
++    m_indices: tuple[int, ...] = (),
++    digit_row: bool = False,
++) -> None:
+     spacing = (width - 150) / max(1, count - 1)
+     for index in range(count):
+-        x = 30 + index * spacing
+-        stroke_width = 86 + (index * 7) % 12
+-        draw.line(
+-            (round(x), y + 55, round(x + stroke_width), y + 5),
+-            fill="black",
+-            width=4,
+-        )
++        x = round(30 + index * spacing)
++        if digit_row:
++            _draw_digit(draw, x, y, index)
++            glyph_width = 70
++        elif index in h_indices:
++            _draw_h(draw, x, y)
++            glyph_width = 70
++        elif index in m_indices:
++            _draw_m(draw, x, y)
++            glyph_width = 70
++        else:
++            glyph_width = 86 + (index * 7) % 12
++            draw.line(
++                (x, y + 55, x + glyph_width, y + 5),
++                fill="black",
++                width=4,
++            )
+         if index % 8 == 0:
+-            dot_x = round(x + stroke_width - 20)
++            dot_x = x + glyph_width - 20
+             draw.ellipse((dot_x - 1, y - 3, dot_x + 1, y - 1), fill="black")
+
+
+@@ -28,7 +91,16 @@ def _alphabet_page() -> Image.Image:
+     image = Image.new("RGB", (1081, 1198), "white")
+     draw = ImageDraw.Draw(image)
+     for row_index, count in enumerate(ALPHABET_ROW_COUNTS):
+-        _draw_slanted_row(draw, count, 35 + row_index * 155, image.width)
++        y = 35 + row_index * 155
++        _draw_slanted_row(
++            draw,
++            count,
++            y,
++            image.width,
++            h_indices=(2,) if row_index == 0 else (),
++            m_indices=(8,) if row_index == 0 else (),
++            digit_row=row_index == 3,
++        )
+     draw.point((1065, 15), fill="black")
+     draw.rectangle((1058, 1110, 1059, 1111), fill="black")
+     return image
+@@ -93,6 +165,12 @@ def test_generated_seven_row_page_has_sixty_three_anchors() -> None:
+         ALPHABET_ROW_COUNTS
+     )
+     assert len(result.regions) == 63
++    assert all(not row.split_anchor_indices for row in result.diagnostics.row_segmentation)
++    assert any(
++        assignment.status == "assigned"
++        for assignment in result.diagnostics.secondary_mark_assignments
++    )
++    assert any(decision.role == "micro-noise" for decision in result.component_decisions)
+     assert not result.diagnostics.search_truncated
+     _assert_exact_ownership(result)
+
+@@ -107,3 +185,17 @@ def test_generated_alphabet_hypotheses_and_diagnostics_are_deterministic() -> No
+     assert [row.inferred_count for row in first.selected.diagnostics.row_segmentation] == list(
+         ALPHABET_ROW_COUNTS
+     )
++
++
++def test_reference_page_selection_is_independent_of_hypothesis_budget() -> None:
++    image = _alphabet_page()
++    selections = []
++    for limit in (1, 5):
++        result = detect_spaced_region_hypotheses(
++            image,
++            mode="dark",
++            config=DetectionConfig(spacing=SpacingConfig(hypothesis_limit=limit)),
++        )
++        selections.append(_region_signature(result.selected))
++        assert len(result.selected.regions) == 63
++    assert selections[0] == selections[1]
+diff --git a/tests/test_anchor_split_evidence.py b/tests/test_anchor_split_evidence.py
+new file mode 100644
+index 0000000..e2588ea
+--- /dev/null
++++ b/tests/test_anchor_split_evidence.py
+@@ -0,0 +1,72 @@
++from PIL import Image, ImageDraw
++
++from rasterregions import (
++    DetectionConfig,
++    SpacingConfig,
++    detect_spaced_region_hypotheses,
++    detect_spaced_regions,
++)
++
++
++def test_h_and_m_like_bodies_keep_the_unsplit_anchor_baseline() -> None:
++    image = Image.new("RGB", (220, 80), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((15, 25, 35, 55), fill="black")
++
++    draw.rectangle((65, 25, 67, 55), fill="black")
++    draw.rectangle((83, 25, 85, 55), fill="black")
++    draw.rectangle((65, 39, 85, 41), fill="black")
++
++    draw.line((115, 55, 115, 25), fill="black", width=3)
++    draw.line((115, 25, 125, 45), fill="black", width=3)
++    draw.line((125, 45, 135, 25), fill="black", width=3)
++    draw.line((135, 25, 135, 55), fill="black", width=3)
++    draw.rectangle((165, 25, 185, 55), fill="black")
++
++    result = detect_spaced_regions(image, mode="dark")
++    row = result.diagnostics.row_segmentation[0]
++
++    assert len(result.regions) == 4
++    assert row.anchor_count == 4
++    assert row.inferred_count == 4
++    assert row.split_anchor_indices == ()
++    assert all(not evidence.accepted for evidence in row.split_evidence)
++
++
++def _two_touching_pair_sheet():
++    image = Image.new("RGB", (280, 90), "white")
++    draw = ImageDraw.Draw(image)
++    for x in (10, 120, 230):
++        draw.rectangle((x, 30, x + 20, 60), fill="black")
++    for x in (55, 165):
++        draw.rectangle((x, 30, x + 17, 60), fill="black")
++        draw.rectangle((x + 23, 30, x + 40, 60), fill="black")
++        draw.rectangle((x + 17, 44, x + 23, 46), fill="black")
++    return image
++
++
++def test_two_bound_splits_and_baseline_are_stable_across_hypothesis_budgets() -> None:
++    signatures = []
++    detailed = None
++    for limit in (1, 5):
++        result = detect_spaced_region_hypotheses(
++            _two_touching_pair_sheet(),
++            mode="dark",
++            config=DetectionConfig(spacing=SpacingConfig(hypothesis_limit=limit)),
++        )
++        signatures.append(
++            tuple((region.bbox, region.mask.tobytes()) for region in result.selected.regions)
++        )
++        assert len(result.selected.regions) == 7
++        detailed = result
++
++    assert signatures[0] == signatures[1]
++    assert detailed is not None
++    options = detailed.row_hypotheses[0]
++    by_splits = {option.split_anchor_indices: option.count for option in options}
++    assert by_splits == {(): 5, (1,): 6, (3,): 6, (1, 3): 7}
++    geometries = [
++        tuple((region.bbox, region.mask.tobytes()) for region in option.regions)
++        for option in options
++    ]
++    assert len(geometries) == len(set(geometries))
+diff --git a/tests/test_context_aware_cleanup.py b/tests/test_context_aware_cleanup.py
+index 42b3141..09a68ae 100644
+--- a/tests/test_context_aware_cleanup.py
++++ b/tests/test_context_aware_cleanup.py
+@@ -83,7 +83,7 @@ def test_tiny_far_away_speck_is_removed_with_stable_raw_component_id() -> None:
+     speck = next(decision for decision in result.component_decisions if decision.bbox.x0 == 3)
+     assert speck.component_index == 0
+     assert speck.action == "removed"
+-    assert speck.role == "noise"
++    assert speck.role == "micro-noise"
+     assert speck.reason is not None
+     assert not result.clean_mask[3, 3]
+
+diff --git a/tests/test_io.py b/tests/test_io.py
+index 6d8c43a..320a7fe 100644
+--- a/tests/test_io.py
++++ b/tests/test_io.py
+@@ -1,9 +1,11 @@
+ from __future__ import annotations
+
+ import json
++from dataclasses import replace
+ from pathlib import Path
+
+ import numpy as np
++import pytest
+ from PIL import Image, ImageDraw
+
+ from rasterregions import (
+@@ -65,6 +67,15 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
+     assert result.diagnostics.image_size == (120, 60)
+     assert result.diagnostics.raw_component_count == 3
+     assert payload["rasterregions_version"]
++    assert payload["ownership"]["valid"]
++    assert payload["cleaned_foreground"]["pixels"] == int(result.clean_mask.sum())
++    assert payload["cleaned_foreground"]["mask_runs"]
++    assert payload["parameters"]["cleanup_config"]["micro_noise_max_area_ratio"] == 0.02
++    assert payload["parameters"]["spacing_config"]["auto_split_min_width_ratio"] == 1.35
++    assert payload["regions"][0]["mask_runs"]
++    assert json.dumps(payload, sort_keys=True) == json.dumps(
++        detection_payload(result), sort_keys=True
++    )
+
+     assert payload["schema_version"] == 1
+     assert payload["component_index_namespace"] == "raw_mask"
+@@ -213,7 +224,10 @@ def test_spacing_diagnostics_are_serialized() -> None:
+     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
+     assert payload["spacing"]["rows"][0]["anchor_count"] == 1
+     assert payload["spacing"]["rows"][0]["segmentation_strategy"] == "anchors"
+-    assert payload["spacing"]["rows"][0]["attempted_counts"] == []
++    assert payload["spacing"]["rows"][0]["attempted_counts"] == [1]
++    assert payload["spacing"]["rows"][0]["selected_count"] == 1
++    assert payload["spacing"]["rows"][0]["baseline_cost"] == 0.0
++    assert payload["spacing"]["ownership"]["valid"]
+
+
+ def test_spacing_payload_exposes_secondary_component_ownership() -> None:
+@@ -244,6 +258,8 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path)
+     encoded = json.dumps(payload)
+     manifest = write_spaced_hypotheses(result, tmp_path)
+
++    assert payload["page_hypotheses"][0]["ownership_valid"]
++    assert payload["selected"]["ownership"]["valid"]
+     assert json.loads(encoded)["search"]["truncated"] == result.truncated
+     assert payload["page_hypotheses"][0]["count"] == 2
+     assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
+@@ -277,3 +293,46 @@ def test_anchor_diagnostics_and_boxes_are_serialized(tmp_path) -> None:
+             110,
+             220,
+         )
++
++
++def test_split_and_baseline_evidence_are_json_serializable() -> None:
++    image = Image.new("RGB", (220, 90), "white")
++    draw = ImageDraw.Draw(image)
++    for x in (15, 120, 170):
++        draw.rectangle((x, 30, x + 20, 60), fill="black")
++    draw.rectangle((65, 30, 82, 60), fill="black")
++    draw.rectangle((89, 30, 105, 60), fill="black")
++    draw.rectangle((82, 44, 89, 46), fill="black")
++
++    result = detect_spaced_region_hypotheses(image, mode="dark")
++    payload = spaced_hypotheses_payload(result)
++    json.dumps(payload)
++
++    row = payload["selected"]["spacing"]["rows"][0]
++    evidence = next(item for item in row["split_evidence"] if item["anchor_index"] == 1)
++    assert evidence["accepted"]
++    assert evidence["cut_range"][0] <= evidence["cut_x"] < evidence["cut_range"][1]
++    assert row["split_anchor_indices"] == [1]
++    assert row["repair_count"] == 1
++    assert row["baseline_cost"] > row["cost"]
++    row_options = payload["row_hypotheses"][0]
++    assert any(
++        option["count"] == 4 and option["split_anchor_indices"] == [] for option in row_options
++    )
++    assert any(
++        option["count"] == 5 and option["split_anchor_indices"] == [1] for option in row_options
++    )
++    assert payload["selected"]["ownership"]["valid"]
++
++
++def test_detection_result_rejects_incomplete_explicit_ownership() -> None:
++    image = Image.new("RGB", (300, 200), "white")
++    draw = ImageDraw.Draw(image)
++    draw.rectangle((40, 90, 99, 149), fill="black")
++    draw.rectangle((200, 70, 205, 75), fill="black")
++    result = detect_spaced_regions(image, mode="dark")
++    assert result.unassigned_mask is not None
++    assert result.unassigned_mask.any()
++
++    with pytest.raises(ValueError, match="conserve cleaned foreground"):
++        replace(result, unassigned_mask=np.zeros_like(result.unassigned_mask))
+diff --git a/tests/test_micro_noise_cleanup.py b/tests/test_micro_noise_cleanup.py
+new file mode 100644
+index 0000000..1372000
+--- /dev/null
++++ b/tests/test_micro_noise_cleanup.py
+@@ -0,0 +1,102 @@
++import numpy as np
++import pytest
++
++from rasterregions import CleanupConfig
++from rasterregions._cleanup import clean_page_mask
++
++
++def test_micro_noise_removed_and_dot_and_narrow_fragment_retained() -> None:
++    mask = np.zeros((220, 440), dtype=bool)
++    for x in (30, 130, 230):
++        mask[90:150, x : x + 60] = True
++    mask[70:76, 55:61] = True
++    mask[60:70, 320] = True
++    mask[20, 20] = True
++    mask[20, 30:32] = True
++    mask[20, 40:43] = True
++    mask[20:22, 50:52] = True
++    mask[21, 52] = True
++
++    cleaned = clean_page_mask(mask)
++    removed = [d for d in cleaned.component_decisions if d.role == "micro-noise"]
++    assert sorted(d.area for d in removed) == [1, 2, 3, 5]
++    assert all(d.action == "removed" and d.body_area_ratio is not None for d in removed)
++    assert cleaned.mask[70:76, 55:61].all()
++    dot = next(d for d in cleaned.component_decisions if d.area == 36)
++    assert dot.role == "secondary-candidate"
++    assert dot.component_index in cleaned.provisional_component_indices
++    assert cleaned.mask[60:70, 320].all()
++    assert not cleaned.mask[20, 20]
++
++
++def test_body_scale_ignores_page_rule_and_many_pixel_specks() -> None:
++    mask = np.zeros((250, 500), dtype=bool)
++    mask[80:140, 40:100] = True
++    mask[80:140, 170:230] = True
++    mask[80:140, 300:360] = True
++    mask[220, :] = True
++    for x in range(10, 490, 5):
++        mask[20, x] = True
++    mask[60:66, 65:71] = True
++
++    cleaned = clean_page_mask(mask)
++    assert sum(d.role == "micro-noise" for d in cleaned.component_decisions) == 96
++    assert any(d.role == "artifact" for d in cleaned.component_decisions)
++    dot = next(d for d in cleaned.component_decisions if d.area == 36)
++    assert dot.action == "kept"
++    assert dot.role == "secondary-candidate"
++    assert dot.body_area_ratio == pytest.approx(0.01)
++
++
++def test_plausible_dot_is_assigned_and_remote_mark_does_not_expand_region() -> None:
++    from PIL import Image
++
++    from rasterregions import detect_spaced_regions
++
++    mask = np.full((200, 300), 255, dtype=np.uint8)
++    mask[90:150, 40:100] = 0
++    mask[70:76, 65:71] = 0
++    mask[20:26, 200:206] = 0
++    result = detect_spaced_regions(Image.fromarray(mask), mode="dark")
++    dot = next(d for d in result.component_decisions if d.bbox.x0 == 65)
++    remote = next(d for d in result.component_decisions if d.bbox.x0 == 200)
++    assert dot.role == "secondary"
++    assert sum(dot.component_index in r.component_indices for r in result.regions) == 1
++    assert remote.action == "kept"
++    assert all(remote.component_index not in r.component_indices for r in result.regions)
++    assert result.regions[0].bbox.x1 < 200
++    from rasterregions.io import detection_payload
++
++    assignments = result.diagnostics.secondary_mark_assignments
++    dot_assignment = next(
++        item for item in assignments if item.component_index == dot.component_index
++    )
++    remote_assignment = next(
++        item for item in assignments if item.component_index == remote.component_index
++    )
++    assert dot_assignment.status == "assigned"
++    assert dot_assignment.area_ratio is not None
++    assert dot_assignment.vertical_gap_ratio is not None
++    assert dot_assignment.bbox_expansion_ratio is not None
++    assert remote_assignment.status == "unassigned"
++    assert remote_assignment.reason is not None
++    serialized = detection_payload(result)["spacing"]["secondary_mark_assignments"]
++    serialized_dot = next(
++        item for item in serialized if item["component_index"] == dot.component_index
++    )
++    assert serialized_dot["bbox_expansion_ratio"] is not None
++
++
++@pytest.mark.parametrize(
++    "name",
++    [
++        "micro_noise_max_area_ratio",
++        "micro_noise_max_height_ratio",
++        "micro_noise_max_width_ratio",
++        "micro_noise_mark_max_vertical_gap_ratio",
++        "micro_noise_mark_max_horizontal_gap_ratio",
++    ],
++)
++def test_micro_noise_ratios_are_validated(name: str) -> None:
++    with pytest.raises(ValueError):
++        CleanupConfig(**{name: 1.1})
+diff --git a/tests/test_segmentation_search_limits.py b/tests/test_segmentation_search_limits.py
+index 1478827..e3efae6 100644
+--- a/tests/test_segmentation_search_limits.py
++++ b/tests/test_segmentation_search_limits.py
+@@ -52,7 +52,7 @@ def test_each_search_budget_rejects_nonpositive_values() -> None:
+             SpacingConfig(**{field: 0})
+
+
+-def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
++def test_automatic_evidence_split_is_independent_of_partition_budget() -> None:
+     image = Image.new("RGB", (130, 80), "white")
+     draw = ImageDraw.Draw(image)
+     draw.rectangle((15, 25, 49, 55), fill="black")
+@@ -62,15 +62,16 @@ def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
+
+     result = detect_spaced_region_hypotheses(image, mode="dark", config=config)
+
+-    assert len(result.selected.regions) == 1
+-    assert result.selected.diagnostics.search_truncated
+-    assert result.selected.diagnostics.search_limit == "row-partition-budget"
+-    assert result.row_hypotheses[0][0].count == 1
++    assert len(result.selected.regions) == 2
++    assert not result.selected.diagnostics.search_truncated
++    assert result.selected.diagnostics.search_limit is None
++    assert result.row_hypotheses[0][0].count == 2
+     row = result.selected.diagnostics.row_segmentation[0]
+     assert row.anchor_count == 1
+-    assert row.segmentation_strategy == "anchors"
++    assert row.segmentation_strategy == "hybrid"
++    assert row.split_anchor_indices == (0,)
+     assert row.attempted_counts == (2,)
+-    assert row.truncated_counts == (2,)
++    assert row.truncated_counts == ()
+
+
+ def test_exact_count_budget_failure_leaves_clean_ink_unassigned() -> None:
+diff --git a/tests/test_spaced_regions.py b/tests/test_spaced_regions.py
+index dd7c71d..b87d90e 100644
+--- a/tests/test_spaced_regions.py
++++ b/tests/test_spaced_regions.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ import numpy as np
+ from PIL import Image, ImageDraw
+
+-from rasterregions import detect_spaced_regions
++from rasterregions import detect_spaced_region_hypotheses, detect_spaced_regions
+ from rasterregions.models import DetectionConfig, SpacingConfig
+
+
+@@ -165,6 +165,18 @@ def test_touching_forms_split_on_strong_valley_or_exact_count_hint() -> None:
+     assert inferred_row.anchor_count == 1
+     assert inferred_row.segmentation_strategy == "hybrid"
+     assert inferred_row.split_anchor_indices == (0,)
++    assert inferred_row.baseline_cost is not None
++    assert inferred_row.baseline_cost > inferred_row.cost
++    assert inferred_row.repair_count == 1
++    evidence = inferred_row.split_evidence[0]
++    assert evidence.accepted
++    assert evidence.cut_range[0] <= evidence.cut_x < evidence.cut_range[1]
++    assert inferred_row.selected_boundaries == (evidence.cut_x,)
++    hypotheses = detect_spaced_region_hypotheses(image, mode="dark")
++    row_options = hypotheses.row_hypotheses[0]
++    assert {option.count for option in row_options} == {1, 2}
++    baseline_option = next(option for option in row_options if option.count == 1)
++    assert baseline_option.baseline_cost == inferred_row.baseline_cost
+     assert inferred_row.attempted_counts == (2,)
+     exact_row = exact.diagnostics.row_segmentation[0]
+     assert exact_row.segmentation_strategy == "hybrid"

@@ -1,0 +1,28 @@
+rows:
+- sha: 5c3f657c14e74f4c4ef9daf8f670ad15ac26c65b
+  inspected: true
+  inspected_paths:
+  - docs/diagnostics.md
+  - docs/spaced-segmentation.md
+  - rasterregions/__init__.py
+  - rasterregions/_cleanup.py
+  - rasterregions/_grouping.py
+  - rasterregions/_partition.py
+  - rasterregions/_rows.py
+  - rasterregions/detect.py
+  - rasterregions/io.py
+  - rasterregions/models.py
+  - tests/test_anchor_first_segmentation.py
+  - tests/test_anchor_split_evidence.py
+  - tests/test_context_aware_cleanup.py
+  - tests/test_io.py
+  - tests/test_micro_noise_cleanup.py
+  - tests/test_segmentation_search_limits.py
+  - tests/test_spaced_regions.py
+  observed_behavior: "Scale-relative cleanup removes implausible micro-noise while preserving nearby marks; spaced-region detection assigns plausible marks, automatically splits supported wide anchors, and reports ownership and split evidence."
+  public_impact: public
+  decision: accepted
+  target_entry_key: null
+  target_entry_id: null
+  notes: ''
+  stale: false
