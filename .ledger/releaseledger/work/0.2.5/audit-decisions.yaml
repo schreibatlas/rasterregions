@@ -1,0 +1,16 @@
+rows:
+- sha: 1e4b54e4a849065184e4ca8a103ad4708e91d71b
+  inspected: true
+  inspected_paths:
+  - docs/foreground-evidence.md
+  - rasterregions/__init__.py
+  - rasterregions/models.py
+  - rasterregions/pyramid.py
+  - tests/test_foreground_pyramid.py
+  observed_behavior: Added a public foreground_pyramid API that creates coarse-to-fine fractional foreground occupancy levels from ForegroundEvidence, with immutable coverage and the exact source mask at full resolution; documentation and tests cover intended use, resampling, and validation.
+  public_impact: public
+  decision: accepted
+  target_entry_key: null
+  target_entry_id: null
+  notes: ''
+  stale: false

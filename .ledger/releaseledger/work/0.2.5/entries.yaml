@@ -1,0 +1,28 @@
+schema: releaseledger.entry-batch.v1
+operation: create
+schema_version: 1
+object_type: release_entry_batch
+release_version: 0.2.5
+git_base_ref: 1236eb363494ea4853434774dd9fa1a896ce3627
+git_base_sha: 1236eb363494ea4853434774dd9fa1a896ce3627
+git_head_ref: 1e4b54e4a849065184e4ca8a103ad4708e91d71b
+git_head_sha: 1e4b54e4a849065184e4ca8a103ad4708e91d71b
+include_merges: nontrivial
+entries:
+- kind: added
+  summary: Added coarse-to-fine foreground occupancy pyramids with fractional coverage and an authoritative full-resolution mask
+  status: accepted
+  source_refs:
+  - git:1e4b54e4a849065184e4ca8a103ad4708e91d71b
+  paths:
+  - docs/foreground-evidence.md
+  - rasterregions/__init__.py
+  - rasterregions/models.py
+  - rasterregions/pyramid.py
+  - tests/test_foreground_pyramid.py
+  sources:
+  - git:1e4b54e4a849065184e4ca8a103ad4708e91d71b
+  prs: []
+  issues: []
+  contributors:
+  - '@holgern'

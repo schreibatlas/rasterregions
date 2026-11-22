@@ -1,0 +1,514 @@
+ docs/foreground-evidence.md      |  29 ++++++
+ rasterregions/__init__.py        |   6 ++
+ rasterregions/models.py          | 118 +++++++++++++++++++++++
+ rasterregions/pyramid.py         |  91 ++++++++++++++++++
+ tests/test_foreground_pyramid.py | 197 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 441 insertions(+)
+
+diff --git a/docs/foreground-evidence.md b/docs/foreground-evidence.md
+index acecfa0..26364a6 100644
+--- a/docs/foreground-evidence.md
++++ b/docs/foreground-evidence.md
+@@ -66,6 +66,35 @@ preview.save("foreground-evidence.png")
+
+ The visualization clips only its display values. The returned decision field itself is not blurred or clipped near zero, so interpolation continues to use the segmentation decision.
+
++## Foreground occupancy pyramid
++
++Use `foreground_pyramid` to derive coarse-to-fine fitting evidence from an existing `ForegroundEvidence`:
++
++```python
++from rasterregions import foreground_evidence, foreground_pyramid
++
++evidence = foreground_evidence("page.png", mode="auto")
++pyramid = foreground_pyramid(evidence, scales=(0.25, 0.5))
++
++for level in pyramid.levels:
++    print(level.shape, level.scale_x, level.scale_y)
++    occupancy = level.coverage
++```
++
++The default scales are `(0.25, 0.5, 1.0)`. Scales must be finite, strictly increasing, and in `(0, 1]`. If `1.0` is omitted, it is appended automatically. Each requested level has dimensions `max(1, round(source_dimension * scale))`; duplicate output shapes are removed. `scale_x` and `scale_y` are the level width and height divided by their source dimensions.
++
++`ForegroundPyramidLevel.coverage` is an immutable `float32` array in `[0, 1]`. Downsampled coverage is produced directly from `evidence.mask` with Pillow BOX area filtering. Each coarse pixel represents fractional source foreground occupancy, so small marks can remain positive even when they disappear from the thresholded view. `mask_threshold` defaults to `0.5`, and `level.mask` is the read-only convenience view `level.coverage >= level.mask_threshold`. `ink_mass` reports level-pixel occupancy; `normalized_ink_mass` estimates the equivalent source-pixel mass using the level scales. Integer output dimensions mean resampled mass is approximate. The synthetic resampling tests allow a 5% relative source-mass tolerance.
++
++The final level is never resampled. Its shape equals the source mask shape and its coverage is exactly `evidence.mask.astype(np.float32)`. This preserves the source classification, but does not make thresholded coarse masks topology preserving:
++
++- `ForegroundEvidence.mask` remains the source classification.
++- `ForegroundPyramidLevel.coverage` is occupancy evidence for fitting.
++- `ForegroundPyramidLevel.mask` is a visualization/convenience representation, not a topology-preserving substitute for the source mask.
++- Coarse levels must not be used as authoritative topology.
++- Applications that need components, cycles, junctions, or tiny-mark topology must derive those facts from the full-resolution source evidence.
++
++The pyramid does not threshold the signed decision field at each scale. Its values are method-dependent classification evidence, not calibrated probabilities or occupancy samples.
++
+ ## Release note
+
+ > RasterRegions can now expose the signed continuous decision field underlying foreground segmentation. Existing boolean-mask APIs are unchanged. The new field is intended for consumers that need subpixel boundary localization.
+diff --git a/rasterregions/__init__.py b/rasterregions/__init__.py
+index 34eec74..96d215b 100644
+--- a/rasterregions/__init__.py
++++ b/rasterregions/__init__.py
+@@ -29,6 +29,8 @@ from .models import (
+     DetectionStatus,
+     ExpectedCountScope,
+     ForegroundEvidence,
++    ForegroundPyramid,
++    ForegroundPyramidLevel,
+     GroupingConfig,
+     IsolationCandidate,
+     IsolationReason,
+@@ -51,6 +53,7 @@ from .models import (
+     SpacedSegmentationHypotheses,
+     SpacingConfig,
+ )
++from .pyramid import foreground_pyramid
+ from .regions import crop, tighten_bbox
+
+ try:
+@@ -72,6 +75,8 @@ __all__ = [
+     "DetectionResult",
+     "DetectionStatus",
+     "ForegroundEvidence",
++    "ForegroundPyramid",
++    "ForegroundPyramidLevel",
+     "ExpectedCountScope",
+     "GroupingConfig",
+     "IsolationReason",
+@@ -101,6 +106,7 @@ __all__ = [
+     "detect_spaced_regions",
+     "detect_spaced_region_hypotheses",
+     "detect_rows",
++    "foreground_pyramid",
+     "foreground_evidence",
+     "foreground_mask",
+     "isolate_component",
+diff --git a/rasterregions/models.py b/rasterregions/models.py
+index 1c8d90f..7659a22 100644
+--- a/rasterregions/models.py
++++ b/rasterregions/models.py
+@@ -127,6 +127,124 @@ class ForegroundEvidence:
+         object.__setattr__(self, "warnings", tuple(self.warnings))
+
+
++def _pyramid_shape(shape: tuple[int, int], field_name: str) -> tuple[int, int]:
++    try:
++        dimensions = tuple(shape)
++    except TypeError as exc:
++        raise ValueError(f"{field_name} must be a (height, width) pair") from exc
++    if len(dimensions) != 2 or any(
++        isinstance(dimension, (bool, np.bool_))
++        or not isinstance(dimension, (int, np.integer))
++        or dimension <= 0
++        for dimension in dimensions
++    ):
++        raise ValueError(f"{field_name} must contain positive integer dimensions")
++    return int(dimensions[0]), int(dimensions[1])
++
++
++@dataclass(frozen=True)
++class ForegroundPyramidLevel:
++    """Fractional foreground occupancy at one pyramid resolution.
++
++    ``coverage`` is fitting evidence. The thresholded ``mask`` is only a
++    visualization/convenience representation, not a topology-preserving
++    substitute for the source mask.
++    """
++
++    index: int
++    source_shape: tuple[int, int]
++    shape: tuple[int, int]
++    scale_x: float
++    scale_y: float
++    coverage: np.ndarray
++    mask_threshold: float = 0.5
++
++    def __post_init__(self) -> None:
++        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
++            raise ValueError("pyramid level index must be a nonnegative integer")
++        source_shape = _pyramid_shape(self.source_shape, "source_shape")
++        shape = _pyramid_shape(self.shape, "shape")
++        if isinstance(self.scale_x, bool) or not isfinite(self.scale_x):
++            raise ValueError("scale_x must be finite")
++        if isinstance(self.scale_y, bool) or not isfinite(self.scale_y):
++            raise ValueError("scale_y must be finite")
++        expected_scale_x = shape[1] / source_shape[1]
++        expected_scale_y = shape[0] / source_shape[0]
++        if not np.isclose(self.scale_x, expected_scale_x) or not np.isclose(
++            self.scale_y, expected_scale_y
++        ):
++            raise ValueError("pyramid level scales must agree with source and level shapes")
++        if isinstance(self.mask_threshold, bool) or not isfinite(self.mask_threshold):
++            raise ValueError("mask_threshold must be finite and between zero and one")
++        if not 0.0 <= self.mask_threshold <= 1.0:
++            raise ValueError("mask_threshold must be finite and between zero and one")
++
++        coverage = np.asarray(self.coverage, dtype=np.float32)
++        if coverage.ndim != 2 or coverage.shape != shape:
++            raise ValueError("coverage dimensions must match the pyramid level shape")
++        if not np.isfinite(coverage).all() or np.any((coverage < 0.0) | (coverage > 1.0)):
++            raise ValueError("coverage values must be finite and between zero and one")
++        coverage = np.array(coverage, dtype=np.float32, copy=True)
++        coverage.setflags(write=False)
++        object.__setattr__(self, "source_shape", source_shape)
++        object.__setattr__(self, "shape", shape)
++        object.__setattr__(self, "scale_x", float(self.scale_x))
++        object.__setattr__(self, "scale_y", float(self.scale_y))
++        object.__setattr__(self, "coverage", coverage)
++        object.__setattr__(self, "mask_threshold", float(self.mask_threshold))
++
++    @property
++    def mask(self) -> np.ndarray:
++        """Return a read-only thresholded view for visualization and convenience."""
++        mask = self.coverage >= self.mask_threshold
++        mask.setflags(write=False)
++        return mask
++
++    @property
++    def ink_mass(self) -> float:
++        """Return the sum of foreground occupancy in level pixels."""
++        return float(self.coverage.sum())
++
++    @property
++    def normalized_ink_mass(self) -> float:
++        """Return occupancy mass in approximate source-pixel units."""
++        return self.ink_mass / (self.scale_x * self.scale_y)
++
++
++@dataclass(frozen=True)
++class ForegroundPyramid:
++    """Coarse-to-fine fitting levels backed by authoritative source evidence."""
++
++    evidence: ForegroundEvidence
++    levels: tuple[ForegroundPyramidLevel, ...]
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.evidence, ForegroundEvidence):
++            raise ValueError("evidence must be a ForegroundEvidence instance")
++        levels = tuple(self.levels)
++        if not levels or any(not isinstance(level, ForegroundPyramidLevel) for level in levels):
++            raise ValueError("levels must contain at least one ForegroundPyramidLevel")
++        source_shape = _pyramid_shape(self.evidence.mask.shape, "evidence mask shape")
++        if any(level.source_shape != source_shape for level in levels):
++            raise ValueError("all pyramid levels must use the evidence source shape")
++        if any(level.index != index for index, level in enumerate(levels)):
++            raise ValueError("pyramid level indexes must be consecutive from zero")
++        for previous, current in zip(levels, levels[1:], strict=False):
++            if (
++                current.shape[0] < previous.shape[0]
++                or current.shape[1] < previous.shape[1]
++                or current.scale_x * current.scale_y <= previous.scale_x * previous.scale_y
++            ):
++                raise ValueError("pyramid levels must be ordered coarse to fine")
++        final = levels[-1]
++        expected_coverage = self.evidence.mask.astype(np.float32)
++        if final.shape != source_shape or not np.array_equal(final.coverage, expected_coverage):
++            raise ValueError("the final pyramid level must exactly preserve the source mask")
++        if any(level.mask_threshold != levels[0].mask_threshold for level in levels):
++            raise ValueError("all pyramid levels must use the same mask threshold")
++        object.__setattr__(self, "levels", levels)
++
++
+ @dataclass(frozen=True)
+ class Component:
+     """An 8-connected foreground component with row-major index and pixel coordinates."""
+diff --git a/rasterregions/pyramid.py b/rasterregions/pyramid.py
+new file mode 100644
+index 0000000..cfb2a9d
+--- /dev/null
++++ b/rasterregions/pyramid.py
+@@ -0,0 +1,91 @@
++"""Coarse-to-fine foreground occupancy pyramids."""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from math import isfinite
++
++import numpy as np
++from PIL import Image
++
++from .models import ForegroundEvidence, ForegroundPyramid, ForegroundPyramidLevel
++
++
++def foreground_pyramid(
++    evidence: ForegroundEvidence,
++    *,
++    scales: Sequence[float] = (0.25, 0.5, 1.0),
++    mask_threshold: float = 0.5,
++) -> ForegroundPyramid:
++    """Build deterministic coarse-to-fine occupancy levels from source evidence.
++
++    Coarse coverage represents fractional occupancy of the source foreground
++    mask. The exact full-resolution level is retained as the final level and
++    remains authoritative for topology.
++    """
++    if not isinstance(evidence, ForegroundEvidence):
++        raise ValueError("evidence must be a ForegroundEvidence instance")
++    if isinstance(mask_threshold, bool) or not isfinite(mask_threshold):
++        raise ValueError("mask_threshold must be finite and between zero and one")
++    if not 0.0 <= mask_threshold <= 1.0:
++        raise ValueError("mask_threshold must be finite and between zero and one")
++    if evidence.mask.ndim != 2 or min(evidence.mask.shape) <= 0:
++        raise ValueError("evidence mask dimensions must be positive")
++
++    try:
++        requested_scales = tuple(scales)
++    except TypeError as exc:
++        raise ValueError("scales must be a nonempty sequence of finite values in (0, 1]") from exc
++    if not requested_scales:
++        raise ValueError("scales must not be empty")
++
++    normalized_scales: list[float] = []
++    for scale in requested_scales:
++        if isinstance(scale, (bool, np.bool_)):
++            raise ValueError("scales must be finite values in (0, 1]")
++        try:
++            normalized = float(scale)
++        except (TypeError, ValueError, OverflowError) as exc:
++            raise ValueError("scales must be finite values in (0, 1]") from exc
++        if not isfinite(normalized) or not 0.0 < normalized <= 1.0:
++            raise ValueError("scales must be finite values in (0, 1]")
++        if normalized_scales and normalized <= normalized_scales[-1]:
++            raise ValueError("scales must be strictly increasing")
++        normalized_scales.append(normalized)
++    if normalized_scales[-1] < 1.0:
++        normalized_scales.append(1.0)
++
++    source_height, source_width = evidence.mask.shape
++    source = evidence.mask.astype(np.float32)
++    levels: list[ForegroundPyramidLevel] = []
++    seen_shapes: set[tuple[int, int]] = set()
++
++    for scale in normalized_scales:
++        width = max(1, round(source_width * scale))
++        height = max(1, round(source_height * scale))
++        shape = (height, width)
++        if shape == (source_height, source_width) and scale < 1.0:
++            continue
++        if shape in seen_shapes:
++            continue
++        seen_shapes.add(shape)
++
++        if scale == 1.0:
++            coverage = evidence.mask.astype(np.float32, copy=True)
++        else:
++            resized = Image.fromarray(source).resize((width, height), resample=Image.Resampling.BOX)
++            coverage = np.clip(np.asarray(resized, dtype=np.float32), 0.0, 1.0)
++
++        levels.append(
++            ForegroundPyramidLevel(
++                index=len(levels),
++                source_shape=(source_height, source_width),
++                shape=shape,
++                scale_x=width / source_width,
++                scale_y=height / source_height,
++                coverage=coverage,
++                mask_threshold=mask_threshold,
++            )
++        )
++
++    return ForegroundPyramid(evidence=evidence, levels=tuple(levels))
+diff --git a/tests/test_foreground_pyramid.py b/tests/test_foreground_pyramid.py
+new file mode 100644
+index 0000000..bc5941b
+--- /dev/null
++++ b/tests/test_foreground_pyramid.py
+@@ -0,0 +1,197 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from rasterregions import (
++    ForegroundEvidence,
++    ForegroundPyramid,
++    ForegroundPyramidLevel,
++    components,
++    foreground_pyramid,
++)
++
++# BOX area resampling should preserve source-equivalent mass within this relative tolerance.
++MASS_RELATIVE_TOLERANCE = 0.05
++
++
++def _evidence(mask: np.ndarray) -> ForegroundEvidence:
++    return ForegroundEvidence(
++        mask,
++        np.where(mask, 1.0, -1.0).astype(np.float32),
++        1.0,
++        "dark",
++    )
++
++
++def _synthetic_mask(name: str) -> np.ndarray:
++    mask = np.zeros((64, 64), dtype=bool)
++    if name == "rectangle":
++        mask[16:48, 20:44] = True
++    elif name == "diagonal":
++        mask[np.arange(5, 59), np.arange(5, 59)] = True
++    elif name == "dot":
++        mask[7, 9] = True
++    elif name == "separated":
++        mask[12:20, 12:20] = True
++        mask[40:48, 40:48] = True
++    elif name == "ring":
++        mask[16:48, 16:48] = True
++        mask[22:42, 22:42] = False
++    else:
++        raise AssertionError(f"unknown synthetic mask: {name}")
++    return mask
++
++
++@pytest.mark.parametrize("name", ["rectangle", "diagonal", "dot", "separated", "ring"])
++def test_foreground_pyramid_preserves_occupancy_mass_and_source(name: str) -> None:
++    evidence = _evidence(_synthetic_mask(name))
++    pyramid = foreground_pyramid(evidence, scales=(0.125, 0.25, 0.5))
++
++    assert pyramid.evidence is evidence
++    assert [level.shape for level in pyramid.levels] == [(8, 8), (16, 16), (32, 32), (64, 64)]
++    for level in pyramid.levels[:-1]:
++        assert np.isfinite(level.coverage).all()
++        assert np.all((level.coverage >= 0.0) & (level.coverage <= 1.0))
++        assert np.any(level.coverage > 0.0)
++        assert level.normalized_ink_mass == pytest.approx(
++            float(evidence.mask.sum()), rel=MASS_RELATIVE_TOLERANCE
++        )
++
++    finest = pyramid.levels[-1]
++    assert finest.shape == evidence.mask.shape
++    assert finest.coverage.dtype == np.float32
++    assert np.array_equal(finest.coverage, evidence.mask.astype(np.float32))
++    assert np.array_equal(finest.mask, evidence.mask)
++    assert len(components(pyramid.evidence.mask)) == len(components(evidence.mask))
++
++
++def test_detached_dot_survives_as_fractional_occupancy_below_mask_threshold() -> None:
++    evidence = _evidence(_synthetic_mask("dot"))
++    pyramid = foreground_pyramid(evidence, scales=(0.125, 1.0))
++
++    coarse = pyramid.levels[0]
++    assert 0.0 < float(coarse.coverage.sum()) < 0.5
++    assert not coarse.mask.any()
++    assert len(components(evidence.mask)) == 1
++    assert np.array_equal(pyramid.levels[-1].mask, evidence.mask)
++
++
++def test_pyramid_scales_are_normalized_and_duplicate_dimensions_removed() -> None:
++    evidence = _evidence(np.array([[True, False]], dtype=bool))
++    pyramid = foreground_pyramid(evidence, scales=(0.2, 0.4, 0.6))
++
++    assert [level.shape for level in pyramid.levels] == [(1, 1), (1, 2)]
++    assert [level.index for level in pyramid.levels] == [0, 1]
++    assert pyramid.levels[-1].scale_x == 1.0
++    assert pyramid.levels[-1].scale_y == 1.0
++    assert np.array_equal(pyramid.levels[-1].coverage, evidence.mask.astype(np.float32))
++
++
++def test_pyramid_levels_are_coarse_to_fine_and_always_include_source_resolution() -> None:
++    evidence = _evidence(np.eye(17, 23, dtype=bool))
++    pyramid = foreground_pyramid(evidence, scales=(0.25, 0.5))
++
++    assert [level.shape for level in pyramid.levels] == [(4, 6), (8, 12), (17, 23)]
++    assert all(
++        left.scale_x * left.scale_y < right.scale_x * right.scale_y
++        for left, right in zip(pyramid.levels, pyramid.levels[1:], strict=False)
++    )
++    assert pyramid.levels[-1].source_shape == evidence.mask.shape
++    assert pyramid.levels[-1].shape == evidence.mask.shape
++
++
++def test_pyramid_coverage_is_an_immutable_snapshot() -> None:
++    coverage = np.array([[0.25, 1.0]], dtype=np.float64)
++    level = ForegroundPyramidLevel(
++        index=0,
++        source_shape=(1, 2),
++        shape=(1, 2),
++        scale_x=1.0,
++        scale_y=1.0,
++        coverage=coverage,
++    )
++
++    assert level.coverage.dtype == np.float32
++    assert not level.coverage.flags.writeable
++    assert not level.mask.flags.writeable
++    coverage[0, 0] = 0.0
++    assert level.coverage[0, 0] == np.float32(0.25)
++    with pytest.raises(ValueError):
++        level.coverage[0, 0] = 0.0
++
++
++def test_pyramid_rejects_empty_or_invalid_scales() -> None:
++    evidence = _evidence(np.ones((4, 4), dtype=bool))
++    with pytest.raises(ValueError, match="not be empty"):
++        foreground_pyramid(evidence, scales=())
++
++
++@pytest.mark.parametrize(
++    "scales",
++    [
++        (0.0,),
++        (-0.1,),
++        (1.1,),
++        (np.nan,),
++        (np.inf,),
++        (0.5, 0.4),
++        (0.5, 0.5),
++    ],
++)
++def test_pyramid_rejects_invalid_scales(scales: tuple[float, ...]) -> None:
++    evidence = _evidence(np.ones((4, 4), dtype=bool))
++    with pytest.raises(ValueError):
++        foreground_pyramid(evidence, scales=scales)
++
++
++@pytest.mark.parametrize("threshold", [-0.1, 1.1, np.nan, np.inf])
++def test_pyramid_rejects_invalid_mask_threshold(threshold: float) -> None:
++    evidence = _evidence(np.ones((4, 4), dtype=bool))
++    with pytest.raises(ValueError, match="mask_threshold"):
++        foreground_pyramid(evidence, mask_threshold=threshold)
++
++
++@pytest.mark.parametrize(
++    ("coverage", "message"),
++    [
++        (np.array([[np.nan, 0.0]], dtype=np.float32), "finite"),
++        (np.array([[0.0, 1.1]], dtype=np.float32), "between zero and one"),
++    ],
++)
++def test_pyramid_level_rejects_invalid_coverage(coverage: np.ndarray, message: str) -> None:
++    with pytest.raises(ValueError, match=message):
++        ForegroundPyramidLevel(
++            index=0,
++            source_shape=(1, 2),
++            shape=(1, 2),
++            scale_x=1.0,
++            scale_y=1.0,
++            coverage=coverage,
++        )
++
++
++def test_foreground_pyramid_container_requires_exact_finest_level() -> None:
++    evidence = _evidence(np.array([[True, False]], dtype=bool))
++    coarse = ForegroundPyramidLevel(
++        index=0,
++        source_shape=(1, 2),
++        shape=(1, 1),
++        scale_x=0.5,
++        scale_y=1.0,
++        coverage=np.array([[0.5]], dtype=np.float32),
++    )
++
++    with pytest.raises(ValueError, match="final pyramid level"):
++        ForegroundPyramid(evidence, (coarse,))
++
++
++def test_repeated_pyramid_construction_is_deterministic() -> None:
++    evidence = _evidence(_synthetic_mask("ring"))
++    first = foreground_pyramid(evidence, scales=(0.17, 0.42, 0.8))
++    second = foreground_pyramid(evidence, scales=(0.17, 0.42, 0.8))
++
++    assert [level.shape for level in first.levels] == [level.shape for level in second.levels]
++    for left, right in zip(first.levels, second.levels, strict=True):
++        assert left.coverage.dtype == right.coverage.dtype == np.float32
++        assert np.array_equal(left.coverage, right.coverage)

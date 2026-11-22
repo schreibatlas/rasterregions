@@ -1,0 +1,43 @@
+schema_version: 1
+object_type: commit_audit_sheet
+versioning:
+  schema_version: 1
+  revision: 3
+release_version: 0.2.5
+git_base_ref: v0.2.4
+git_base_sha: 1236eb363494ea4853434774dd9fa1a896ce3627
+git_head_ref: HEAD
+git_head_sha: 1e4b54e4a849065184e4ca8a103ad4708e91d71b
+git_range: 1236eb363494ea4853434774dd9fa1a896ce3627..1e4b54e4a849065184e4ca8a103ad4708e91d71b
+commit_count: 1
+rows:
+- sha: 1e4b54e4a849065184e4ca8a103ad4708e91d71b
+  source_ref: git:1e4b54e4a849065184e4ca8a103ad4708e91d71b
+  short_sha: 1e4b54e
+  changed_paths:
+  - docs/foreground-evidence.md
+  - rasterregions/__init__.py
+  - rasterregions/models.py
+  - rasterregions/pyramid.py
+  - tests/test_foreground_pyramid.py
+  stats:
+    files_changed: 5
+    insertions: 441
+    deletions: 0
+  inspected: true
+  inspected_paths:
+  - docs/foreground-evidence.md
+  - rasterregions/__init__.py
+  - rasterregions/models.py
+  - rasterregions/pyramid.py
+  - tests/test_foreground_pyramid.py
+  observed_behavior: Added a public foreground_pyramid API that creates coarse-to-fine
+    fractional foreground occupancy levels from ForegroundEvidence, with immutable
+    coverage and the exact source mask at full resolution; documentation and tests
+    cover intended use, resampling, and validation.
+  public_impact: public
+  decision: accepted
+  stale: false
+  evidence_subject: 'feat: forground occupanccy pyramid'
+  target_entry_id: entry-0001
+  notes: ''

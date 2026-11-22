@@ -1,0 +1,29 @@
+{
+  "candidate_count": 1,
+  "candidates": [
+    {
+      "additions": 441,
+      "deletions": 0,
+      "patch_file": "1e4b54e.patch",
+      "patch_sha256": "bc6c15f81d7af942c3998caf5f3ad37096a24a7446182eb1656cae024a4b0669",
+      "paths": [
+        "docs/foreground-evidence.md",
+        "rasterregions/__init__.py",
+        "rasterregions/models.py",
+        "rasterregions/pyramid.py",
+        "tests/test_foreground_pyramid.py"
+      ],
+      "sha": "1e4b54e4a849065184e4ca8a103ad4708e91d71b",
+      "short_sha": "1e4b54e",
+      "source_ref": "git:1e4b54e4a849065184e4ca8a103ad4708e91d71b"
+    }
+  ],
+  "git_base_ref": "1236eb363494ea4853434774dd9fa1a896ce3627",
+  "git_base_sha": "1236eb363494ea4853434774dd9fa1a896ce3627",
+  "git_head_ref": "1e4b54e4a849065184e4ca8a103ad4708e91d71b",
+  "git_head_sha": "1e4b54e4a849065184e4ca8a103ad4708e91d71b",
+  "include_merges": "nontrivial",
+  "object_type": "git_evidence_manifest",
+  "release_version": "0.2.5",
+  "schema_version": 1
+}
