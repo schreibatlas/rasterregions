@@ -66,6 +66,35 @@ preview.save("foreground-evidence.png")
 
 The visualization clips only its display values. The returned decision field itself is not blurred or clipped near zero, so interpolation continues to use the segmentation decision.
 
+## Foreground occupancy pyramid
+
+Use `foreground_pyramid` to derive coarse-to-fine fitting evidence from an existing `ForegroundEvidence`:
+
+```python
+from rasterregions import foreground_evidence, foreground_pyramid
+
+evidence = foreground_evidence("page.png", mode="auto")
+pyramid = foreground_pyramid(evidence, scales=(0.25, 0.5))
+
+for level in pyramid.levels:
+    print(level.shape, level.scale_x, level.scale_y)
+    occupancy = level.coverage
+```
+
+The default scales are `(0.25, 0.5, 1.0)`. Scales must be finite, strictly increasing, and in `(0, 1]`. If `1.0` is omitted, it is appended automatically. Each requested level has dimensions `max(1, round(source_dimension * scale))`; duplicate output shapes are removed. `scale_x` and `scale_y` are the level width and height divided by their source dimensions.
+
+`ForegroundPyramidLevel.coverage` is an immutable `float32` array in `[0, 1]`. Downsampled coverage is produced directly from `evidence.mask` with Pillow BOX area filtering. Each coarse pixel represents fractional source foreground occupancy, so small marks can remain positive even when they disappear from the thresholded view. `mask_threshold` defaults to `0.5`, and `level.mask` is the read-only convenience view `level.coverage >= level.mask_threshold`. `ink_mass` reports level-pixel occupancy; `normalized_ink_mass` estimates the equivalent source-pixel mass using the level scales. Integer output dimensions mean resampled mass is approximate. The synthetic resampling tests allow a 5% relative source-mass tolerance.
+
+The final level is never resampled. Its shape equals the source mask shape and its coverage is exactly `evidence.mask.astype(np.float32)`. This preserves the source classification, but does not make thresholded coarse masks topology preserving:
+
+- `ForegroundEvidence.mask` remains the source classification.
+- `ForegroundPyramidLevel.coverage` is occupancy evidence for fitting.
+- `ForegroundPyramidLevel.mask` is a visualization/convenience representation, not a topology-preserving substitute for the source mask.
+- Coarse levels must not be used as authoritative topology.
+- Applications that need components, cycles, junctions, or tiny-mark topology must derive those facts from the full-resolution source evidence.
+
+The pyramid does not threshold the signed decision field at each scale. Its values are method-dependent classification evidence, not calibrated probabilities or occupancy samples.
+
 ## Release note
 
 > RasterRegions can now expose the signed continuous decision field underlying foreground segmentation. Existing boolean-mask APIs are unchanged. The new field is intended for consumers that need subpixel boundary localization.

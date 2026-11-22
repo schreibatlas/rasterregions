@@ -29,6 +29,8 @@ from .models import (
     DetectionStatus,
     ExpectedCountScope,
     ForegroundEvidence,
+    ForegroundPyramid,
+    ForegroundPyramidLevel,
     GroupingConfig,
     IsolationCandidate,
     IsolationReason,
@@ -51,6 +53,7 @@ from .models import (
     SpacedSegmentationHypotheses,
     SpacingConfig,
 )
+from .pyramid import foreground_pyramid
 from .regions import crop, tighten_bbox
 
 try:
@@ -72,6 +75,8 @@ __all__ = [
     "DetectionResult",
     "DetectionStatus",
     "ForegroundEvidence",
+    "ForegroundPyramid",
+    "ForegroundPyramidLevel",
     "ExpectedCountScope",
     "GroupingConfig",
     "IsolationReason",
@@ -101,6 +106,7 @@ __all__ = [
     "detect_spaced_regions",
     "detect_spaced_region_hypotheses",
     "detect_rows",
+    "foreground_pyramid",
     "foreground_evidence",
     "foreground_mask",
     "isolate_component",

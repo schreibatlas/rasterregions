@@ -127,6 +127,124 @@ class ForegroundEvidence:
         object.__setattr__(self, "warnings", tuple(self.warnings))
 
 
+def _pyramid_shape(shape: tuple[int, int], field_name: str) -> tuple[int, int]:
+    try:
+        dimensions = tuple(shape)
+    except TypeError as exc:
+        raise ValueError(f"{field_name} must be a (height, width) pair") from exc
+    if len(dimensions) != 2 or any(
+        isinstance(dimension, (bool, np.bool_))
+        or not isinstance(dimension, (int, np.integer))
+        or dimension <= 0
+        for dimension in dimensions
+    ):
+        raise ValueError(f"{field_name} must contain positive integer dimensions")
+    return int(dimensions[0]), int(dimensions[1])
+
+
+@dataclass(frozen=True)
+class ForegroundPyramidLevel:
+    """Fractional foreground occupancy at one pyramid resolution.
+
+    ``coverage`` is fitting evidence. The thresholded ``mask`` is only a
+    visualization/convenience representation, not a topology-preserving
+    substitute for the source mask.
+    """
+
+    index: int
+    source_shape: tuple[int, int]
+    shape: tuple[int, int]
+    scale_x: float
+    scale_y: float
+    coverage: np.ndarray
+    mask_threshold: float = 0.5
+
+    def __post_init__(self) -> None:
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            raise ValueError("pyramid level index must be a nonnegative integer")
+        source_shape = _pyramid_shape(self.source_shape, "source_shape")
+        shape = _pyramid_shape(self.shape, "shape")
+        if isinstance(self.scale_x, bool) or not isfinite(self.scale_x):
+            raise ValueError("scale_x must be finite")
+        if isinstance(self.scale_y, bool) or not isfinite(self.scale_y):
+            raise ValueError("scale_y must be finite")
+        expected_scale_x = shape[1] / source_shape[1]
+        expected_scale_y = shape[0] / source_shape[0]
+        if not np.isclose(self.scale_x, expected_scale_x) or not np.isclose(
+            self.scale_y, expected_scale_y
+        ):
+            raise ValueError("pyramid level scales must agree with source and level shapes")
+        if isinstance(self.mask_threshold, bool) or not isfinite(self.mask_threshold):
+            raise ValueError("mask_threshold must be finite and between zero and one")
+        if not 0.0 <= self.mask_threshold <= 1.0:
+            raise ValueError("mask_threshold must be finite and between zero and one")
+
+        coverage = np.asarray(self.coverage, dtype=np.float32)
+        if coverage.ndim != 2 or coverage.shape != shape:
+            raise ValueError("coverage dimensions must match the pyramid level shape")
+        if not np.isfinite(coverage).all() or np.any((coverage < 0.0) | (coverage > 1.0)):
+            raise ValueError("coverage values must be finite and between zero and one")
+        coverage = np.array(coverage, dtype=np.float32, copy=True)
+        coverage.setflags(write=False)
+        object.__setattr__(self, "source_shape", source_shape)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "scale_x", float(self.scale_x))
+        object.__setattr__(self, "scale_y", float(self.scale_y))
+        object.__setattr__(self, "coverage", coverage)
+        object.__setattr__(self, "mask_threshold", float(self.mask_threshold))
+
+    @property
+    def mask(self) -> np.ndarray:
+        """Return a read-only thresholded view for visualization and convenience."""
+        mask = self.coverage >= self.mask_threshold
+        mask.setflags(write=False)
+        return mask
+
+    @property
+    def ink_mass(self) -> float:
+        """Return the sum of foreground occupancy in level pixels."""
+        return float(self.coverage.sum())
+
+    @property
+    def normalized_ink_mass(self) -> float:
+        """Return occupancy mass in approximate source-pixel units."""
+        return self.ink_mass / (self.scale_x * self.scale_y)
+
+
+@dataclass(frozen=True)
+class ForegroundPyramid:
+    """Coarse-to-fine fitting levels backed by authoritative source evidence."""
+
+    evidence: ForegroundEvidence
+    levels: tuple[ForegroundPyramidLevel, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evidence, ForegroundEvidence):
+            raise ValueError("evidence must be a ForegroundEvidence instance")
+        levels = tuple(self.levels)
+        if not levels or any(not isinstance(level, ForegroundPyramidLevel) for level in levels):
+            raise ValueError("levels must contain at least one ForegroundPyramidLevel")
+        source_shape = _pyramid_shape(self.evidence.mask.shape, "evidence mask shape")
+        if any(level.source_shape != source_shape for level in levels):
+            raise ValueError("all pyramid levels must use the evidence source shape")
+        if any(level.index != index for index, level in enumerate(levels)):
+            raise ValueError("pyramid level indexes must be consecutive from zero")
+        for previous, current in zip(levels, levels[1:], strict=False):
+            if (
+                current.shape[0] < previous.shape[0]
+                or current.shape[1] < previous.shape[1]
+                or current.scale_x * current.scale_y <= previous.scale_x * previous.scale_y
+            ):
+                raise ValueError("pyramid levels must be ordered coarse to fine")
+        final = levels[-1]
+        expected_coverage = self.evidence.mask.astype(np.float32)
+        if final.shape != source_shape or not np.array_equal(final.coverage, expected_coverage):
+            raise ValueError("the final pyramid level must exactly preserve the source mask")
+        if any(level.mask_threshold != levels[0].mask_threshold for level in levels):
+            raise ValueError("all pyramid levels must use the same mask threshold")
+        object.__setattr__(self, "levels", levels)
+
+
 @dataclass(frozen=True)
 class Component:
     """An 8-connected foreground component with row-major index and pixel coordinates."""
