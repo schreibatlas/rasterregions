@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from rasterregions import (
@@ -65,6 +67,15 @@ def test_detection_payload_adds_structured_reproducibility_diagnostics() -> None
     assert result.diagnostics.image_size == (120, 60)
     assert result.diagnostics.raw_component_count == 3
     assert payload["rasterregions_version"]
+    assert payload["ownership"]["valid"]
+    assert payload["cleaned_foreground"]["pixels"] == int(result.clean_mask.sum())
+    assert payload["cleaned_foreground"]["mask_runs"]
+    assert payload["parameters"]["cleanup_config"]["micro_noise_max_area_ratio"] == 0.02
+    assert payload["parameters"]["spacing_config"]["auto_split_min_width_ratio"] == 1.35
+    assert payload["regions"][0]["mask_runs"]
+    assert json.dumps(payload, sort_keys=True) == json.dumps(
+        detection_payload(result), sort_keys=True
+    )
 
     assert payload["schema_version"] == 1
     assert payload["component_index_namespace"] == "raw_mask"
@@ -213,7 +224,10 @@ def test_spacing_diagnostics_are_serialized() -> None:
     assert payload["spacing"]["rows"][0]["inferred_count"] == 1
     assert payload["spacing"]["rows"][0]["anchor_count"] == 1
     assert payload["spacing"]["rows"][0]["segmentation_strategy"] == "anchors"
-    assert payload["spacing"]["rows"][0]["attempted_counts"] == []
+    assert payload["spacing"]["rows"][0]["attempted_counts"] == [1]
+    assert payload["spacing"]["rows"][0]["selected_count"] == 1
+    assert payload["spacing"]["rows"][0]["baseline_cost"] == 0.0
+    assert payload["spacing"]["ownership"]["valid"]
 
 
 def test_spacing_payload_exposes_secondary_component_ownership() -> None:
@@ -244,6 +258,8 @@ def test_spaced_hypothesis_payload_and_overlays_are_json_serializable(tmp_path) 
     encoded = json.dumps(payload)
     manifest = write_spaced_hypotheses(result, tmp_path)
 
+    assert payload["page_hypotheses"][0]["ownership_valid"]
+    assert payload["selected"]["ownership"]["valid"]
     assert json.loads(encoded)["search"]["truncated"] == result.truncated
     assert payload["page_hypotheses"][0]["count"] == 2
     assert payload["page_hypotheses"][0]["rows"][0]["regions"][0]["body_count"] == 1
@@ -277,3 +293,46 @@ def test_anchor_diagnostics_and_boxes_are_serialized(tmp_path) -> None:
             110,
             220,
         )
+
+
+def test_split_and_baseline_evidence_are_json_serializable() -> None:
+    image = Image.new("RGB", (220, 90), "white")
+    draw = ImageDraw.Draw(image)
+    for x in (15, 120, 170):
+        draw.rectangle((x, 30, x + 20, 60), fill="black")
+    draw.rectangle((65, 30, 82, 60), fill="black")
+    draw.rectangle((89, 30, 105, 60), fill="black")
+    draw.rectangle((82, 44, 89, 46), fill="black")
+
+    result = detect_spaced_region_hypotheses(image, mode="dark")
+    payload = spaced_hypotheses_payload(result)
+    json.dumps(payload)
+
+    row = payload["selected"]["spacing"]["rows"][0]
+    evidence = next(item for item in row["split_evidence"] if item["anchor_index"] == 1)
+    assert evidence["accepted"]
+    assert evidence["cut_range"][0] <= evidence["cut_x"] < evidence["cut_range"][1]
+    assert row["split_anchor_indices"] == [1]
+    assert row["repair_count"] == 1
+    assert row["baseline_cost"] > row["cost"]
+    row_options = payload["row_hypotheses"][0]
+    assert any(
+        option["count"] == 4 and option["split_anchor_indices"] == [] for option in row_options
+    )
+    assert any(
+        option["count"] == 5 and option["split_anchor_indices"] == [1] for option in row_options
+    )
+    assert payload["selected"]["ownership"]["valid"]
+
+
+def test_detection_result_rejects_incomplete_explicit_ownership() -> None:
+    image = Image.new("RGB", (300, 200), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 90, 99, 149), fill="black")
+    draw.rectangle((200, 70, 205, 75), fill="black")
+    result = detect_spaced_regions(image, mode="dark")
+    assert result.unassigned_mask is not None
+    assert result.unassigned_mask.any()
+
+    with pytest.raises(ValueError, match="conserve cleaned foreground"):
+        replace(result, unassigned_mask=np.zeros_like(result.unassigned_mask))

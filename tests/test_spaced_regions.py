@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
-from rasterregions import detect_spaced_regions
+from rasterregions import detect_spaced_region_hypotheses, detect_spaced_regions
 from rasterregions.models import DetectionConfig, SpacingConfig
 
 
@@ -165,6 +165,18 @@ def test_touching_forms_split_on_strong_valley_or_exact_count_hint() -> None:
     assert inferred_row.anchor_count == 1
     assert inferred_row.segmentation_strategy == "hybrid"
     assert inferred_row.split_anchor_indices == (0,)
+    assert inferred_row.baseline_cost is not None
+    assert inferred_row.baseline_cost > inferred_row.cost
+    assert inferred_row.repair_count == 1
+    evidence = inferred_row.split_evidence[0]
+    assert evidence.accepted
+    assert evidence.cut_range[0] <= evidence.cut_x < evidence.cut_range[1]
+    assert inferred_row.selected_boundaries == (evidence.cut_x,)
+    hypotheses = detect_spaced_region_hypotheses(image, mode="dark")
+    row_options = hypotheses.row_hypotheses[0]
+    assert {option.count for option in row_options} == {1, 2}
+    baseline_option = next(option for option in row_options if option.count == 1)
+    assert baseline_option.baseline_cost == inferred_row.baseline_cost
     assert inferred_row.attempted_counts == (2,)
     exact_row = exact.diagnostics.row_segmentation[0]
     assert exact_row.segmentation_strategy == "hybrid"

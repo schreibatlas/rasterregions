@@ -83,7 +83,7 @@ def test_tiny_far_away_speck_is_removed_with_stable_raw_component_id() -> None:
     speck = next(decision for decision in result.component_decisions if decision.bbox.x0 == 3)
     assert speck.component_index == 0
     assert speck.action == "removed"
-    assert speck.role == "noise"
+    assert speck.role == "micro-noise"
     assert speck.reason is not None
     assert not result.clean_mask[3, 3]
 

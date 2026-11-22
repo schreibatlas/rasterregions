@@ -18,6 +18,7 @@ from .detect import (
 )
 from .mask import foreground_evidence, foreground_mask
 from .models import (
+    AnchorSplitEvidence,
     BBox,
     CleanupConfig,
     Component,
@@ -65,6 +66,7 @@ except ImportError:
         __version__ = "0+unknown"
 
 __all__ = [
+    "AnchorSplitEvidence",
     "BBox",
     "CleanupConfig",
     "Component",

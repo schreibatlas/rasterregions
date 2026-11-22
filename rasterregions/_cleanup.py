@@ -83,18 +83,64 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
         component.index: _is_page_artifact(component, width, height, config) for component in found
     }
     non_artifacts = [component for component in found if not artifacts[component.index]]
-    provisional_scale, _ = _size_scale(non_artifacts)
-    provisional_threshold = provisional_scale * config.tiny_area_ratio
+    scale_candidates = [component for component in non_artifacts if component.area > 5]
+    micro_ids: set[int] = set()
+    body_area = 0.0
+    body_height = body_width = 0.0
+    bodies: list[Component] = []
+    if scale_candidates:
+        ordered = sorted(scale_candidates, key=lambda component: component.area)
+        upper = ordered[len(ordered) // 2 :]
+        body_area = float(np.median([component.area for component in upper]))
+        bodies = [component for component in ordered if component.area >= body_area * 0.2]
+        body_area = float(np.median([component.area for component in bodies]))
+        body_height = float(np.median([component.height for component in bodies]))
+        body_width = float(np.median([component.width for component in bodies]))
+        micro_ids = {
+            component.index
+            for component in non_artifacts
+            if component.area < body_area * config.micro_noise_max_area_ratio
+            and component.height < body_height * config.micro_noise_max_height_ratio
+            and component.width < body_width * config.micro_noise_max_width_ratio
+        }
+        micro_ids.difference_update(
+            component.index
+            for component in non_artifacts
+            if component.index in micro_ids
+            and any(
+                max(
+                    0,
+                    component.bbox.y0 - body.bbox.y1,
+                    body.bbox.y0 - component.bbox.y1,
+                )
+                <= body_height * config.micro_noise_mark_max_vertical_gap_ratio
+                and max(
+                    0,
+                    component.bbox.x0 - body.bbox.x1,
+                    body.bbox.x0 - component.bbox.x1,
+                )
+                <= body_width * config.micro_noise_mark_max_horizontal_gap_ratio
+                for body in bodies
+            )
+        )
+    retained = [component for component in non_artifacts if component.index not in micro_ids]
+    provisional_scale, _ = _size_scale(retained)
     provisional = tuple(
-        component for component in non_artifacts if component.area < provisional_threshold
+        component
+        for component in retained
+        if component.area
+        < max(
+            provisional_scale * config.tiny_area_ratio,
+            body_area * config.secondary_mark_max_area_ratio,
+        )
+        and component.height < body_height * 0.65
+        and component.width < body_width * 0.65
     )
     provisional_ids = {component.index for component in provisional}
     primary_candidates = [
-        component for component in non_artifacts if component.index not in provisional_ids
+        component for component in retained if component.index not in provisional_ids
     ]
-    if not primary_candidates and non_artifacts:
-        primary_candidates = [max(non_artifacts, key=lambda component: component.area)]
-    primary_area, median_height = _size_scale(primary_candidates)
+    primary_area, median_height = _size_scale(primary_candidates or retained)
 
     cleaned = np.array(mask, dtype=bool, copy=True)
     warnings: list[str] = []
@@ -106,8 +152,12 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
             reason = "page border, rule, or oversized artifact"
             cleaned[component.ys, component.xs] = False
             warnings.append(f"Removed component {component.index}: {reason}.")
+        elif component.index in micro_ids:
+            reason = "tiny component below plausible detached-mark scale"
+            cleaned[component.ys, component.xs] = False
+            warnings.append(f"Removed component {component.index}: {reason}.")
         elif component.index in provisional_ids:
-            reason = "provisional small component retained for contextual assignment"
+            reason = "plausible detached handwriting mark retained for contextual assignment"
             kept_components.append(component)
         else:
             kept_components.append(component)
@@ -116,15 +166,18 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
                 component.index,
                 component.bbox,
                 component.area,
-                "removed" if artifacts[component.index] else "kept",
+                "removed" if artifacts[component.index] or component.index in micro_ids else "kept",
                 reason,
                 role=(
                     "artifact"
                     if artifacts[component.index]
+                    else "micro-noise"
+                    if component.index in micro_ids
                     else "secondary-candidate"
                     if component.index in provisional_ids
                     else "primary"
                 ),
+                body_area_ratio=component.area / body_area if body_area else None,
             )
         )
 
@@ -135,5 +188,5 @@ def clean_page_mask(mask: np.ndarray, config: CleanupConfig | None = None) -> Cl
         median_height,
         tuple(warnings),
         tuple(decisions),
-        tuple(component.index for component in provisional),
+        tuple(component.index for component in provisional if component.index not in micro_ids),
     )

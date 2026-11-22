@@ -15,6 +15,9 @@
 
 
 Spacing-mode results add a `spacing` object to `detection_payload`: row-level counts and warnings, candidate and selected boundary evidence, secondary-mark assignments and margins, body counts, width-prior deviation, and unassigned-ink fraction/pixel count. The exact owner pixels are available through each `Region.mask` and `DetectionResult.unassigned_mask`; their union accounts for the cleaned foreground.
+Cleanup decisions include component width and height, scale-relative area, action, role, and reason. `DetectionDiagnostics.cleanup_config` and `spacing_config` expose the effective thresholds. `detection_payload` includes cleaned foreground row runs, each region's mask runs relative to its bbox, and an `ownership` summary with validity, owned, overlapping, and unassigned pixel counts.
+
+Spacing row diagnostics include the selected count and cost, the unsplit baseline cost, repair count, split-anchor indices, and structured evidence for accepted and rejected split candidates. Evidence includes the exact candidate cut, its allowed cut interval, geometry ratios, score, and reason codes. Row and page hypothesis payloads retain the unsplit alternative and split metadata. The search object reports truncation, the applicable limit, and any failure reason.
 Component indexes in cleanup decisions, rows, and regions use the explicitly named `raw_mask` namespace. Removed components may therefore leave gaps in indexes for retained components.
 
 ## Write artifacts

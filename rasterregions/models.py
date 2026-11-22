@@ -19,6 +19,7 @@ ComponentRole = Literal[
     "noise",
     "artifact",
     "ambiguous",
+    "micro-noise",
 ]
 
 
@@ -310,6 +311,7 @@ class ComponentDecision:
     action: Literal["kept", "removed"]
     reason: str | None = None
     role: ComponentRole = "primary"
+    body_area_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -334,8 +336,56 @@ class PartitionBoundary:
 
 
 @dataclass(frozen=True)
+class AnchorSplitEvidence:
+    """Measured evidence for splitting one primary body anchor."""
+
+    anchor_index: int
+    cut_x: int
+    cut_range: tuple[int, int]
+    valley_strength: float
+    neck_width: int
+    neck_width_ratio: float
+    left_area_fraction: float
+    right_area_fraction: float
+    left_height_ratio: float
+    right_height_ratio: float
+    anchor_width_ratio: float | None
+    score: float
+    accepted: bool
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.anchor_index < 0 or self.cut_x < 0 or self.neck_width < 1:
+            raise ValueError("split evidence indexes and neck width must be positive")
+        if len(self.cut_range) != 2 or not self.cut_range[0] <= self.cut_x < self.cut_range[1]:
+            raise ValueError("cut_x must lie inside the positive cut_range")
+        values = (
+            self.valley_strength,
+            self.neck_width_ratio,
+            self.left_area_fraction,
+            self.right_area_fraction,
+            self.left_height_ratio,
+            self.right_height_ratio,
+            self.score,
+        )
+        if not all(isfinite(value) for value in values):
+            raise ValueError("split evidence values must be finite")
+        if any(not 0.0 <= value <= 1.0 for value in values):
+            raise ValueError("split evidence ratios and score must be between zero and one")
+        if self.anchor_width_ratio is not None and (
+            not isfinite(self.anchor_width_ratio) or self.anchor_width_ratio <= 0.0
+        ):
+            raise ValueError("anchor_width_ratio must be finite and positive")
+        object.__setattr__(self, "cut_range", tuple(self.cut_range))
+        object.__setattr__(self, "reasons", tuple(self.reasons))
+
+
+@dataclass(frozen=True)
 class CleanupConfig:
-    """Thresholds for artifact removal and provisional tiny-component classification."""
+    """Artifact thresholds and maximum micro-noise ratios to median body dimensions.
+
+    Micro-noise is removed only when all three ratios are below their limits.
+    """
 
     tiny_area_ratio: float = 0.008
     rule_aspect_ratio: float = 12.0
@@ -344,6 +394,13 @@ class CleanupConfig:
     border_bbox_ratio: float = 0.20
     border_fill_ratio: float = 0.15
     max_component_area_ratio: float = 0.50
+
+    micro_noise_max_area_ratio: float = 0.02
+    micro_noise_max_height_ratio: float = 0.08
+    micro_noise_max_width_ratio: float = 0.08
+    secondary_mark_max_area_ratio: float = 0.20
+    micro_noise_mark_max_vertical_gap_ratio: float = 0.50
+    micro_noise_mark_max_horizontal_gap_ratio: float = 0.40
 
     def __post_init__(self) -> None:
         values = (
@@ -354,6 +411,12 @@ class CleanupConfig:
             self.border_bbox_ratio,
             self.border_fill_ratio,
             self.max_component_area_ratio,
+            self.micro_noise_max_area_ratio,
+            self.micro_noise_max_height_ratio,
+            self.micro_noise_max_width_ratio,
+            self.secondary_mark_max_area_ratio,
+            self.micro_noise_mark_max_vertical_gap_ratio,
+            self.micro_noise_mark_max_horizontal_gap_ratio,
         )
         if not all(isfinite(value) for value in values):
             raise ValueError("cleanup configuration values must be finite")
@@ -364,6 +427,12 @@ class CleanupConfig:
             self.border_bbox_ratio,
             self.border_fill_ratio,
             self.max_component_area_ratio,
+            self.micro_noise_max_area_ratio,
+            self.micro_noise_max_height_ratio,
+            self.micro_noise_max_width_ratio,
+            self.secondary_mark_max_area_ratio,
+            self.micro_noise_mark_max_vertical_gap_ratio,
+            self.micro_noise_mark_max_horizontal_gap_ratio,
         )
         if any(not 0.0 <= value <= 1.0 for value in fractions):
             raise ValueError("cleanup fractions must be between zero and one")
@@ -566,9 +635,20 @@ class SpacingConfig:
     max_region_width_ratio: float = 3.5
     max_inferred_count: int = 24
     complexity_penalty: float = 0.35
+    auto_split_min_width_ratio: float = 1.35
+    auto_split_max_neck_width_ratio: float = 0.20
+    auto_split_min_child_area_fraction: float = 0.16
+    auto_split_min_child_height_ratio: float = 0.45
+    auto_split_min_improvement: float = 0.15
     ambiguity_margin: float = 0.10
     mark_assignment_margin: float = 0.15
     row_assignment_margin: float = 0.15
+    secondary_mark_min_area_ratio: float = 0.001
+    secondary_mark_max_area_ratio: float = 0.60
+    secondary_mark_max_vertical_gap_ratio: float = 0.65
+    secondary_mark_max_horizontal_gap_ratio: float = 0.75
+    secondary_mark_max_bbox_expansion_ratio: float = 3.0
+    secondary_bbox_expansion_weight: float = 0.4
 
     hypothesis_limit: int = 5
     max_candidate_boundaries: int = 256
@@ -586,6 +666,17 @@ class SpacingConfig:
             self.ambiguity_margin,
             self.mark_assignment_margin,
             self.row_assignment_margin,
+            self.auto_split_min_width_ratio,
+            self.auto_split_max_neck_width_ratio,
+            self.auto_split_min_child_area_fraction,
+            self.auto_split_min_child_height_ratio,
+            self.auto_split_min_improvement,
+            self.secondary_mark_min_area_ratio,
+            self.secondary_mark_max_area_ratio,
+            self.secondary_mark_max_vertical_gap_ratio,
+            self.secondary_mark_max_horizontal_gap_ratio,
+            self.secondary_mark_max_bbox_expansion_ratio,
+            self.secondary_bbox_expansion_weight,
         )
         if not all(isfinite(value) for value in values):
             raise ValueError("spacing configuration values must be finite")
@@ -623,6 +714,30 @@ class SpacingConfig:
         margins = (self.ambiguity_margin, self.mark_assignment_margin, self.row_assignment_margin)
         if any(not 0.0 <= margin <= 1.0 for margin in margins):
             raise ValueError("spacing confidence margins must be between zero and one")
+        if self.auto_split_min_width_ratio < 1.0:
+            raise ValueError("auto_split_min_width_ratio must be at least one")
+        auto_split_fractions = (
+            self.auto_split_max_neck_width_ratio,
+            self.auto_split_min_child_area_fraction,
+            self.auto_split_min_child_height_ratio,
+            self.auto_split_min_improvement,
+        )
+        if any(not 0.0 <= value <= 1.0 for value in auto_split_fractions):
+            raise ValueError("automatic split ratios and improvement must be between zero and one")
+        if not (
+            0.0 <= self.secondary_mark_min_area_ratio <= self.secondary_mark_max_area_ratio <= 1.0
+        ):
+            raise ValueError("secondary mark area ratios must be ordered and in [0, 1]")
+        if (
+            min(
+                self.secondary_mark_max_vertical_gap_ratio,
+                self.secondary_mark_max_horizontal_gap_ratio,
+                self.secondary_bbox_expansion_weight,
+            )
+            < 0.0
+            or self.secondary_mark_max_bbox_expansion_ratio < 1.0
+        ):
+            raise ValueError("secondary mark distance and expansion limits must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -656,6 +771,8 @@ class DetectionDiagnostics:
     foreground_fraction: float = 0.0
     roi: BBox | None = None
 
+    cleanup_config: CleanupConfig | None = None
+    spacing_config: SpacingConfig | None = None
     row_segmentation: tuple[RowSegmentationDiagnostics, ...] = ()
     secondary_mark_assignments: tuple[SecondaryMarkAssignment, ...] = ()
     selected_region_count: int | None = None
@@ -675,6 +792,10 @@ class DetectionDiagnostics:
             self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
         )
         object.__setattr__(self, "body_counts_per_region", tuple(self.body_counts_per_region))
+        if self.cleanup_config is not None and not isinstance(self.cleanup_config, CleanupConfig):
+            raise ValueError("cleanup_config must be CleanupConfig")
+        if self.spacing_config is not None and not isinstance(self.spacing_config, SpacingConfig):
+            raise ValueError("spacing_config must be SpacingConfig")
         if any(
             isinstance(count, bool) or not isinstance(count, int) or count < 0
             for count in self.body_counts_per_region
@@ -739,6 +860,9 @@ class RowSegmentationDiagnostics:
     truncated_counts: tuple[int, ...] = ()
     split_anchor_indices: tuple[int, ...] = ()
     merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
+    baseline_cost: float | None = None
+    repair_count: int = 0
+    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_indices", tuple(self.component_indices))
@@ -751,6 +875,7 @@ class RowSegmentationDiagnostics:
         object.__setattr__(self, "attempted_counts", tuple(self.attempted_counts))
         object.__setattr__(self, "truncated_counts", tuple(self.truncated_counts))
         object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
+        object.__setattr__(self, "split_evidence", tuple(self.split_evidence))
         merged_groups = tuple(tuple(group) for group in self.merged_anchor_groups)
         object.__setattr__(self, "merged_anchor_groups", merged_groups)
         if self.anchor_count is not None and (
@@ -767,6 +892,14 @@ class RowSegmentationDiagnostics:
                 for count in counts
             ):
                 raise ValueError("attempted counts must be positive integers")
+        if self.repair_count < 0:
+            raise ValueError("repair_count must be nonnegative")
+        if self.baseline_cost is not None and (
+            not isfinite(self.baseline_cost) or self.baseline_cost < 0.0
+        ):
+            raise ValueError("baseline_cost must be finite and nonnegative")
+        if any(not isinstance(item, AnchorSplitEvidence) for item in self.split_evidence):
+            raise ValueError("split_evidence must contain AnchorSplitEvidence values")
         if any(index < 0 for index in self.split_anchor_indices):
             raise ValueError("split anchor indices must be nonnegative")
         if any(len(group) < 2 or any(index < 0 for index in group) for group in merged_groups):
@@ -827,6 +960,12 @@ class SecondaryMarkAssignment:
     margin: float | None
     status: Literal["assigned", "ambiguous", "unassigned"]
     candidate_region_indices: tuple[int, ...] = ()
+    area_ratio: float | None = None
+    horizontal_overlap_ratio: float | None = None
+    horizontal_center_distance: float | None = None
+    vertical_gap_ratio: float | None = None
+    bbox_expansion_ratio: float | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -844,6 +983,28 @@ class SecondaryMarkAssignment:
         scores = (self.best_score, self.second_best_score, self.margin)
         if any(value is not None and not isfinite(value) for value in scores):
             raise ValueError("mark assignment scores must be finite")
+        metrics = (
+            self.area_ratio,
+            self.horizontal_overlap_ratio,
+            self.horizontal_center_distance,
+            self.vertical_gap_ratio,
+            self.bbox_expansion_ratio,
+        )
+        if any(value is not None and not isfinite(value) for value in metrics):
+            raise ValueError("mark assignment geometry must be finite")
+        if any(
+            value is not None and not 0.0 <= value <= 1.0
+            for value in (
+                self.area_ratio,
+                self.horizontal_overlap_ratio,
+                self.vertical_gap_ratio,
+            )
+        ):
+            raise ValueError("mark assignment ratios must be between zero and one")
+        if self.horizontal_center_distance is not None and self.horizontal_center_distance < 0.0:
+            raise ValueError("horizontal center distance must be nonnegative")
+        if self.bbox_expansion_ratio is not None and self.bbox_expansion_ratio < 1.0:
+            raise ValueError("bbox expansion ratio must be at least one")
         if self.margin is not None and self.margin < 0.0:
             raise ValueError("mark assignment margin must be nonnegative")
         if self.status == "assigned" and self.target_region_index is None:
@@ -931,12 +1092,29 @@ class DetectionResult:
             if self.unassigned_mask is None
             else np.asarray(self.unassigned_mask, dtype=bool)
         )
+        provided_unassigned_mask = self.unassigned_mask is not None
         if unassigned.shape != clean.shape:
             raise ValueError("unassigned mask must match clean mask shape")
         unassigned = np.array(unassigned, copy=True)
         unassigned.setflags(write=False)
         object.__setattr__(self, "unassigned_mask", unassigned)
         object.__setattr__(self, "clean_mask", clean)
+        if (
+            provided_unassigned_mask
+            and self.diagnostics is not None
+            and self.diagnostics.row_count is not None
+        ):
+            ownership = np.zeros_like(clean)
+            for region in self.regions:
+                bbox = region.bbox
+                if bbox.x1 > clean.shape[1] or bbox.y1 > clean.shape[0]:
+                    raise ValueError("region ownership must stay inside cleaned foreground bounds")
+                local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
+                if np.any(local & region.mask):
+                    raise ValueError("region ownership masks must be pairwise disjoint")
+                local |= region.mask
+            if np.any(ownership & unassigned) or not np.array_equal(ownership | unassigned, clean):
+                raise ValueError("region and unassigned masks must conserve cleaned foreground")
         object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "component_decisions", tuple(self.component_decisions))
         if self.source_path is not None:
@@ -1043,6 +1221,10 @@ class RowPartitionHypothesis:
 
     boundary_evidence: tuple[PartitionBoundary, ...] = ()
     cut_crossing_cost: float = 0.0
+    baseline_cost: float | None = None
+    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
+    split_anchor_indices: tuple[int, ...] = ()
+    repair_count: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -1076,6 +1258,16 @@ class RowPartitionHypothesis:
             self, "secondary_mark_assignments", tuple(self.secondary_mark_assignments)
         )
         object.__setattr__(self, "boundary_evidence", tuple(self.boundary_evidence))
+        object.__setattr__(self, "split_evidence", tuple(self.split_evidence))
+        if self.baseline_cost is not None and (
+            not isfinite(self.baseline_cost) or self.baseline_cost < 0.0
+        ):
+            raise ValueError("baseline_cost must be finite and nonnegative")
+        if any(not isinstance(item, AnchorSplitEvidence) for item in self.split_evidence):
+            raise ValueError("split_evidence must contain AnchorSplitEvidence values")
+        object.__setattr__(self, "split_anchor_indices", tuple(self.split_anchor_indices))
+        if self.repair_count < 0 or any(index < 0 for index in self.split_anchor_indices):
+            raise ValueError("split anchors and repair count must be nonnegative")
 
 
 @dataclass(frozen=True)

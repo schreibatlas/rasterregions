@@ -52,7 +52,7 @@ def test_each_search_budget_rejects_nonpositive_values() -> None:
             SpacingConfig(**{field: 0})
 
 
-def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
+def test_automatic_evidence_split_is_independent_of_partition_budget() -> None:
     image = Image.new("RGB", (130, 80), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((15, 25, 49, 55), fill="black")
@@ -62,15 +62,16 @@ def test_partition_budget_keeps_automatic_anchor_hypothesis() -> None:
 
     result = detect_spaced_region_hypotheses(image, mode="dark", config=config)
 
-    assert len(result.selected.regions) == 1
-    assert result.selected.diagnostics.search_truncated
-    assert result.selected.diagnostics.search_limit == "row-partition-budget"
-    assert result.row_hypotheses[0][0].count == 1
+    assert len(result.selected.regions) == 2
+    assert not result.selected.diagnostics.search_truncated
+    assert result.selected.diagnostics.search_limit is None
+    assert result.row_hypotheses[0][0].count == 2
     row = result.selected.diagnostics.row_segmentation[0]
     assert row.anchor_count == 1
-    assert row.segmentation_strategy == "anchors"
+    assert row.segmentation_strategy == "hybrid"
+    assert row.split_anchor_indices == (0,)
     assert row.attempted_counts == (2,)
-    assert row.truncated_counts == (2,)
+    assert row.truncated_counts == ()
 
 
 def test_exact_count_budget_failure_leaves_clean_ink_unassigned() -> None:

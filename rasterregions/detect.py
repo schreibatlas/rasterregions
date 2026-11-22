@@ -16,8 +16,10 @@ from ._grouping import (
     _merge_spacing_body_anchors,
     _spacing_attachment_score,
     _spacing_body_anchor_has_strong_valley,
+    _spacing_body_anchor_split_evidence,
     _spacing_body_anchors,
     _spacing_body_components,
+    _split_spacing_body_anchor,
 )
 from ._image import normalize_image
 from ._partition import (
@@ -309,6 +311,8 @@ def detect_regions(
         mask_method=mask_result.method,
         mask_confidence=mask_result.confidence,
         foreground_fraction=float(mask_result.mask.mean()),
+        cleanup_config=config.cleanup,
+        spacing_config=config.spacing,
     )
     return DetectionResult(
         source_path=normalized.source_path,
@@ -417,6 +421,161 @@ def _row_from_body_anchors(
     )
 
 
+def _automatic_anchor_hypotheses(
+    image: Image.Image,
+    found: tuple[Component, ...],
+    component_indices: Sequence[int],
+    page_shape: tuple[int, int],
+    row: RowBand,
+    row_index: int,
+    padding: int,
+    anchors: Sequence[_BodyAnchor],
+    baseline: RowPartition,
+    config: DetectionConfig,
+) -> RowPartition:
+    median_width = (
+        float(np.median([anchor.width for anchor in anchors])) if len(anchors) > 1 else None
+    )
+    evidence = []
+    for index, anchor in enumerate(anchors):
+        item = _spacing_body_anchor_split_evidence(anchor, index, median_width, config.spacing)
+        if item is None:
+            continue
+        if item.accepted and (
+            item.score - config.spacing.complexity_penalty
+            < config.spacing.auto_split_min_improvement
+        ):
+            item = replace(
+                item,
+                accepted=False,
+                reasons=(*item.reasons, "insufficient-improvement-over-unsplit-baseline"),
+            )
+        evidence.append(item)
+    accepted = tuple(item for item in evidence if item.accepted)
+    baseline_cost = float(sum(item.score for item in accepted))
+
+    def geometry(option: RowPartition) -> tuple[tuple[object, ...], ...]:
+        return tuple((region.bbox.as_tuple(), region.mask.tobytes()) for region in option.regions)
+
+    baseline = replace(
+        baseline,
+        cost=baseline_cost,
+        baseline_cost=baseline_cost,
+        repair_count=0,
+        split_anchor_indices=(),
+        segmentation_strategy="anchors",
+        attempted_counts=(len(baseline.regions),),
+        split_evidence=tuple(evidence),
+    )
+    options = [baseline]
+    seen_geometries = {geometry(baseline)}
+    choices = [[item] for item in accepted]
+    if len(accepted) > 1:
+        choices.append(list(accepted))
+    for choice in choices:
+        by_index = {item.anchor_index: item for item in choice}
+        repaired_anchors: list[_BodyAnchor] = []
+        valid = True
+        for index, anchor in enumerate(anchors):
+            item = by_index.get(index)
+            if item is None:
+                repaired_anchors.append(anchor)
+                continue
+            children = _split_spacing_body_anchor(anchor, item.cut_x)
+            if children is None:
+                valid = False
+                break
+            repaired_anchors.extend(children)
+        if not valid:
+            continue
+        complexity = config.spacing.complexity_penalty * len(choice)
+        candidate_cost = max(0.0, baseline_cost - sum(item.score for item in choice) + complexity)
+        candidate = _row_from_body_anchors(
+            image,
+            found,
+            component_indices,
+            page_shape,
+            row_index,
+            padding,
+            repaired_anchors,
+            candidate_cost,
+        )
+        if candidate is None:
+            continue
+        candidate_geometry = geometry(candidate)
+        if candidate_geometry in seen_geometries:
+            continue
+        seen_geometries.add(candidate_geometry)
+        boundaries = tuple(
+            PartitionBoundary(
+                x=item.cut_x,
+                projection=float(item.neck_width),
+                crossing_components=1,
+                confidence=item.score,
+                valley_strength=item.valley_strength,
+                component_indices=anchors[item.anchor_index].component_indices,
+                selected=True,
+                kind="valley",
+            )
+            for item in choice
+        )
+        ordered_regions = sorted(candidate.regions, key=lambda region: region.bbox.x0)
+        cut_positions = (
+            row.bbox.x0,
+            *(
+                (left.bbox.center_x + right.bbox.center_x) // 2
+                for left, right in zip(ordered_regions, ordered_regions[1:], strict=False)
+            ),
+            row.bbox.x1,
+        )
+        options.append(
+            replace(
+                candidate,
+                confidence=min(item.score for item in choice),
+                cost=candidate_cost,
+                baseline_cost=baseline_cost,
+                repair_count=len(choice),
+                split_anchor_indices=tuple(sorted(item.anchor_index for item in choice)),
+                segmentation_strategy="hybrid",
+                attempted_counts=(len(candidate.regions),),
+                partition_boundaries=boundaries,
+                body_counts_per_region=tuple(1 for _ in candidate.regions),
+                cut_positions=tuple(int(value) for value in cut_positions),
+                split_evidence=tuple(evidence),
+            )
+        )
+    options.sort(
+        key=lambda option: (
+            option.cost,
+            option.repair_count,
+            geometry(option),
+        )
+    )
+    selected = options[0]
+    limit = config.spacing.hypothesis_limit
+    retained = options[:limit]
+    if all(option is not baseline for option in retained):
+        retained[-1] = baseline
+        retained.sort(
+            key=lambda option: (
+                option.cost,
+                option.repair_count,
+                geometry(option),
+            )
+        )
+    alternatives = tuple(option for option in retained if option is not selected)
+    margin = None
+    if len(retained) > 1:
+        second_cost = retained[1].cost
+        margin = max(0.0, second_cost - selected.cost) / max(1.0, abs(second_cost))
+    return replace(
+        selected,
+        alternative_cost_margin=margin,
+        alternatives=alternatives,
+        truncated=selected.truncated or len(options) > limit,
+    )
+
+
 def _row_with_local_anchor_repairs(
     image: Image.Image,
     mask: np.ndarray,
@@ -436,6 +595,19 @@ def _row_with_local_anchor_repairs(
     )
     if partition is None:
         return None
+    if target_count is None:
+        return _automatic_anchor_hypotheses(
+            image,
+            found,
+            component_indices,
+            mask.shape,
+            row,
+            row_index,
+            padding,
+            anchors,
+            partition,
+            config,
+        )
     suspicious = [
         index
         for index, anchor in enumerate(anchors)
@@ -570,7 +742,6 @@ def detect_spaced_regions(
         component.index: layout.component_row_assignments[index]
         for index, component in enumerate(cleaned.components)
     }
-    cleaned = _remove_unassigned_provisional_components(cleaned, layout)
     rows = layout.rows
     if row_counts is None:
         requested: tuple[int | None, ...] = (None,) * len(rows)
@@ -951,6 +1122,9 @@ def detect_spaced_regions(
                 ),
                 split_anchor_indices=partition.split_anchor_indices if partition else (),
                 merged_anchor_groups=partition.merged_anchor_groups if partition else (),
+                baseline_cost=partition.baseline_cost if partition else None,
+                repair_count=partition.repair_count if partition else 0,
+                split_evidence=partition.split_evidence if partition else (),
             )
         )
         for column_index, region in enumerate(row_regions):
@@ -1031,6 +1205,7 @@ def detect_spaced_regions(
                         component,
                         bodies,
                         row_diagnostics[regions[region_index].row_index].body_height,
+                        config.spacing,
                     )
                 )
                 is not None
@@ -1050,12 +1225,26 @@ def detect_spaced_regions(
             )
         elif component.index in unassigned_row_ids:
             decision = SecondaryMarkAssignment(
-                component.index, None, None, None, None, "unassigned"
+                component.index,
+                None,
+                None,
+                None,
+                None,
+                "unassigned",
+                reason="component is not plausibly associated with a primary body",
             )
         else:
             decision = decision_by_component.get(
                 component.index,
-                SecondaryMarkAssignment(component.index, None, None, None, None, "unassigned"),
+                SecondaryMarkAssignment(
+                    component.index,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "unassigned",
+                    reason="component has no secondary-mark assignment decision",
+                ),
             )
         secondary_assignments.append(decision)
     secondary_assignments.sort(key=lambda item: item.component_index)
@@ -1247,6 +1436,8 @@ def detect_spaced_regions(
         unassigned_ink_fraction=unassigned_fraction,
         search_truncated=search_truncated,
         search_limit=search_limit,
+        cleanup_config=config.cleanup,
+        spacing_config=config.spacing,
     )
     result = DetectionResult(
         source_path=normalized.source_path,
@@ -1401,6 +1592,10 @@ def _selected_page_hypothesis(
                         if boundary.x in boundaries[1:-1]
                     )
                 ),
+                baseline_cost=row_diagnostic.baseline_cost if row_diagnostic else None,
+                split_evidence=part.split_evidence if part else (),
+                split_anchor_indices=part.split_anchor_indices if part else (),
+                repair_count=part.repair_count if part else 0,
                 cut_crossing_cost=part.cut_crossing_cost if part else 0.0,
             )
         )
@@ -1481,6 +1676,10 @@ def _row_hypothesis_from_partition(
         secondary_mark_assignments=tuple(row_assignments),
         boundary_evidence=partition.partition_boundaries,
         cut_crossing_cost=partition.cut_crossing_cost,
+        baseline_cost=partition.baseline_cost,
+        split_evidence=partition.split_evidence,
+        split_anchor_indices=partition.split_anchor_indices,
+        repair_count=partition.repair_count,
     )
 
 
@@ -1554,7 +1753,9 @@ def _page_hypotheses_for_partitions(
                 if result.diagnostics and target_row < len(result.diagnostics.row_segmentation)
                 else body_height
             )
-            score = _spacing_attachment_score(component, body_groups[region_index], row_scale)
+            score = _spacing_attachment_score(
+                component, body_groups[region_index], row_scale, config.spacing
+            )
             if score is not None:
                 scored.append((score, region_index))
         scored.sort(key=lambda item: (item[0], item[1]))
@@ -1730,6 +1931,10 @@ def _page_hypotheses_for_partitions(
                     secondary_mark_assignments=row_assignments,
                     boundary_evidence=partition.partition_boundaries,
                     cut_crossing_cost=partition.cut_crossing_cost,
+                    baseline_cost=partition.baseline_cost,
+                    split_evidence=partition.split_evidence,
+                    split_anchor_indices=partition.split_anchor_indices,
+                    repair_count=partition.repair_count,
                 )
             )
         if not row_hypotheses:

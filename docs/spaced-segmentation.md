@@ -17,6 +17,19 @@ result = detect_spaced_regions("page.png", row_counts=[None, 4])
 
 The sequence must have one entry per detected row. Automatic inference is deterministic and bounded by `SpacingConfig.max_inferred_count`. Similar-cost alternatives, strong internal valleys in a single connected body, weak boundaries, suspicious width deviations, ambiguous marks, or unassigned ink can make the status `ambiguous`. A row that cannot be partitioned returns diagnostics rather than fabricated cuts.
 
+## Scale-aware cleanup and mark ownership
+
+`DetectionConfig.cleanup` controls component cleanup. A component is removed as micro-noise only when its area, height, and width are all below their respective ratios of the inferred median body scale. A small component within the configured mark-gap limits of a plausible body is preserved for contextual assignment instead. This keeps plausible dots available while discarding isolated specks. Page rules and border artifacts are handled by separate cleanup controls.
+
+
+The default micro-noise limits are 0.02 of median body area and 0.08 of median body height and width. Tiny components within 0.50 body heights vertically and 0.40 body widths horizontally are exempted for mark assignment. Mark assignment defaults to a 0.001 minimum relative area, 0.65 maximum vertical gap, 0.75 maximum horizontal gap, 3.0 maximum bbox expansion, and a 0.15 best-versus-second-best score margin.
+
+`DetectionConfig.spacing` controls secondary-mark attachment and automatic repairs. Mark candidates must satisfy size, alignment, distance, bbox-expansion, and score-margin gates. A mark that has no credible owner remains in `unassigned_mask`; it does not enlarge a region box.
+
+Automatic splits compete with the unsplit primary-body baseline. A split requires a narrow projection neck, substantial children with supported heights, an anomalously wide anchor, and the configured minimum improvement over the baseline after complexity cost. `auto_split_min_width_ratio`, `auto_split_max_neck_width_ratio`, `auto_split_min_child_area_fraction`, `auto_split_min_child_height_ratio`, and `auto_split_min_improvement` control these checks. Split evidence records the candidate cut and its allowed valley interval, measured ratios, acceptance, and reason codes. Caller-supplied exact counts can still use the broader partition search.
+
+The effective cleanup and spacing configurations are retained in `DetectionResult.diagnostics` and serialized in `detection_payload`. The result also exposes the cleaned `clean_mask`, each region's exact mask, and the complementary `unassigned_mask`. Explicit ownership masks are validated for overlap and exact foreground conservation.
+
 ## Ownership and diagnostics
 
 The API uses body and secondary-mark evidence, smoothed projection valleys, component-center midpoints, and the existing dynamic-programming partitioner. Width priors are estimated from the current row; scale-relative controls live in `DetectionConfig.spacing`:

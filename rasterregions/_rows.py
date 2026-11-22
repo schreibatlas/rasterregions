@@ -155,7 +155,7 @@ def _spacing_rows_from_components(
                 for body in row
                 if (
                     score := _spacing_attachment_score(
-                        component, (body,), row_scales[row_index] or body_scale
+                        component, (body,), row_scales[row_index] or body_scale, spacing
                     )
                 )
                 is not None
@@ -175,7 +175,7 @@ def _spacing_rows_from_components(
             for row_index, row in enumerate(rows_of_bodies)
             if (
                 score := _spacing_attachment_score(
-                    component, row, row_scales[row_index] or body_scale
+                    component, row, row_scales[row_index] or body_scale, spacing
                 )
             )
             is not None

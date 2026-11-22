@@ -11,6 +11,7 @@ from PIL import Image
 from ._grouping import _make_region, _size_scale, _spacing_body_components
 from ._rows import _row_y_bounds
 from .models import (
+    AnchorSplitEvidence,
     BBox,
     Component,
     ExpectedCountScope,
@@ -59,6 +60,12 @@ class RowPartition:
     truncated_counts: tuple[int, ...] = ()
     split_anchor_indices: tuple[int, ...] = ()
     merged_anchor_groups: tuple[tuple[int, ...], ...] = ()
+    baseline_cost: float | None = None
+    repair_count: int = 0
+    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
+    baseline_cost: float | None = None
+    repair_count: int = 0
+    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
 
 
 def _combine_page_partitions(

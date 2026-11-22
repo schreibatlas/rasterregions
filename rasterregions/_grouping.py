@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 
 from .models import (
+    AnchorSplitEvidence,
     BBox,
     Component,
     GroupingConfig,
@@ -242,16 +243,149 @@ def _spacing_body_anchor_has_strong_valley(anchor: _BodyAnchor) -> bool:
     return False
 
 
-def _spacing_attachment_score(
+def _spacing_body_anchor_split_evidence(
+    anchor: _BodyAnchor,
+    anchor_index: int,
+    median_width: float | None,
+    config: SpacingConfig,
+) -> AnchorSplitEvidence | None:
+    projection = anchor.mask.sum(axis=0).astype(int)
+    if projection.size < 4:
+        return None
+    start = max(1, projection.size // 5)
+    stop = min(projection.size - 1, (projection.size * 4) // 5)
+    minima = [
+        x
+        for x in range(start, stop)
+        if projection[x] <= projection[x - 1] and projection[x] <= projection[x + 1]
+    ]
+    if not minima:
+        return None
+    cut = min(
+        minima,
+        key=lambda x: (
+            projection[x] / max(1, min(int(projection[:x].max()), int(projection[x + 1 :].max()))),
+            x,
+        ),
+    )
+    left_peak = int(projection[:cut].max())
+    right_peak = int(projection[cut + 1 :].max())
+    neck_reference = max(1, min(left_peak, right_peak))
+    valley_ratio = float(projection[cut] / neck_reference)
+    low_limit = max(1, int(np.floor(neck_reference * config.auto_split_max_neck_width_ratio)))
+    neck_start = cut
+    neck_stop = cut
+    while neck_start > 0 and projection[neck_start - 1] <= low_limit:
+        neck_start -= 1
+    while neck_stop + 1 < projection.size and projection[neck_stop + 1] <= low_limit:
+        neck_stop += 1
+    neck_width = neck_stop - neck_start + 1
+    neck_ratio = max(valley_ratio, neck_width / max(1, anchor.width))
+    left = anchor.mask[:, :cut]
+    right = anchor.mask[:, cut:]
+    total_area = max(1, anchor.area)
+    left_area_fraction = float(left.sum() / total_area)
+    right_area_fraction = float(right.sum() / total_area)
+
+    def child_height(mask: np.ndarray) -> float:
+        ys = np.flatnonzero(mask.any(axis=1))
+        return (int(ys[-1]) - int(ys[0]) + 1) / max(1, anchor.height) if len(ys) else 0.0
+
+    left_height_ratio = child_height(left)
+    right_height_ratio = child_height(right)
+    width_ratio = (
+        anchor.width / median_width if median_width is not None and median_width > 0 else None
+    )
+    narrow_neck = neck_ratio <= config.auto_split_max_neck_width_ratio
+    substantial_children = (
+        min(left_area_fraction, right_area_fraction) >= config.auto_split_min_child_area_fraction
+    )
+    tall_children = (
+        min(left_height_ratio, right_height_ratio) >= config.auto_split_min_child_height_ratio
+    )
+    width_anomaly = width_ratio is None or width_ratio >= config.auto_split_min_width_ratio
+    reasons = []
+    reasons.append("narrow-neck" if narrow_neck else "neck-too-wide")
+    reasons.append("substantial-children" if substantial_children else "child-area-too-small")
+    reasons.append("child-heights-supported" if tall_children else "child-height-too-small")
+    if width_ratio is None:
+        reasons.append("width-anomaly-not-applicable")
+    else:
+        reasons.append("wide-anchor" if width_anomaly else "anchor-width-not-anomalous")
+    signals = (
+        float(np.clip(1.0 - neck_ratio, 0.0, 1.0)),
+        float(np.clip(min(left_area_fraction, right_area_fraction) / 0.25, 0.0, 1.0)),
+        float(np.clip(min(left_height_ratio, right_height_ratio) / 0.70, 0.0, 1.0)),
+        float(np.clip(width_ratio / config.auto_split_min_width_ratio, 0.0, 1.0))
+        if width_ratio is not None
+        else 1.0,
+    )
+    score = float(np.mean(signals))
+    accepted = narrow_neck and substantial_children and tall_children and width_anomaly
+    return AnchorSplitEvidence(
+        anchor_index=anchor_index,
+        cut_x=anchor.bbox.x0 + cut,
+        cut_range=(anchor.bbox.x0 + neck_start, anchor.bbox.x0 + neck_stop + 1),
+        valley_strength=float(np.clip(1.0 - valley_ratio, 0.0, 1.0)),
+        neck_width=neck_width,
+        neck_width_ratio=float(np.clip(neck_ratio, 0.0, 1.0)),
+        left_area_fraction=left_area_fraction,
+        right_area_fraction=right_area_fraction,
+        left_height_ratio=left_height_ratio,
+        right_height_ratio=right_height_ratio,
+        anchor_width_ratio=width_ratio,
+        score=score,
+        accepted=accepted,
+        reasons=tuple(reasons),
+    )
+
+
+def _split_spacing_body_anchor(
+    anchor: _BodyAnchor, cut_x: int
+) -> tuple[_BodyAnchor, _BodyAnchor] | None:
+    local_cut = cut_x - anchor.bbox.x0
+    if not 0 < local_cut < anchor.width:
+        return None
+    children = []
+    for x0, x1 in ((0, local_cut), (local_cut, anchor.width)):
+        mask = anchor.mask[:, x0:x1]
+        ys, xs = np.nonzero(mask)
+        if not len(xs):
+            return None
+        left, right = int(xs.min()), int(xs.max()) + 1
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        child_mask = np.array(mask[top:bottom, left:right], copy=True)
+        bbox = BBox(
+            anchor.bbox.x0 + x0 + left,
+            anchor.bbox.y0 + top,
+            anchor.bbox.x0 + x0 + right,
+            anchor.bbox.y0 + bottom,
+        )
+        children.append(
+            _BodyAnchor(
+                component_indices=anchor.component_indices,
+                mask=child_mask,
+                bbox=bbox,
+                center_x=bbox.center_x,
+                width=bbox.width,
+                height=bbox.height,
+                area=int(child_mask.sum()),
+            )
+        )
+    return children[0], children[1]
+
+
+def _spacing_attachment_metrics(
     component: Component,
     targets: Sequence[Component],
     scale: float,
-) -> float | None:
-    """Return the best scale-normalized geometric score for one mark and target set."""
+    config: SpacingConfig,
+) -> tuple[float, float, float, float, float, float, bool] | None:
+    """Return score, geometry, and eligibility for the best target."""
     if not targets:
         return None
     scale = max(1.0, scale)
-    scores: list[float] = []
+    options = []
     for target in targets:
         horizontal_gap = max(
             target.bbox.x0 - component.bbox.x1,
@@ -263,8 +397,14 @@ def _spacing_attachment_score(
             component.bbox.y0 - target.bbox.y1,
             0,
         )
-        if horizontal_gap > 1.5 * scale or vertical_gap > 1.75 * scale:
-            continue
+        area_ratio = component.area / max(1.0, target.area)
+        expanded_width = max(target.bbox.x1, component.bbox.x1) - min(
+            target.bbox.x0, component.bbox.x0
+        )
+        expanded_height = max(target.bbox.y1, component.bbox.y1) - min(
+            target.bbox.y0, component.bbox.y0
+        )
+        expansion = expanded_width * expanded_height / (target.width * target.height)
         overlap_x = max(
             0,
             min(target.bbox.x1, component.bbox.x1) - max(target.bbox.x0, component.bbox.x0),
@@ -273,13 +413,48 @@ def _spacing_attachment_score(
             0,
             min(target.bbox.y1, component.bbox.y1) - max(target.bbox.y0, component.bbox.y0),
         )
-        size_ratio = min(component.area, target.area) / max(1.0, target.area)
-        alignment_bonus = 0.30 * overlap_x / scale + 0.20 * overlap_y / scale
-        size_penalty = 0.15 * max(0.0, size_ratio - 0.45)
-        scores.append(
-            horizontal_gap / scale + 0.7 * vertical_gap / scale - alignment_bonus + size_penalty
+        overlap_ratio = overlap_x / max(1, min(target.width, component.width))
+        center_distance = abs(component.center_x - target.center_x) / scale
+        vertical_gap_ratio = vertical_gap / scale
+        score = (
+            horizontal_gap / scale
+            + 0.7 * vertical_gap_ratio
+            - 0.30 * overlap_x / scale
+            - 0.20 * overlap_y / scale
+            + 0.15 * max(0.0, area_ratio - 0.45)
+            + config.secondary_bbox_expansion_weight * (expansion - 1.0)
         )
-    return max(0.0, min(scores)) if scores else None
+        eligible = (
+            config.secondary_mark_min_area_ratio
+            <= area_ratio
+            <= config.secondary_mark_max_area_ratio
+            and horizontal_gap <= config.secondary_mark_max_horizontal_gap_ratio * scale
+            and vertical_gap <= config.secondary_mark_max_vertical_gap_ratio * scale
+            and expansion <= config.secondary_mark_max_bbox_expansion_ratio
+        )
+        options.append(
+            (
+                max(0.0, score),
+                area_ratio,
+                overlap_ratio,
+                center_distance,
+                vertical_gap_ratio,
+                expansion,
+                eligible,
+            )
+        )
+    eligible_options = [option for option in options if option[-1]]
+    return min(eligible_options or options)
+
+
+def _spacing_attachment_score(
+    component: Component,
+    targets: Sequence[Component],
+    scale: float,
+    config: SpacingConfig | None = None,
+) -> float | None:
+    metrics = _spacing_attachment_metrics(component, targets, scale, config or SpacingConfig())
+    return metrics[0] if metrics is not None and metrics[-1] else None
 
 
 def _is_suspicious_lateral_speck(mark: Component, targets: Sequence[Component]) -> bool:
@@ -302,43 +477,61 @@ def _assign_spacing_marks(
     region_indices: tuple[int, ...] | None = None,
     region_scales: tuple[float, ...] | None = None,
 ) -> tuple[tuple[SecondaryMarkAssignment, ...], tuple[tuple[Component, ...], ...]]:
-    """Assign each secondary component to at most one region, preserving close ties."""
+    """Assign each plausible secondary component to at most one region."""
     indices = region_indices or tuple(range(len(bodies_by_region)))
     assigned: list[list[Component]] = [[] for _ in bodies_by_region]
     decisions: list[SecondaryMarkAssignment] = []
     for mark in sorted(marks, key=lambda component: component.index):
         if any(_is_suspicious_lateral_speck(mark, bodies) for bodies in bodies_by_region):
             decisions.append(
-                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
-            )
-            continue
-        scores = [
-            (score, region_index, local_index)
-            for local_index, (region_index, bodies) in enumerate(
-                zip(indices, bodies_by_region, strict=True)
-            )
-            if (
-                score := _spacing_attachment_score(
-                    mark,
-                    bodies,
-                    region_scales[local_index] if region_scales is not None else median_height,
+                SecondaryMarkAssignment(
+                    mark.index,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "unassigned",
+                    reason="lateral mark is not aligned with a body",
                 )
             )
-            is not None
-        ]
-        scores.sort()
-        if not scores or scores[0][0] > 2.5:
+            continue
+        options = []
+        rejected = []
+        for local_index, (region_index, bodies) in enumerate(
+            zip(indices, bodies_by_region, strict=True)
+        ):
+            scale = region_scales[local_index] if region_scales is not None else median_height
+            metrics = _spacing_attachment_metrics(mark, bodies, scale, config)
+            if metrics is not None:
+                entry = (metrics, region_index, local_index)
+                (options if metrics[-1] else rejected).append(entry)
+        options.sort(key=lambda item: (item[0], item[1]))
+        rejected.sort(key=lambda item: (item[0], item[1]))
+        if not options or options[0][0][0] > 2.5:
+            evidence = options[0][0] if options else rejected[0][0] if rejected else None
+            details = _mark_assignment_details(evidence)
             decisions.append(
-                SecondaryMarkAssignment(mark.index, None, None, None, None, "unassigned")
+                SecondaryMarkAssignment(
+                    mark.index,
+                    None,
+                    evidence[0] if evidence else None,
+                    None,
+                    None,
+                    "unassigned",
+                    reason="no nearby body passed mark geometry and bbox-expansion limits",
+                    **details,
+                )
             )
             continue
-        best_score, target, local_target = scores[0]
-        second_score = scores[1][0] if len(scores) > 1 else None
+        best_metrics, target, local_target = options[0]
+        best_score = best_metrics[0]
+        second_score = options[1][0][0] if len(options) > 1 else None
         margin = (
             (second_score - best_score) / max(1.0, abs(second_score))
             if second_score is not None
             else None
         )
+        details = _mark_assignment_details(best_metrics)
         if margin is not None and margin < config.mark_assignment_margin:
             decisions.append(
                 SecondaryMarkAssignment(
@@ -348,17 +541,38 @@ def _assign_spacing_marks(
                     second_score,
                     margin,
                     "ambiguous",
-                    candidate_region_indices=tuple(target for _, target, _ in scores[:2]),
+                    candidate_region_indices=tuple(item[1] for item in options[:2]),
+                    reason="best-target score margin is below the configured threshold",
+                    **details,
                 )
             )
             continue
         assigned[local_target].append(mark)
         decisions.append(
             SecondaryMarkAssignment(
-                mark.index, target, best_score, second_score, margin, "assigned"
+                mark.index,
+                target,
+                best_score,
+                second_score,
+                margin,
+                "assigned",
+                reason="plausible mark with clear best target and bounded bbox expansion",
+                **details,
             )
         )
     return tuple(decisions), tuple(tuple(group) for group in assigned)
+
+
+def _mark_assignment_details(metrics) -> dict[str, float | None]:
+    if metrics is None:
+        return {}
+    return {
+        "area_ratio": metrics[1],
+        "horizontal_overlap_ratio": metrics[2],
+        "horizontal_center_distance": metrics[3],
+        "vertical_gap_ratio": metrics[4],
+        "bbox_expansion_ratio": metrics[5],
+    }
 
 
 def _make_region(

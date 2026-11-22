@@ -4,12 +4,14 @@ import contextlib
 import json
 import os
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 from .models import (
+    AnchorSplitEvidence,
     DetectionResult,
     PagePartitionHypothesis,
     RegionHypothesis,
@@ -46,6 +48,8 @@ def detection_payload(result: DetectionResult) -> dict:
             "expected_count": result.expected_count,
             "expected_count_scope": result.expected_count_scope,
             "roi": list(diagnostics.roi.as_tuple()) if diagnostics and diagnostics.roi else None,
+            "cleanup_config": asdict(diagnostics.cleanup_config) if diagnostics else None,
+            "spacing_config": asdict(diagnostics.spacing_config) if diagnostics else None,
         },
         "mask": {
             "method": result.mask_result.method,
@@ -54,14 +58,27 @@ def detection_payload(result: DetectionResult) -> dict:
             "foreground_fraction": round(float(result.mask_result.mask.mean()), 6),
             "warnings": list(result.mask_result.warnings),
         },
+        "cleaned_foreground": {
+            "shape": list(result.clean_mask.shape),
+            "pixels": int(result.clean_mask.sum()),
+            "mask_runs": _mask_runs(result.clean_mask),
+        },
+        "ownership": _ownership_payload(result),
         "cleanup": [
             {
                 "component_index": decision.component_index,
                 "bbox": list(decision.bbox.as_tuple()),
+                "width": decision.bbox.width,
+                "height": decision.bbox.height,
                 "area": decision.area,
                 "role": decision.role,
                 "action": decision.action,
                 "reason": decision.reason,
+                "body_area_ratio": (
+                    round(decision.body_area_ratio, 6)
+                    if decision.body_area_ratio is not None
+                    else None
+                ),
             }
             for decision in decisions
         ],
@@ -91,6 +108,10 @@ def detection_payload(result: DetectionResult) -> dict:
                 "reading_order": region.reading_order,
                 "bbox": list(region.bbox.as_tuple()),
                 "confidence": round(region.confidence, 4),
+                "width": region.bbox.width,
+                "height": region.bbox.height,
+                "area": int(region.mask.sum()),
+                "mask_runs": _mask_runs(region.mask),
                 "component_indices": list(region.component_indices),
                 "primary_component_indices": list(region.primary_component_indices),
                 "secondary_component_indices": list(region.secondary_component_indices),
@@ -110,6 +131,7 @@ def detection_payload(result: DetectionResult) -> dict:
             "best_second_best_partition_margin": diagnostics.best_second_best_partition_margin,
             "unassigned_ink_fraction": round(diagnostics.unassigned_ink_fraction, 6),
             "unassigned_ink_pixels": int(result.unassigned_mask.sum()),
+            "ownership": _ownership_payload(result),
             "search_truncated": diagnostics.search_truncated,
             "search_limit": diagnostics.search_limit,
             "width_prior_deviation": diagnostics.width_prior_deviation,
@@ -130,11 +152,19 @@ def detection_payload(result: DetectionResult) -> dict:
                     "attempted_counts": list(row.attempted_counts),
                     "truncated_counts": list(row.truncated_counts),
                     "split_anchor_indices": list(row.split_anchor_indices),
+                    "repair_count": row.repair_count,
+                    "split_evidence": [
+                        _split_evidence_payload(evidence) for evidence in row.split_evidence
+                    ],
                     "merged_anchor_groups": [list(group) for group in row.merged_anchor_groups],
                     "inferred_count": row.inferred_count,
                     "requested_count": row.requested_count,
                     "selected_boundaries": list(row.selected_boundaries),
                     "confidence": round(row.confidence, 4),
+                    "selected_count": row.inferred_count,
+                    "baseline_cost": (
+                        round(row.baseline_cost, 4) if row.baseline_cost is not None else None
+                    ),
                     "cost": round(row.cost, 4),
                     "alternative_cost_margin": (
                         round(row.alternative_cost_margin, 4)
@@ -167,6 +197,12 @@ def detection_payload(result: DetectionResult) -> dict:
                     "second_best_score": assignment.second_best_score,
                     "margin": assignment.margin,
                     "status": assignment.status,
+                    "area_ratio": assignment.area_ratio,
+                    "horizontal_overlap_ratio": assignment.horizontal_overlap_ratio,
+                    "horizontal_center_distance": assignment.horizontal_center_distance,
+                    "vertical_gap_ratio": assignment.vertical_gap_ratio,
+                    "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
+                    "reason": assignment.reason,
                     "candidate_region_indices": list(assignment.candidate_region_indices),
                 }
                 for assignment in diagnostics.secondary_mark_assignments
@@ -192,6 +228,60 @@ def _mask_runs(mask: np.ndarray) -> list[list[int]]:
     return runs
 
 
+def _split_evidence_payload(evidence: AnchorSplitEvidence) -> dict:
+    return {
+        "anchor_index": evidence.anchor_index,
+        "cut_x": evidence.cut_x,
+        "cut_range": list(evidence.cut_range),
+        "valley_strength": round(evidence.valley_strength, 6),
+        "neck_width": evidence.neck_width,
+        "neck_width_ratio": round(evidence.neck_width_ratio, 6),
+        "left_area_fraction": round(evidence.left_area_fraction, 6),
+        "right_area_fraction": round(evidence.right_area_fraction, 6),
+        "left_height_ratio": round(evidence.left_height_ratio, 6),
+        "right_height_ratio": round(evidence.right_height_ratio, 6),
+        "anchor_width_ratio": (
+            round(evidence.anchor_width_ratio, 6)
+            if evidence.anchor_width_ratio is not None
+            else None
+        ),
+        "score": round(evidence.score, 6),
+        "accepted": evidence.accepted,
+        "reasons": list(evidence.reasons),
+    }
+
+
+def _ownership_payload(result: DetectionResult) -> dict:
+    ownership = np.zeros_like(result.clean_mask)
+    overlap = np.zeros_like(result.clean_mask)
+    in_bounds = True
+    for region in result.regions:
+        bbox = region.bbox
+        if bbox.x1 > ownership.shape[1] or bbox.y1 > ownership.shape[0]:
+            in_bounds = False
+            continue
+        local = ownership[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
+        local_overlap = overlap[bbox.y0 : bbox.y1, bbox.x0 : bbox.x1]
+        local_overlap |= local & region.mask
+        local |= region.mask
+    unassigned = result.unassigned_mask
+    assert unassigned is not None
+    valid = (
+        in_bounds
+        and not np.any(overlap)
+        and not np.any(ownership & unassigned)
+        and np.array_equal(ownership | unassigned, result.clean_mask)
+    )
+    return {
+        "valid": bool(valid),
+        "cleaned_foreground_pixels": int(result.clean_mask.sum()),
+        "region_owned_pixels": int(ownership.sum()),
+        "overlap_pixels": int(overlap.sum()),
+        "unassigned_pixels": int(unassigned.sum()),
+        "unassigned_mask_runs": _mask_runs(unassigned),
+    }
+
+
 def _boundary_payload(boundary) -> dict:
     return {
         "x": boundary.x,
@@ -215,6 +305,12 @@ def _assignment_payload(assignment) -> dict:
         "margin": assignment.margin,
         "status": assignment.status,
         "candidate_region_indices": list(assignment.candidate_region_indices),
+        "area_ratio": assignment.area_ratio,
+        "horizontal_overlap_ratio": assignment.horizontal_overlap_ratio,
+        "horizontal_center_distance": assignment.horizontal_center_distance,
+        "vertical_gap_ratio": assignment.vertical_gap_ratio,
+        "bbox_expansion_ratio": assignment.bbox_expansion_ratio,
+        "reason": assignment.reason,
     }
 
 
@@ -247,6 +343,10 @@ def _row_hypothesis_payload(row: RowPartitionHypothesis) -> dict:
     return {
         "row_index": row.row_index,
         "count": row.count,
+        "split_anchor_indices": list(row.split_anchor_indices),
+        "repair_count": row.repair_count,
+        "baseline_cost": round(row.baseline_cost, 6) if row.baseline_cost is not None else None,
+        "split_evidence": [_split_evidence_payload(item) for item in row.split_evidence],
         "boundaries": list(row.boundaries),
         "boundary_evidence": [_boundary_payload(boundary) for boundary in row.boundary_evidence],
         "cost": round(row.cost, 6),
@@ -285,6 +385,10 @@ def _page_hypothesis_payload(
         "unassigned_ink_pixels": int(unassigned.sum()),
         "unassigned_mask_runs": _mask_runs(unassigned),
         "cleaned_foreground_pixels": cleaned_foreground_pixels,
+        "region_owned_pixels": sum(
+            int(region.mask.sum()) for row in page.row_hypotheses for region in row.regions
+        ),
+        "ownership_valid": True,
         "rows": [_row_hypothesis_payload(row) for row in page.row_hypotheses],
     }
 
