@@ -48,8 +48,16 @@ def detection_payload(result: DetectionResult) -> dict:
             "expected_count": result.expected_count,
             "expected_count_scope": result.expected_count_scope,
             "roi": list(diagnostics.roi.as_tuple()) if diagnostics and diagnostics.roi else None,
-            "cleanup_config": asdict(diagnostics.cleanup_config) if diagnostics else None,
-            "spacing_config": asdict(diagnostics.spacing_config) if diagnostics else None,
+            "cleanup_config": (
+                asdict(diagnostics.cleanup_config)
+                if diagnostics and diagnostics.cleanup_config is not None
+                else None
+            ),
+            "spacing_config": (
+                asdict(diagnostics.spacing_config)
+                if diagnostics and diagnostics.spacing_config is not None
+                else None
+            ),
         },
         "mask": {
             "method": result.mask_result.method,

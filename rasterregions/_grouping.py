@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TypedDict
 
 import numpy as np
 from PIL import Image
@@ -17,6 +18,14 @@ from .models import (
     SpacingConfig,
 )
 from .regions import crop, tighten_bbox
+
+
+class _MarkAssignmentDetails(TypedDict, total=False):
+    area_ratio: float
+    horizontal_overlap_ratio: float
+    horizontal_center_distance: float
+    vertical_gap_ratio: float
+    bbox_expansion_ratio: float
 
 
 def _size_scale(found: tuple[Component, ...] | list[Component]) -> tuple[float, float]:
@@ -495,8 +504,8 @@ def _assign_spacing_marks(
                 )
             )
             continue
-        options = []
-        rejected = []
+        options: list[tuple[tuple[float, float, float, float, float, float, bool], int, int]] = []
+        rejected: list[tuple[tuple[float, float, float, float, float, float, bool], int, int]] = []
         for local_index, (region_index, bodies) in enumerate(
             zip(indices, bodies_by_region, strict=True)
         ):
@@ -563,7 +572,9 @@ def _assign_spacing_marks(
     return tuple(decisions), tuple(tuple(group) for group in assigned)
 
 
-def _mark_assignment_details(metrics) -> dict[str, float | None]:
+def _mark_assignment_details(
+    metrics: tuple[float, float, float, float, float, float, bool] | None,
+) -> _MarkAssignmentDetails:
     if metrics is None:
         return {}
     return {

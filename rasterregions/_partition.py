@@ -63,9 +63,6 @@ class RowPartition:
     baseline_cost: float | None = None
     repair_count: int = 0
     split_evidence: tuple[AnchorSplitEvidence, ...] = ()
-    baseline_cost: float | None = None
-    repair_count: int = 0
-    split_evidence: tuple[AnchorSplitEvidence, ...] = ()
 
 
 def _combine_page_partitions(
